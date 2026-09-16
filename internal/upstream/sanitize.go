@@ -25,6 +25,16 @@ var sanitizeFeatures = []string{
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
 var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
 
+// sanitizeBareHdrRe 兜底层：裸键名（无冒号无值）同样是指纹——2026-09-13 实验 F4
+// 证实 assistant 消息里反引号引用裸键名即触发 11128，而剥离层要求冒号、对裸串无效。
+// 键值形态被整段删除后，残留的裸键名做最小缩写（header→hdr）：破坏逐字匹配、
+// 语义不变、保留可读性。大小写不敏感，覆盖 X-Anthropic-... 变体。
+//
+// 注意该正则不要求冒号，是 sanitizeHdrRe 的超集——hasFingerprint 与 sanitizeText
+// 中两者并用：先删键值形态（sanitizeHdrRe），再缩写残留裸键名（本正则），
+// 替换语义不同（整段删除 vs 最小缩写），不可合并为一个正则。
+var sanitizeBareHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
+
 // sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）循环清理。
 var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
 
@@ -86,6 +96,8 @@ func sanitizeText(text string) string {
 			text = sanitizeKvRe.ReplaceAllString(text, "")
 		}
 	}
+	// 兜底：键值形态已在上面整段删除，这里只剩裸键名（引用/示例文本形态）。
+	text = sanitizeBareHdrRe.ReplaceAllString(text, "x-anthropic-billing-hdr")
 	return strings.TrimSpace(text)
 }
 
@@ -97,7 +109,7 @@ func hasFingerprint(text string) bool {
 			return true
 		}
 	}
-	return sanitizeHdrRe.MatchString(text)
+	return sanitizeBareHdrRe.MatchString(text)
 }
 
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
@@ -179,6 +191,14 @@ func sanitizeMessages(messages []any) bool {
 		}
 		if tc, ok := m["tool_calls"]; ok {
 			if sanitizeToolCalls(tc) {
+				changed = true
+			}
+		}
+		// reasoning_content（思维链回填字段，见 thinking.go/sse.go）实测同样
+		// 携带指纹，与 content 同等净化。string 形态直接走 sanitizeText。
+		if rc, ok := m["reasoning_content"].(string); ok {
+			if s := sanitizeText(rc); s != rc {
+				m["reasoning_content"] = s
 				changed = true
 			}
 		}

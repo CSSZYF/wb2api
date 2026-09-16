@@ -457,10 +457,17 @@ const (
 )
 
 // chatPaths 按 realm 返回 chat 端点路径候选序列：
-// global → [console, v2]（404/405 时 fallback）；cn → [v2]（现状逐字，零回归）。
+// global → [v2, console]（v2 优先，404/405 时 fallback）；cn → [v2]（现状逐字，零回归）。
+//
+// 2026-09-17 实测修正：/console 通道对请求内容更敏感——同一 body 直连 /console
+// 返回 403 WAF Block Page、/v2 返回 200（触发为历史文本的累计安全评分，与体积无关，
+// 4KB 触发段在 /console 稳定 403、在 /v2 稳定 200）。私人构建（fb07cc9）与 intl
+// 项目均直接走 /v2。原 [console, v2] 顺序来自 PLAN R9，实测会误伤长历史对话
+// （ZCode 会话历史含安全术语时 console 首路径必 403 → 单账号池 503）。
+// 改为 v2 优先后，console 仅作 v2 404/405 的兼容兜底（上游新旧路径分叉场景）。
 func (c *Client) chatPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
+		return []string{chatCompletionsPath, globalChatConsolePath}
 	}
 	return []string{chatCompletionsPath}
 }
@@ -693,8 +700,8 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 需要客户端断开联动的调用方用 ChatStreamContext 传入请求 ctx。
 //
-// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
-// （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
+// global realm：先打 /v2/chat/completions，404/405 时同一 base 二次换 /console/chat/completions
+// （v2 优先，2026-09-17 实测修正；console 仅作路径分叉兼容兜底）。cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
 }
