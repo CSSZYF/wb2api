@@ -12,8 +12,13 @@ FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
-# GOFLAGS/CGO_ENABLED 一次设定，四个二进制共用；LDFLAGS 同源，避免版本漂移。
-ENV GOFLAGS=-trimpath \
+# GOOS/GOARCH 必须显式从 TARGET* 传下去。
+# 踩过的坑：只声明 ARG 而不喂给 go build，BUILDPLATFORM(amd64) 下编出来的就是 amd64
+# 二进制，两个架构的镜像里装同一个 amd64 文件 —— 落到 arm64 节点直接
+# `exec /app/wb2api: exec format error`。声明 ≠ 生效。
+ENV GOOS=${TARGETOS} \
+    GOARCH=${TARGETARCH} \
+    GOFLAGS=-trimpath \
     CGO_ENABLED=0
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -25,6 +30,23 @@ RUN LDFLAGS="-s -w -X main.appVersion=${VERSION}" \
  && go build -ldflags "$LDFLAGS" -o /out/signin_bin ./cmd/signin \
  && go build -ldflags "$LDFLAGS" -o /out/login ./cmd/login \
  && go build -ldflags "$LDFLAGS" -o /out/credit ./cmd/credit
+# 构建期门禁：逐个核对产物架构与 TARGETARCH 一致。
+# 这道检查是补的——之前只验 manifest index 里有几个 platform，那只说明"层存在"，
+# 不说明"层里的二进制是那个架构"，所以 exec format error 一路漏到了集群上。
+# buildinfo 里带 GOOS/GOARCH，用它断言，不依赖 file(1)（alpine 没有）。
+RUN set -eu; \
+    fail=0; \
+    for b in wb2api signin_bin login credit; do \
+      info="$(go version -m /out/$b)"; \
+      if printf '%s' "$info" | grep -q "GOARCH=${TARGETARCH}"; then \
+        echo "  arch OK  $b -> ${TARGETOS}/${TARGETARCH}"; \
+      else \
+        echo "  ARCH MISMATCH  $b 期望 ${TARGETOS}/${TARGETARCH}，实际："; \
+        printf '%s\n' "$info"; \
+        fail=1; \
+      fi; \
+    done; \
+    [ "$fail" = 0 ] || { echo "构建中止：产物架构与目标架构不一致（会导致 exec format error）"; exit 1; }
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
