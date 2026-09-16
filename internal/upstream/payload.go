@@ -11,7 +11,7 @@ import (
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
-	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, nil, nil)
+	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, false, nil, nil)
 }
 
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
@@ -20,13 +20,17 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 //
 // 向后兼容封装：不传 defaultEfforts（无模型声明默认档），thinking.go 回退硬编码 high。
 func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
-	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, efforts, nil)
+	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, false, efforts, nil)
 }
 
 // PrepareBodyOptWithEffortsAndDefault 完整管线：efforts 降级 + thinking.go 按
 // defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
 // （deepseek 缺档回退硬编码 high）。
-func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+//
+// zeroWidth 控制零宽脱敏（见 zerowidth.go）——与 sanitize 是**两个独立开关**：
+// sanitize 默认开（改写/删除已知指纹），零宽默认关（插入不可见字符，改动更隐蔽，
+// 由使用者在面板上显式开启）。
+func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize, zeroWidth bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -54,6 +58,15 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
+		}
+	}
+	// 零宽脱敏必须在 sanitize 之后：sanitize 依赖**整句子符串相等**来定位并改写模板句，
+	// 若先插了零宽字符，句子中间多出 U+200B，字符串匹配随即失效、改写全部落空。
+	// 反过来则不冲突：零宽按"独立词"匹配，改写后的新句子（…CLI tool for Claude.）里
+	// 仍含 Claude / Anthropic 等词，照样被覆盖。
+	if zeroWidth {
+		if msgs, ok := obj["messages"].([]any); ok {
+			ApplyZeroWidthMessages(msgs)
 		}
 	}
 	out, err := json.Marshal(obj)

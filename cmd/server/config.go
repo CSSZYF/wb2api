@@ -112,6 +112,11 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// ZeroWidthSanitize 零宽字符脱敏（默认 false）：在 system 消息的指纹词内部插入
+		// U+200B，可见文本不变、只破坏上游的逐字精确匹配。
+		// 与上面那个独立：上面是"改写/删除"（默认开、覆盖面窄），这里是"插入不可见字符"
+		// （默认关、覆盖面广）。两者叠加不冲突，开启顺序固定为先改写后插零宽。
+		ZeroWidthSanitize bool `json:"zerowidth_sanitize"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -219,6 +224,9 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	// 零宽脱敏默认关：它改动的是"看不见的字节"，出问题时表现为两个看起来一样的字符串对不上，
+	// 排查成本高。由使用者在面板显式开启（与上游 codebuddy2api 的默认关闭口径一致）。
+	c.Features.ZeroWidthSanitize = false
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
@@ -375,6 +383,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
+		}
+	}
+	if v := os.Getenv("WB2A_ZEROWIDTH_SANITIZE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.ZeroWidthSanitize = b
 		}
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {

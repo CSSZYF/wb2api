@@ -776,3 +776,59 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
 	}
 }
+
+// TestZeroWidthSanitizeDefaultOffAndEnvOverride 零宽脱敏的默认值与开关路径。
+//
+// 默认必须是关：这个功能改动的是"看不见的字节"，出问题时表现为两个看起来一样的
+// 字符串对不上，排查成本高，所以由使用者显式开启（与上游 codebuddy2api 口径一致）。
+func TestZeroWidthSanitizeDefaultOffAndEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	key, err := WriteDefault(path)
+	if err != nil {
+		t.Fatalf("WriteDefault: %v", err)
+	}
+	if key == "" {
+		t.Error("应生成随机 api_key")
+	}
+	// 生成的配置文件必须显式含该键且为 false —— 让用户能看见并直接改。
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gen struct {
+		Features map[string]any `json:"features"`
+	}
+	if err := json.Unmarshal(raw, &gen); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := gen.Features["zerowidth_sanitize"]
+	if !ok {
+		t.Errorf("生成的配置缺少 features.zerowidth_sanitize 键：%v", gen.Features)
+	} else if v != false {
+		t.Errorf("zerowidth_sanitize 默认应为 false，实际 %v", v)
+	}
+
+	// 不设环境变量 → 关闭。
+	if c, err := Load(path); err != nil {
+		t.Fatal(err)
+	} else if c.Features.ZeroWidthSanitize {
+		t.Error("缺省应为关闭")
+	}
+
+	// 环境变量打开。注意用 ParseBool 口径：只有 true/false/1/0 等合法值生效。
+	t.Setenv("WB2A_ZEROWIDTH_SANITIZE", "true")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Features.ZeroWidthSanitize {
+		t.Error("WB2A_ZEROWIDTH_SANITIZE=true 应打开零宽脱敏")
+	}
+
+	// 与指纹脱敏是两个独立开关：开零宽不得连带改动另一个。
+	if !c.Features.SanitizeBlacklistFingerprints {
+		t.Error("零宽开关不应影响 sanitize_blacklist_fingerprints（默认仍应为 true）")
+	}
+}

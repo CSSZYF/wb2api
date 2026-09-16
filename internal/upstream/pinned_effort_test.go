@@ -21,7 +21,7 @@ func TestPinnedDeepSeekEffortPassthrough(t *testing.T) {
 		"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
 	})
 	// 能力缓存为空：模拟"上游目录里没有这个模型"的真实状态。
-	out := PrepareBodyOptWithEffortsAndDefault(body, false, nil, nil)
+	out := PrepareBodyOptWithEffortsAndDefault(body, false, false, nil, nil)
 	var got map[string]any
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatal(err)
@@ -39,7 +39,7 @@ func TestPinnedDeepSeekEffortPassthrough(t *testing.T) {
 		"model":    model,
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	})
-	out2 := PrepareBodyOptWithEffortsAndDefault(body2, false, nil, nil)
+	out2 := PrepareBodyOptWithEffortsAndDefault(body2, false, false, nil, nil)
 	var got2 map[string]any
 	if err := json.Unmarshal(out2, &got2); err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestPinnedDeepSeekEffortPassthrough(t *testing.T) {
 		"thinking":         map[string]any{"type": "disabled"},
 		"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
 	})
-	out3 := PrepareBodyOptWithEffortsAndDefault(body3, false, nil, nil)
+	out3 := PrepareBodyOptWithEffortsAndDefault(body3, false, false, nil, nil)
 	var got3 map[string]any
 	if err := json.Unmarshal(out3, &got3); err != nil {
 		t.Fatal(err)
@@ -77,7 +77,7 @@ func TestPinnedDeepSeekEffortPassthrough(t *testing.T) {
 		"reasoning_effort": "max",
 		"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
 	})
-	out4 := PrepareBodyOptWithEffortsAndDefault(body4, false, supported, nil)
+	out4 := PrepareBodyOptWithEffortsAndDefault(body4, false, false, supported, nil)
 	var got4 map[string]any
 	if err := json.Unmarshal(out4, &got4); err != nil {
 		t.Fatal(err)
@@ -103,7 +103,7 @@ func TestDeepSeekThinkingForcedOn(t *testing.T) {
 			obj[k] = v
 		}
 		raw, _ := json.Marshal(obj)
-		out := PrepareBodyOptWithEffortsAndDefault(raw, false, nil, nil)
+		out := PrepareBodyOptWithEffortsAndDefault(raw, false, false, nil, nil)
 		var got map[string]any
 		if err := json.Unmarshal(out, &got); err != nil {
 			t.Fatal(err)

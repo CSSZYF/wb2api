@@ -738,7 +738,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
-              <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
+              <input type="checkbox" name="sanitize_blacklist_fingerprints">
+              <span class="hint">改写/删除已知模板句（默认开）</span></div>
+            <div class="switch"><span class="lb">零宽字符脱敏</span>
+              <input type="checkbox" name="zerowidth_sanitize">
+              <span class="hint">在 system 消息的指纹词内插入 U+200B，可见文本不变、只破坏逐字匹配（默认关）</span></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>

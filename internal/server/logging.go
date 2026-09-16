@@ -252,6 +252,36 @@ func uidPrefix(uid string) string {
 	return uid
 }
 
+// modelLogWidth 表格日志中模型名的显示宽度（按 rune 计）。
+//
+// 取 32 的理由：覆盖现实中最长的形态——带显式域前缀的 "global:deepseek-v4.1-flash"
+// 是 26 字符；同时对畸形输入保留上限，防止单行日志被超长模型名撑爆。
+const modelLogWidth = 32
+
+// shortModel 按 rune 截断模型名，截断时追加 "…" 标记。
+//
+// 为什么必须留标记：早期实现是硬切前 11 个字符（model[:11]），而
+// "deepseek-v4.1-flash" 的前 11 个字符恰好是 "deepseek-v4" —— 一个看起来
+// 完全合理的**另一个模型名**。于是日志显示的模型与客户端实际请求的模型不是同一个，
+// 排查时把人往完全相反的方向带。截断成"合法名字"比截断成乱码危险得多；
+// 带 "…" 之后，"名字不完整"这件事自身可见，不可能再被误读成另一个模型。
+//
+// 按 rune 而非字节切：客户端可能塞入非 ASCII 模型名，按字节切会产出非法 UTF-8，
+// 在面板/终端里显示成乱码。
+func shortModel(model string, width int) string {
+	if width <= 0 {
+		return model
+	}
+	r := []rune(model)
+	if len(r) <= width {
+		return model
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(r[:width-1]) + "…"
+}
+
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
@@ -259,9 +289,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
-	}
+	model = shortModel(model, modelLogWidth)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {

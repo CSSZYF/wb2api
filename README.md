@@ -10,10 +10,13 @@
 > **镜像**：多架构 `linux/amd64` + `linux/arm64`，由 GitHub Actions 构建并推送：
 >
 > ```bash
-> docker run -d --name wb2api -p 7863:7863 >   -v "$PWD/auths:/app/auths" -v "$PWD/data:/app/data" >   -v "$PWD/config.json:/app/config.json" >   ghcr.io/csszyf/<仓库名>:latest
+> docker run -d --name wb2api -p 7863:7863 >   -e WB2A_AUTH_DIR=/app/data/auths >   -e WB2A_STATE_FILE=/app/data/state.json >   -v "$PWD/data:/app/data" >   ghcr.io/csszyf/wb2api:latest
 > ```
 >
-> 宿主目录属主不匹配时用 `--user "$(id -u):$(id -g)"`（见 docker-compose.yml 注释）。
+> **配置落在持久卷上**（`/app/data/config.json`），所以面板「配置」页保存能持久生效。
+> 首次启动若未设 `WB2A_API_KEY`，二进制会生成随机 key 写进 `./data/config.json`，
+> 打开即可看到。入口脚本会在启动时修正卷属主（需以 root 启动，随后 su-exec 降权到
+> uid 10001），并自动迁移旧的 `/app/config.json` 配置。
 >
 > **本 fork 的改动**（均有回归测试）：
 >
@@ -26,6 +29,9 @@
 > | 写死内置模型 | 上游目录不返回但可调用的模型（如 `deepseek-v4.1-flash`）由 `models.pinned_models` 兜底，面板与 `/v1/models` 同源 |
 > | 模型名归一化 | 去掉冗余厂商标注：`DeepSeek: DeepSeek V4.1 Flash` → `DeepSeek V4.1 Flash` |
 > | 思考字段诊断 | `WB2A_DEBUG_REASONING=1` 时按请求打一行 in/out 思考字段（只打字段、不打消息内容），用于定位"档位调了没区别" |
+> | 零宽字符脱敏 | `features.zerowidth_sanitize`（默认关，面板可勾）：在 system 消息的指纹词内插入 U+200B，可见文本不变、只破坏上游逐字匹配。词表移植自 [codebuddy2api](https://github.com/maiphucgiang/codebuddy2api)（83 项，含安全术语与身份指纹两类）；只动 system，用户消息一字不改 |
+> | 配置落卷 + 入口脚本 | 配置改到 `/app/data/config.json`（持久卷），面板保存不再 permission denied；入口脚本修正卷属主、迁移旧配置、su-exec 降权 |
+> | 日志模型名不再歧义 | 表格日志原先硬切前 11 字符，`deepseek-v4.1-flash` 会显示成 `deepseek-v4`（另一个真实存在的模型名）；现按 rune 截断到 32 并加 `…` 标记 |
 > | 多架构 Dockerfile | `TARGETOS`/`TARGETARCH` + `VERSION` 构建参数，`BUILDPLATFORM` 固定构建机避免 qemu 里跑编译器 |
 >
 > 完整改动见 git 历史；`v1.9.1` tag 即上游基线，可直接 diff。

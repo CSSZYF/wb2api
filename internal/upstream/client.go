@@ -346,6 +346,9 @@ type Client struct {
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
+	// ZeroWidthSanitize 零宽字符脱敏开关（默认 false）：在 system 消息的指纹词内部
+	// 插入 U+200B，破坏上游逐字匹配。与 SanitizeFingerprints 独立，可各自开关。
+	ZeroWidthSanitize bool
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -509,7 +512,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	efforts := c.effortsSnapshot(realm)
 	defaults := c.defaultEffortsSnapshot(realm)
 	logReasoning("in ", body, efforts, defaults)
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defaults)
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, c.ZeroWidthSanitize, efforts, defaults)
 	logReasoning("out", body, efforts, defaults)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。

@@ -50,7 +50,7 @@ RUN set -eu; \
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
-RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
+RUN apk add --no-cache wget ca-certificates tzdata python3 bash su-exec \
  && adduser -D -u 10001 app \
  && mkdir -p /app/auths /app/data \
  && chown -R app:app /app
@@ -64,10 +64,19 @@ COPY --from=build /out/credit /app/credit
 COPY login.sh signin.sh credit.sh /app/
 COPY scripts/probe_active.py /app/scripts/probe_active.py
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
-# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
-COPY config.example.json /app/config.json
-USER app
+# 配置从"镜像内只读"改为"落在持久卷上"（/app/data/config.json）。
+# 旧版把示例直接 COPY 成 /app/config.json，属主 root（COPY 发生在 USER 之前），
+# 于是面板保存配置必然 permission denied —— 挂了持久卷也存不进卷里，等于白挂。
+# 现在示例只作参考；真实配置由二进制在卷上生成/保存：
+#   - 卷里没有 config.json → 二进制自动生成（含随机 api_key）
+#   - 存在旧 /app/config.json → 入口脚本按需迁移（见 docker-entrypoint.sh）
+COPY config.example.json /app/config.example.json
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && chmod 755 /app/docker-entrypoint.sh
+# 不再写 USER app：入口脚本需要 root 才能修正卷属主，随后用 su-exec 降权到 app(10001)。
+# 服务进程本身仍是非 root，与旧镜像等效。
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
-ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["/app/wb2api", "-config", "/app/data/config.json"]

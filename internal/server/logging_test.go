@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -154,8 +155,10 @@ func TestLogChatRowFormat(t *testing.T) {
 	out := captureStdout(t, func() {
 		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
 	})
+	// 断言**完整**模型名：只写 "deepseek-v4" 的话，截断成 11 字符后的
+	// "deepseek-v4"（本文件的回归对象）同样能通过 —— 弱断言正是该 bug 存活的原因。
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "deepseek-v4-flash", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -290,5 +293,72 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// TestShortModelTruncationIsVisible 模型名截断必须自身可见。
+//
+// 回归对象：早期是 model[:11] 硬切，而 "deepseek-v4.1-flash" 的前 11 个字符
+// 恰好等于 "deepseek-v4" —— 一个看起来完全合理的另一个模型名。日志于是显示
+// 了一个"客户端从未请求过的模型"，排查时把人引向相反方向。
+func TestShortModelTruncationIsVisible(t *testing.T) {
+	const real = "deepseek-v4.1-flash" // 19 字符，旧实现会截成 "deepseek-v4"
+
+	// 默认宽度下必须原样完整显示。
+	if got := shortModel(real, modelLogWidth); got != real {
+		t.Errorf("默认宽度下应完整显示：got %q want %q", got, real)
+	}
+	if len([]rune(real)) > modelLogWidth {
+		t.Fatalf("测试前提失效：%q 已超过默认宽度 %d", real, modelLogWidth)
+	}
+
+	// 关键断言：旧行为产出的那个"看着挺合理"的名字，现在绝不允许作为完整结果出现。
+	got := shortModel(real, 11)
+	if got == "deepseek-v4" {
+		t.Fatalf("截断结果与另一个真实模型名相同（这正是要修掉的歧义）：%q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("截断结果必须以省略号结尾以自证不完整：%q", got)
+	}
+	if len([]rune(got)) > 11 {
+		t.Errorf("截断后不得超宽：%q 有 %d 个 rune", got, len([]rune(got)))
+	}
+
+	// 边界：恰好等于宽度 → 不动；超一个字符 → 截断。
+	if got := shortModel("abcde", 5); got != "abcde" {
+		t.Errorf("等宽不应截断：%q", got)
+	}
+	if got := shortModel("abcdef", 5); got != "abcd…" {
+		t.Errorf("超宽应截断为 %q，got %q", "abcd…", got)
+	}
+
+	// 宽度 1 与非法宽度的兜底。
+	if got := shortModel("abcdef", 1); got != "…" {
+		t.Errorf("宽度 1 应只留省略号：%q", got)
+	}
+	if got := shortModel(real, 0); got != real {
+		t.Errorf("宽度 <=0 表示不限：%q", got)
+	}
+
+	// 非 ASCII 必须按 rune 切（按字节切会产出非法 UTF-8 乱码）。
+	if got := shortModel("模型名字测试超长", 4); got != "模型名…" {
+		t.Errorf("非 ASCII 截断错误：%q（按 rune 应为 %q）", got, "模型名…")
+	}
+	for _, s := range []string{shortModel("模型名字测试超长", 4), shortModel(real, 11)} {
+		if !utf8.ValidString(s) {
+			t.Errorf("截断结果不是合法 UTF-8：%q", s)
+		}
+	}
+}
+
+// TestLogChatRowKeepsFullModelName 端到端：表格行里出现完整模型名，
+// 而不是被切成另一个合法模型名。
+func TestLogChatRowKeepsFullModelName(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(0, time.Second, "deepseek-v4.1-flash", "sync", "u1", 200, 1)
+	})
+	if !strings.Contains(out, "deepseek-v4.1-flash") {
+		t.Errorf("日志应含完整模型名，实际输出: %s", out)
 	}
 }

@@ -1,25 +1,24 @@
 services:
   wb2api:
-    build: .
+    image: ghcr.io/csszyf/wb2api:latest   # 生产建议钉显式版本，如 :v1.9.4
     container_name: workbuddy2api
     restart: unless-stopped
-    # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
-    # 「写入 auths/*.json.tmp 失败 permission denied」，三种解法任选：
-    #   1) 非 root · 让容器以你自己的 uid 运行（挂载目录本来就是你建的）：
-    #      PUID=$(id -u) PGID=$(id -g) docker compose up -d
-    #      或写进 .env 文件：PUID=1000 / PGID=1000
-    #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
-    #   3) user: "0:0" 以 root 运行（省事但容器逃逸面更大，自担）
-    user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
+      # 配置项优先在面板「配置」页改：保存后会落到卷里的 config.json 并即时生效。
+      # 这里只放"路径类"（改路径要重启），避免与面板互相覆盖。
+      - WB2A_AUTH_DIR=/app/data/auths
+      - WB2A_STATE_FILE=/app/data/state.json
+      # 首次启动若不设 WB2A_API_KEY：二进制会生成随机 key 并写进 ./data/config.json，
+      # 打开该文件即可看到（面板登录与客户端 Bearer 都用它）。
+      # - WB2A_API_KEY=改成你自己的
     ports:
       - "7863:7863"
     volumes:
-      - ./auths:/app/auths
+      # 单一卷，全部持久化数据都在里面：
+      #   config.json（面板保存的目标）/ auths/（账号凭证）/ state.json / usage.json
+      #
+      # 注意（v1.9.4 起的行为变更）：配置不再是 /app/config.json 那个只读示例，
+      # 而是卷里的 ./data/config.json。老部署若是靠挂载 ./config.json:/app/config.json
+      # 提供配置，入口脚本会自动把它迁移进卷；迁移过一次后请删掉那条挂载，否则两边会不一致。
       - ./data:/app/data
-      # 注意：宿主机必须先有 config.json（cp config.example.json config.json）。
-      # 缺失时 Docker 会把挂载点创建成目录 → 容器启动失败（程序会自动生成配置，
-      # 但前提是它能以文件形式写入 —— 挂载目录会挡住这条路径）。
-      # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
-      - ./config.json:/app/config.json
