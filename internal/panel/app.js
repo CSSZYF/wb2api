@@ -213,8 +213,11 @@ async function loadOverview(quiet) {
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sSticky').textContent = d.sticky_sessions;
-    $('navSub').textContent = 'v' + d.version;
-    $('navVer').textContent = 'v' + d.version;
+    // 版本号自身可能已带 v 前缀（CI 从 git tag 注入，tag 形如 v1.9.2）：
+    // 已带则原样显示，否则补一个 v——两种来源都不会渲染成 vv1.9.2。
+    const ver = /^v/i.test(d.version || '') ? d.version : 'v' + d.version;
+    $('navSub').textContent = ver;
+    $('navVer').textContent = ver;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
@@ -329,7 +332,18 @@ async function loadModels() {
         outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
     const hit = list.filter(m => probeOf(m.id)).length;
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    // 诊断行：把"上游到底给了什么 / 哪一步筛掉了谁"摊在面板上，省得为一个空列表去开 devtools。
+    const dg = d.diag || {};
+    const parts = [list.length + ' 个模型'];
+    if (dg.path) parts.push('来源 ' + dg.path);
+    if (dg.count_upstream != null && dg.count_upstream !== list.length) parts.push('上游 ' + dg.count_upstream + ' → 展示 ' + list.length);
+    if ((dg.hidden || []).length) parts.push('隐藏别名 ' + dg.hidden.length + ' 个');
+    if (!(dg.cli_agent_ids || []).length) parts.push('上游未给 agents 名单（按全表展示）');
+    const dropped = dg.dropped || [];
+    if (dropped.length) parts.push('未进列表 ' + dropped.length + ' 个（' + dropped.join(', ') + '）');
+    parts.push('已刷新降级缓存');
+    if (hit) parts.push(hit + ' 个有实测上限');
+    $('mdNote').textContent = parts.join(' · ');
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }

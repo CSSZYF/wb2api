@@ -57,9 +57,23 @@ type Config struct {
 
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
-	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
+	// false（显式逃生门）时即便 auth realm=global 也不提供 global 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// StripRealmPrefix true（缺省）= /v1/models 输出裸模型名，不带 "cn:"/"global:"
+	// 前缀；显式前缀在入站方向仍被解析（老客户端配置零改动）。
+	// false = 保留 v1 起的历史行为（每个 id 带域前缀）。
+	StripRealmPrefix bool
+	// RealmPrecedence 裸模型名在两域都有账号时的默认归属域："global"（缺省）| "cn"。
+	RealmPrecedence string
+	// HiddenModels 对外隐藏的模型名（upstream.ResolveHiddenModels 归一化后的集合）。
+	// 与面板「模型与档位」同口径——两处必须用同一份，否则会出现"面板看得见、
+	// 客户端调不到"。nil = 不隐藏。
+	HiddenModels upstream.HiddenSet
+	// PinnedModels 强制内置的模型条目（上游目录不给、但可调用的模型）。
+	// 上游已返回同名模型时以上游数据为准，只在缺失时兜底追加。
+	PinnedModels []upstream.PinnedModel
 
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
@@ -105,6 +119,9 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// router 模型名 → realm 归属决策（显式前缀优先，裸名按池内可用域）。
+	// 与 cmd 侧粘性闭包同源，避免两处各写一套域判定而漂移。
+	router RealmRouter
 	// maxBodyBytes 请求体上限的运行期值（cfg.MaxBodyBytes 的原子镜像）。
 	// 面板在线改 server.max_body_mb 时经 SetMaxBodyBytes 热生效，无需重启
 	// （issue #17：改了配置却静默不生效，用户仍被 8MB 413 拦截）。
@@ -137,7 +154,16 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
+	var hasRealm func(string) bool
+	if cfg.Pool != nil {
+		hasRealm = cfg.Pool.HasRealm
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.router = RealmRouter{
+		GlobalEnabled: cfg.GlobalEnabled,
+		Precedence:    cfg.RealmPrecedence,
+		HasRealm:      hasRealm,
+	}
 	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
@@ -268,69 +294,160 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // 只含模型名、不含倍率。探测失败 / 无 global 账号时直接输出此名单。
 var globalModels = upstream.GlobalModelNames
 
-// modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
-// 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。动态失败回退静态表。
+// modelList 模型列表：只列「池内确实有账号的域」，缺省输出裸模型名
+// （config models.strip_realm_prefix 缺省 true）。显式 "cn:"/"global:" 前缀在入站
+// 方向仍被解析（老客户端配置零改动）。
+//
+// 单域部署（只登国际版账号）结果 = 国际版名单 + 无前缀 + 零 CN 上游调用。
+// 双域都有账号时两域名单合并去重，同名条目按 realm_precedence 先入（展示的是
+// 真正会接这个请求的那一份，与 router 口径一致）。
 func (h *Handler) modelList() []map[string]any {
-	out := make([]map[string]any, 0, len(staticModels)+len(globalModels))
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		for _, mi := range infos {
-			entry := map[string]any{
-				"id":                "cn:" + mi.ID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "workbuddy",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
-			}
-			if mi.ContextWindow == 0 {
-				entry["context_length"] = 131072 // 兜底
-			}
-			if len(mi.Efforts) > 0 {
-				entry["supported_efforts"] = mi.Efforts
-			}
-			if mi.DefaultEffort != "" {
-				entry["default_effort"] = mi.DefaultEffort
-			}
-			if mi.MaxAllowedSize > 0 {
-				entry["max_allowed_size"] = mi.MaxAllowedSize
-			}
-			if mi.SupportsReasoning {
-				entry["supports_reasoning"] = mi.SupportsReasoning
-				entry["can_disable_thinking"] = mi.CanDisableThinking
-			}
-			if mi.SupportsImages {
-				entry["supports_images"] = true // P1：多模态能力透出
-			}
-			if mi.Credits != "" {
-				entry["credits"] = mi.Credits
-			}
-			out = append(out, entry)
+	cnOn := h.realmAvailable("cn")
+	glOn := h.realmAvailable("global")
+	both := !cnOn && !glOn // 池内无账号：列双域静态兜底，避免空列表（零上游调用）
+
+	type realmEntry struct {
+		realm string
+		entry map[string]any
+	}
+	var cnEntries, glEntries []realmEntry
+
+	if cnOn || both {
+		var infos []upstream.ModelInfo
+		if cnOn {
+			infos = h.fetchDynamicModels() // 只在有 CN 账号时才打上游
 		}
-	} else {
-		for _, m := range staticModels {
-			e := make(map[string]any, len(m)+1)
-			for k, v := range m {
-				e[k] = v
+		infos = h.cfg.HiddenModels.FilterInfo(infos)
+		if len(infos) > 0 {
+			for _, mi := range infos {
+				entry := map[string]any{
+					"id":                mi.ID,
+					"object":            "model",
+					"created":           1753600000,
+					"owned_by":          "workbuddy",
+					"context_length":    mi.ContextWindow,
+					"max_output_tokens": mi.MaxTokens,
+				}
+				if mi.ContextWindow == 0 {
+					entry["context_length"] = 131072 // 兜底
+				}
+				if len(mi.Efforts) > 0 {
+					entry["supported_efforts"] = mi.Efforts
+				}
+				if mi.DefaultEffort != "" {
+					entry["default_effort"] = mi.DefaultEffort
+				}
+				if mi.MaxAllowedSize > 0 {
+					entry["max_allowed_size"] = mi.MaxAllowedSize
+				}
+				if mi.SupportsReasoning {
+					entry["supports_reasoning"] = mi.SupportsReasoning
+					entry["can_disable_thinking"] = mi.CanDisableThinking
+				}
+				if mi.SupportsImages {
+					entry["supports_images"] = true // P1：多模态能力透出
+				}
+				if mi.Credits != "" {
+					entry["credits"] = mi.Credits
+				}
+				cnEntries = append(cnEntries, realmEntry{"cn", entry})
 			}
-			if id, ok := m["id"].(string); ok {
-				e["id"] = "cn:" + id
+		} else {
+			for _, m := range staticModels {
+				if id, _ := m["id"].(string); h.cfg.HiddenModels.Has(id) {
+					continue
+				}
+				e := make(map[string]any, len(m))
+				for k, v := range m {
+					e[k] = v
+				}
+				cnEntries = append(cnEntries, realmEntry{"cn", e})
 			}
-			out = append(out, e)
 		}
 	}
-	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。名单 = 探测结果
-	// ∪ 静态兜底（fetchGlobalModels 内合并去重）；无 global 账号时直接静态名单且零上游调用。
-	if h.cfg.GlobalEnabled {
-		for _, id := range h.fetchGlobalModels() {
-			out = append(out, map[string]any{
-				"id":       "global:" + id,
+
+	// global 模型名单：仅在有 global 账号且 GlobalEnabled=true 时列出（逃生门）。
+	// 名单 = 探测结果 ∪ 静态兜底（fetchGlobalModels 内合并去重）；无 global 账号时
+	// 该分支整体不进（both 场景下 fetchGlobalModels 返回静态名单，仍零上游调用）。
+	//
+	// 注意：该名单只有名字、没有能力字段。写死条目（PinnedModels）命中时改用其完整
+	// 快照，避免"列表里有 deepseek、但倍率/窗口全空"的半截投影。
+	pinnedByID := make(map[string]upstream.PinnedModel, len(h.cfg.PinnedModels))
+	for _, pm := range h.cfg.PinnedModels {
+		if pm.ID != "" {
+			pinnedByID[pm.ID] = pm
+		}
+	}
+	if glOn || both {
+		for _, id := range h.cfg.HiddenModels.FilterNames(h.fetchGlobalModels()) {
+			entry := map[string]any{
+				"id":       id,
 				"object":   "model",
 				"created":  1753600000,
 				"owned_by": "workbuddy",
-			})
+			}
+			if pm, ok := pinnedByID[id]; ok {
+				entry = pm.Entry()
+			}
+			glEntries = append(glEntries, realmEntry{"global", entry})
 		}
 	}
+
+	// 优先域先入：同名条目保留优先域那一份，另一域的重复项丢弃。
+	first, second := cnEntries, glEntries
+	if h.router.BareRealm() == "global" {
+		first, second = glEntries, cnEntries
+	}
+	out := make([]map[string]any, 0, len(cnEntries)+len(glEntries)+len(h.cfg.PinnedModels))
+	seen := make(map[string]bool, len(cnEntries)+len(glEntries)+len(h.cfg.PinnedModels))
+	for _, group := range [2][]realmEntry{first, second} {
+		for _, re := range group {
+			id, _ := re.entry["id"].(string)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			if !h.cfg.StripRealmPrefix {
+				// 保留历史协议：id 标回所属域前缀。
+				e := make(map[string]any, len(re.entry))
+				for k, v := range re.entry {
+					e[k] = v
+				}
+				e["id"] = re.realm + ":" + id
+				out = append(out, e)
+				continue
+			}
+			out = append(out, re.entry)
+		}
+	}
+	// 写死条目兜底：上游目录没给的模型（账号差异/灰度）也列出来。上游给了同名条目时
+	// seen 已命中，这里自动让位——上游数据永远优先。隐藏名单同样作用于写死条目
+	// （想藏掉就把它加进 models.hidden_models）。
+	for _, pm := range h.cfg.PinnedModels {
+		if pm.ID == "" || seen[pm.ID] || h.cfg.HiddenModels.Has(pm.ID) {
+			continue
+		}
+		seen[pm.ID] = true
+		e := pm.Entry()
+		if !h.cfg.StripRealmPrefix {
+			e["id"] = h.router.BareRealm() + ":" + pm.ID
+		}
+		out = append(out, e)
+	}
 	return out
+}
+
+// realmAvailable 报告该域是否参与对外模型列表与裸名默认域。
+// 判据是「池内有没有这个域的账号」（pool.HasRealm，不看健康度）：账号全在冷却时
+// 列表与默认域不应突然翻转。global 另受 GlobalEnabled 逃生门约束。
+func (h *Handler) realmAvailable(realm string) bool {
+	if h.cfg.Pool == nil {
+		return false
+	}
+	if realm == "global" && !h.cfg.GlobalEnabled {
+		return false
+	}
+	return h.cfg.Pool.HasRealm(realm)
 }
 
 // fetchGlobalModels 拉 global realm 模型名目录（探测 ∪ 静态名单，1h 缓存 + 5min 负缓存）。
@@ -343,8 +460,11 @@ func (h *Handler) fetchGlobalModels() []string {
 	return h.cfg.Upstream.FetchGlobalModels(acct)
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
+// fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
 // 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
+//
+// 强制 realm=cn 选号：本表是 CN 目录（/console 家族），拿 global 账号去打
+// global 域的同名路径会吃到 500/解析失败（v1.x 面板"拉取模型 500"的根因之一）。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
@@ -359,7 +479,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
+	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
 	if acct == nil {
 		return nil
 	}
@@ -405,10 +525,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
-	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
-	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
-	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(peek.Model)
+	// realm 归属解析：model 名可带显式 "[realm:]" 前缀（老客户端配置兼容）；
+	// 裸名按池内可用域归属——单域部署（只登国际版账号）下裸名直接走该域，
+	// 多域部署按 realm_precedence。bareModel 用于选号/粘性/出站 body 重写。
+	realm, bareModel := h.router.Resolve(peek.Model)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)

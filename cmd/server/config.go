@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // Config 顶层配置。
@@ -142,6 +143,28 @@ type Config struct {
 		ExpiringSoon string `json:"expiring_soon"`
 	} `json:"pool"`
 
+	// Models 网关对外模型名协议（/v1/models 的 id 形态 + 裸名归属域）。
+	Models struct {
+		// StripRealmPrefix 缺省 true：/v1/models 输出裸模型名，不带 "cn:"/"global:" 前缀。
+		// 显式前缀在入站方向仍被解析（老客户端配置零改动）；显式 false 恢复历史行为。
+		StripRealmPrefix bool `json:"strip_realm_prefix"`
+		// RealmPrecedence 裸模型名在「池内两域都有账号」时的默认归属域：
+		// "global"（缺省）/ "cn"。单域部署（只登国际版账号）下此项无影响——
+		// 裸名直接落唯一可用域。
+		RealmPrecedence string `json:"realm_precedence"`
+		// HiddenModels 对外隐藏的模型名（面板「模型与档位」与 /v1/models 同口径）。
+		// 键缺席 → 用内置默认：上游的路由策略别名 default-model / fast-model /
+		// balanced-model / primary-model / deep-model（它们不是真实模型，选中后由
+		// 上游按当时策略转派，倍率与窗口随时变）。
+		// 显式 [] → 全部展示；非空数组 → 以该名单为准。
+		HiddenModels []string `json:"hidden_models"`
+		// PinnedModels 强制内置的模型条目：上游目录不给（账号差异/灰度）、但实际可调用
+		// 的模型，写死一份能力快照让它稳定出现在面板与 /v1/models。
+		// 键缺席 → 用内置默认（deepseek-v4.1-flash）；显式 [] → 不强行内置。
+		// 上游若开始返回同名模型，自动以上游数据为准（写死条目让位）。
+		PinnedModels []upstream.PinnedModel `json:"pinned_models"`
+	} `json:"models"`
+
 	SessionSticky struct {
 		Enabled    bool   `json:"enabled"`     // 默认 true
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
@@ -175,6 +198,10 @@ func Default() *Config {
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
+	// 模型名协议缺省：去域前缀（裸名）+ 裸名默认落 global。键缺席时 Default() 的值
+	// 被原样保留，只有显式配置才覆盖。
+	c.Models.StripRealmPrefix = true
+	c.Models.RealmPrecedence = "global"
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -445,6 +472,14 @@ func (c *Config) normalize() error {
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
+	}
+	// models.realm_precedence：只认 cn/global；空（键缺席时 Default() 已置 global，
+	// 此处覆盖显式 ""）与非法值统一回落 global，不静默变成 cn。
+	switch strings.ToLower(strings.TrimSpace(c.Models.RealmPrecedence)) {
+	case "cn":
+		c.Models.RealmPrecedence = "cn"
+	default:
+		c.Models.RealmPrecedence = "global"
 	}
 	return c.normalizePrompt()
 }

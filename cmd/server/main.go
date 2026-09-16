@@ -30,7 +30,15 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.9.1-panel"
+//
+// 这里是**本地构建的默认值**；正式发布由 CI 从 git tag 注入：
+//
+//	go build -ldflags "-X main.appVersion=v1.9.2"
+//
+// 之所以用 var 而非 const：const 无法被 -ldflags -X 覆盖，版本号就得手改源码，
+// 于是很容易留下 `+dirty` / `+realmfix` 这类构建期后缀与源码里写死的字符串对不上。
+// 单一来源 = git tag，产物版本号永远可复现、无后缀。
+var appVersion = "v1.9.2"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -104,9 +112,9 @@ func main() {
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
 			Available:  p.AvailableUIDs,
-			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
-			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
-			AvailableForModel: realmAwareAvailableForModel(p),
+			// realm 感知闭包：显式前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
+			// 裸名的域归属走同一 RealmRouter（单域部署落唯一可用域），与请求路由零漂移。
+			AvailableForModel: realmAwareAvailableForModel(p, cfg.realmRouter(p)),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -220,6 +228,10 @@ func main() {
 	// 变量前置 + saveConfig 内 nil 保护解开（SaveConfig 只在请求期被调，彼时
 	// handler 必已就位）。
 	var chatHandler *server.Handler
+	// 对外展示口径（隐藏名单 + 写死内置条目）：panel 与 handler 共用同一份，
+	// 避免"面板看得见、客户端调不到"的两处投影漂移。
+	hiddenModels := upstream.ResolveHiddenModels(cfg.Models.HiddenModels)
+	pinnedModels := upstream.ResolvePinnedModels(cfg.Models.PinnedModels)
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -231,10 +243,13 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// 隐藏名单 / 写死条目与 handler 共用同一份（面板看得见的模型，客户端一定调得到）。
+		HiddenModels: hiddenModels,
+		PinnedModels: pinnedModels,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
-		ConfigPath:  *cfgPath,
+		ConfigPath: *cfgPath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -258,9 +273,15 @@ func main() {
 		Usage:        rec,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
-		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
+		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
-		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		// 对外模型名协议：缺省去域前缀（单域部署不再出现 "global:"/"cn:"）。
+		// 显式前缀在入站方向仍被解析，老客户端配置不受影响。
+		StripRealmPrefix: cfg.Models.StripRealmPrefix,
+		RealmPrecedence:  cfg.Models.RealmPrecedence,
+		HiddenModels:     hiddenModels,
+		PinnedModels:     pinnedModels,
+		MaxBodyBytes:     int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 	})
 	chatHandler = h
 

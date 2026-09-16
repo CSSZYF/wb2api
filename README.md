@@ -1,3 +1,35 @@
+> ### 本仓库说明（fork）
+>
+> 基于上游 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) `v1.9.1` 的修改版。
+> 上游设计的精巧处（账号池调度、错误分类、提示词体系、realm 双域）原样保留，本仓库只做下列改动。
+>
+> **版本号策略**：`main.appVersion` 是 `var` 不是 `const`，正式构建由 CI 从 **git tag 注入**
+> （tag `v1.9.2` → `main.appVersion=v1.9.2`，**原样采用、不剥 v 不加后缀**）。单一来源 = tag，
+> 所以产物版本号可复现、**不带 `+dirty` 之类的构建期后缀**。本地构建不注入则用源码默认值。
+>
+> **镜像**：多架构 `linux/amd64` + `linux/arm64`，由 GitHub Actions 构建并推送：
+>
+> ```bash
+> docker run -d --name wb2api -p 7863:7863 >   -v "$PWD/auths:/app/auths" -v "$PWD/data:/app/data" >   -v "$PWD/config.json:/app/config.json" >   ghcr.io/csszyf/<仓库名>:latest
+> ```
+>
+> 宿主目录属主不匹配时用 `--user "$(id -u):$(id -g)"`（见 docker-compose.yml 注释）。
+>
+> **本 fork 的改动**（均有回归测试）：
+>
+> | 改动 | 说明 |
+> |---|---|
+> | 国际版模型目录走 `/v2` 家族 | `/console` 家族在国际站返回 500 网关错误页 —— 面板「拉取模型」502 的根因。`FetchModels` 改为按 realm 选端点序列 |
+> | `/v1/models` 去域前缀 | 缺省输出裸模型名（`models.strip_realm_prefix`），显式 `cn:`/`global:` 前缀仍被解析，老客户端零改动 |
+> | 裸名域归属统一 | 新增 `RealmRouter`（handler 与粘性闭包共用）：单域部署裸名落唯一可用域，多域按 `models.realm_precedence`。此前裸名恒判 `cn`，只登国际版账号的部署裸名必 503 |
+> | 隐藏路由别名 | `default-model` / `fast-model` / `balanced-model` / `primary-model` / `deep-model` 是上游路由策略别名而非真实模型，默认从对外列表隐藏（`models.hidden_models`） |
+> | 写死内置模型 | 上游目录不返回但可调用的模型（如 `deepseek-v4.1-flash`）由 `models.pinned_models` 兜底，面板与 `/v1/models` 同源 |
+> | 模型名归一化 | 去掉冗余厂商标注：`DeepSeek: DeepSeek V4.1 Flash` → `DeepSeek V4.1 Flash` |
+> | 思考字段诊断 | `WB2A_DEBUG_REASONING=1` 时按请求打一行 in/out 思考字段（只打字段、不打消息内容），用于定位"档位调了没区别" |
+> | 多架构 Dockerfile | `TARGETOS`/`TARGETARCH` + `VERSION` 构建参数，`BUILDPLATFORM` 固定构建机避免 qemu 里跑编译器 |
+>
+> 完整改动见 git 历史；`v1.9.1` tag 即上游基线，可直接 diff。
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png" alt="WorkBuddy2API" width="120">
 </p>

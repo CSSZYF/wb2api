@@ -11,11 +11,23 @@
     "soft_rate_max": "2h"
   },
   "schedule": {
-    "checkin_hours": [9, 21],
-    "travel_hours": [9, 21],
-    "activity_hours": [10],
-    "keepalive_hours": [22],
-    "blackcat_hours": [23],
+    "checkin_hours": [
+      9,
+      21
+    ],
+    "travel_hours": [
+      9,
+      21
+    ],
+    "activity_hours": [
+      10
+    ],
+    "keepalive_hours": [
+      22
+    ],
+    "blackcat_hours": [
+      23
+    ],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
@@ -65,5 +77,28 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "models": {
+    "strip_realm_prefix": true,
+    "realm_precedence": "global",
+    "hidden_models": [
+      "default-model",
+      "fast-model",
+      "balanced-model",
+      "primary-model",
+      "deep-model"
+    ],
+    "pinned_models": [
+      {
+        "id": "deepseek-v4.1-flash",
+        "name": "Deepseek-V4.1-Flash",
+        "credits": "x0.03",
+        "context_length": 1000000,
+        "max_output_tokens": 128000,
+        "default_effort": "high",
+        "supports_reasoning": true,
+        "supported_efforts": []
+      }
+    ]
   }
 }

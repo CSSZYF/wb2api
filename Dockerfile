@@ -1,14 +1,30 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.23-alpine AS build
+#
+# 多架构镜像：linux/amd64 + linux/arm64（buildx 一次构建）。
+# 版本号由 CI 从 git tag 注入（build-arg VERSION），写进 main.appVersion ——
+# 产物版本号唯一来源是 tag，不靠手改源码，所以不会出现 +dirty / +自定义后缀。
+#
+# 本地构建：
+#   docker build --build-arg VERSION=1.9.2-panel -t wb2api:1.9.2-panel .
+# 本机无 docker 时由 .github/workflows/docker.yml 在 CI 里构建并推 GHCR。
+
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+# GOFLAGS/CGO_ENABLED 一次设定，四个二进制共用；LDFLAGS 同源，避免版本漂移。
+ENV GOFLAGS=-trimpath \
+    CGO_ENABLED=0
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-# 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit
+# 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。
+RUN LDFLAGS="-s -w -X main.appVersion=${VERSION}" \
+ && go build -ldflags "$LDFLAGS" -o /out/wb2api ./cmd/server \
+ && go build -ldflags "$LDFLAGS" -o /out/signin_bin ./cmd/signin \
+ && go build -ldflags "$LDFLAGS" -o /out/login ./cmd/login \
+ && go build -ldflags "$LDFLAGS" -o /out/credit ./cmd/credit
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。

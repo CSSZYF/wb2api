@@ -500,11 +500,17 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
+//
+// WB2A_DEBUG_REASONING 非空时，改写前后各打一行"思考字段"诊断（in/out）：
+// 用于回答"我调了 off/low/medium/high 感觉一样"到底是客户端没发、还是网关改写了、
+// 还是模型不在能力缓存里。该诊断是唯一能看到出站档位的地方——正常日志只在降级时才出声。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints,
-		c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm))
+	efforts := c.effortsSnapshot(realm)
+	defaults := c.defaultEffortsSnapshot(realm)
+	logReasoning("in ", body, efforts, defaults)
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defaults)
+	logReasoning("out", body, efforts, defaults)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -790,27 +796,86 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 // 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
 const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
 
-// FetchModels 调上游动态模型接口。
+// modelsPaths 按 realm 返回模型目录端点候选序列（按序尝试，首个成功即采用）。
+//
+//   - global（国际站）：/v2 家族优先。国际站的 /console 家族返回 500 + HTML 网关
+//     错误页（见 globalModelsProbePaths 注释与线上实测），此前 panel「拉取模型」
+//     拿到 502 + `models api status 500: <html>…500 Internal Server Error…` 即此故；
+//   - cn（国内站）：只有 /console 家族。
+func (c *Client) modelsPaths(a *auth.Auth) []string {
+	if c.globalOn(a) {
+		return []string{
+			"/v2/enterprises/personal/models",
+			"/console/enterprises/personal/models",
+		}
+	}
+	return []string{"/console/enterprises/personal/models"}
+}
+
+// ModelFetchDiag 一次模型目录拉取的诊断快照。
+//
+// 存在的理由：面板「模型与档位」与 /v1/models 看到的都是**筛选后**的结果，
+// 「上游到底给了什么、哪一步筛掉的」不可见时，只能靠猜（例如"deepseek 怎么不在
+// 列表里"——是上游没给、还是 agents 名单没列它、还是被 nonChatModel 滤了）。
+// 本结构把这条链路摊开，只读诊断，不参与任何路由决策。
+type ModelFetchDiag struct {
+	Path        string            `json:"path"`          // 成功的端点路径
+	CliAgentIDs []string          `json:"cli_agent_ids"` // agents[name=cli].models；空 = 上游未给 agents（走全表兜底）
+	Agents      []ModelFetchAgent `json:"agents"`        // 上游 agents 全量：核对"只取 cli"有没有漏掉模型
+	RawModelIDs []string          `json:"raw_model_ids"` // 上游 models[] 的原始 id（nonChatModel 过滤前）
+	AllModelIDs []string          `json:"all_model_ids"` // 通过 nonChatModel 过滤后的全部模型 id（保序）
+	Dropped     []string          `json:"dropped"`       // 在 AllModelIDs 但未进入结果（agents 未列 / disabled）
+}
+
+// ModelFetchAgent 上游 agents 数组的一项（只取诊断需要的字段）。
+type ModelFetchAgent struct {
+	Name   string   `json:"name"`
+	Count  int      `json:"count"`
+	Models []string `json:"models"`
+}
+
+// FetchModels 调上游动态模型接口，端点按 realm 选择（modelsPaths）。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
-// CLI 目录（/console/enterprises/personal/models）决定「能调哪些模型」；
-// IDE /v3/config 覆盖同名模型的窗口 / 思考档（失败则静默保留 CLI 字段）。
+// 模型目录决定「能调哪些模型」；IDE /v3/config 覆盖同名模型的窗口 / 思考档
+// （覆盖用 c.chatBase(a)，因此同样 realm 感知；失败则静默保留目录字段）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	out, _, err := c.FetchModelsDiag(a)
+	return out, err
+}
+
+// FetchModelsDiag 同 FetchModels，另外返回诊断快照（供面板展示"上游给了什么"）。
+func (c *Client) FetchModelsDiag(a *auth.Auth) ([]ModelInfo, ModelFetchDiag, error) {
+	var lastErr error
+	var lastDiag ModelFetchDiag
+	for _, path := range c.modelsPaths(a) {
+		out, diag, err := c.fetchModelsOnce(a, path)
+		if err == nil {
+			return out, diag, nil
+		}
+		lastDiag, lastErr = diag, err
+	}
+	return nil, lastDiag, lastErr
+}
+
+// fetchModelsOnce 单个候选端点拉取 + 解析（含 /v3/config 能力覆盖与 effort 缓存刷新）。
+func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelFetchDiag, error) {
+	diag := ModelFetchDiag{Path: path}
 	// 局部变量名避开 url（本包已 import net/url，同名会造成阅读混淆）。
-	endpoint := c.chatBase(a) + "/console/enterprises/personal/models"
+	endpoint := c.chatBase(a) + path
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, diag, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, diag, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, diag, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -840,10 +905,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("models parse: %w", err)
+		return nil, diag, fmt.Errorf("models parse: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("models api code=%d", env.Code)
+		return nil, diag, fmt.Errorf("models api code=%d", env.Code)
 	}
 	var cliIDs []string
 	for _, ag := range env.Data.Agents {
@@ -852,14 +917,20 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			break
 		}
 	}
-	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no cli agent models found")
+	diag.CliAgentIDs = cliIDs // 空 = 上游未给 cli agents（下游走全表兜底并记录）
+	// agents 全量入诊断：我们只取 name=="cli"，若上游还有 ide/buddyapp 等其他 agent
+	// 且它们列了 cli 没有的模型（"官方客户端看得到、网关看不到"的场景），这里能看出来。
+	for _, ag := range env.Data.Agents {
+		diag.Agents = append(diag.Agents, ModelFetchAgent{
+			Name: ag.Name, Count: len(ag.Models), Models: ag.Models,
+		})
 	}
 	type parsed struct {
 		mi       ModelInfo
 		disabled bool
 	}
 	dynMap := make(map[string]parsed, len(env.Data.Models))
+	allIDs := make([]string, 0, len(env.Data.Models)) // 保上游返回序，供无 agents 时兜底
 	for _, m := range env.Data.Models {
 		// 非对话模型（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
 		// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
@@ -872,7 +943,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 		dynMap[m.ID] = parsed{ModelInfo{
 			ID:                 m.ID,
-			Name:               m.Name,
+			Name:               normalizeModelName(m.Name),
 			ContextWindow:      m.MaxInputTokens,
 			MaxTokens:          m.MaxOutputTokens,
 			MaxAllowedSize:     m.MaxAllowedSize,
@@ -883,15 +954,46 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			SupportsImages:     m.SupportsImages,
 			Credits:            m.Credits,
 		}, m.Disabled}
+		allIDs = append(allIDs, m.ID)
 	}
+	// 原始 id（过滤前）入诊断：区分"上游压根没返回"与"被 nonChatModel 滤掉了"。
+	diag.RawModelIDs = make([]string, 0, len(env.Data.Models))
+	for _, m := range env.Data.Models {
+		diag.RawModelIDs = append(diag.RawModelIDs, m.ID)
+	}
+	// agents 名单决定「能调哪些」（CN /console 形态）。国际站 /v2 形态可能不带 agents：
+	// 此时以过滤后的全表为可用集，而不是整条路径判失败（否则 global 目录永远拿不到
+	// 倍率/档位/上下文，面板那几列全空）。
+	if len(cliIDs) == 0 {
+		cliIDs = allIDs
+	}
+	if len(cliIDs) == 0 {
+		return nil, diag, fmt.Errorf("models api returned empty list")
+	}
+	diag.AllModelIDs = allIDs
+	seen := make(map[string]bool, len(cliIDs))
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		if pm, ok := dynMap[id]; ok && !pm.disabled {
 			out = append(out, pm.mi)
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
+		return nil, diag, fmt.Errorf("models api returned empty list")
+	}
+	// 记账：agent 名单里列了、但最终没进结果的（disabled / 不在 models 表里）。
+	inOut := make(map[string]bool, len(out))
+	for _, mi := range out {
+		inOut[mi.ID] = true
+	}
+	for _, id := range diag.AllModelIDs {
+		if !inOut[id] {
+			diag.Dropped = append(diag.Dropped, id)
+		}
 	}
 	if overlay, err := c.fetchV3ConfigModelMap(a); err == nil && len(overlay) > 0 {
 		out = mergeModelCapabilities(out, overlay)
@@ -918,7 +1020,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.efforts[realmKey(a.Realm())] = cache
 	c.defaultEfforts[realmKey(a.Realm())] = defCache
 	c.effortsMu.Unlock()
-	return out, nil
+	return out, diag, nil
 }
 
 // v3ConfigDomain /v3/config 的 X-Domain：优先账号落盘 domain，否则 chatBase host。
@@ -1000,7 +1102,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 		}
 		out[m.ID] = ModelInfo{
 			ID:                 m.ID,
-			Name:               m.Name,
+			Name:               normalizeModelName(m.Name),
 			ContextWindow:      m.MaxInputTokens,
 			MaxTokens:          m.MaxOutputTokens,
 			MaxAllowedSize:     m.MaxAllowedSize,

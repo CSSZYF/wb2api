@@ -17,6 +17,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,14 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// HiddenModels 对外隐藏的模型名，与 /v1/models 同口径（同一份 upstream.HiddenSet）。
+	// nil = 不隐藏。
+	HiddenModels upstream.HiddenSet
+
+	// PinnedModels 强制内置的模型条目，与 /v1/models 同源：上游目录没给的模型
+	// （账号差异/灰度）也稳定出现在「模型与档位」，面板看得见 = 客户端调得到。
+	PinnedModels []upstream.PinnedModel
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -240,18 +249,38 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 无可用账号 503（先添加账号）；上游失败 502。
+//
+// realm 感知：默认查「池内唯一可用域」（只登国际版账号的部署 → 查 global），可用
+// ?realm=cn|global 显式指定。两条路径的端点家族必须分开——国际站的 /console 家族
+// 返回 500 网关错误页（HTML），这是历史「拉取模型 500」的根因。
+// 无可用账号 503；CN 域上游失败 502。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	acct := p.cfg.Pool.Pick()
+	realm := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("realm")))
+	if realm != "cn" && realm != "global" {
+		realm = "global"
+		if p.cfg.Pool.HasRealm("cn") && !p.cfg.Pool.HasRealm("global") {
+			realm = "cn" // 纯 CN 部署：默认查国内版
+		}
+	}
+	acct := p.cfg.Pool.PickExcludingForRealm(nil, "", realm)
 	if acct == nil {
-		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
+		writeErr(w, http.StatusServiceUnavailable,
+			"没有可用的 "+realm+" 账号：请先在面板添加账号再查询")
 		return
 	}
-	infos, err := p.cfg.Upstream.FetchModels(acct)
+	// 国际站模型目录在 /v2 家族（/console 家族返回 500 网关错误页）——由
+	// upstream.FetchModels 的 modelsPaths 按 realm 选路。两个域走同一条解析路径，
+	// 面板才能拿到倍率/默认档/思考档/上下文/最大输出这五列。
+	infos, diag, err := p.cfg.Upstream.FetchModelsDiag(acct)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
 		return
 	}
+	countUpstream := len(infos)
+	// 写死条目兜底（上游没返回但可调用的模型）；上游给了同名条目时以上游为准。
+	infos = upstream.MergePinned(infos, p.cfg.PinnedModels)
+	// 与 /v1/models 同一份隐藏名单：面板能看见的模型，客户端一定也能调用。
+	infos = p.cfg.HiddenModels.FilterInfo(infos)
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
 		out = append(out, map[string]any{
@@ -268,7 +297,47 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			"credits":              mi.Credits,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"realm":  realm,
+		"models": out,
+		// 只读诊断：上游到底给了什么、哪一步筛掉了谁。nil 切片统一序列化成 []，
+		// 前端与脚本都不用再判 null。
+		"diag": map[string]any{
+			"path":           diag.Path,
+			"cli_agent_ids":  nonNil(diag.CliAgentIDs),
+			"agents":         nonNilAgents(diag.Agents),
+			"raw_model_ids":  nonNil(diag.RawModelIDs),
+			"all_model_ids":  nonNil(diag.AllModelIDs),
+			"dropped":        nonNil(diag.Dropped),
+			"hidden":         p.cfg.HiddenModels.Names(),
+			"pinned":         nonNilPinned(p.cfg.PinnedModels),
+			"count_upstream": countUpstream,
+			"count_shown":    len(out),
+		},
+	})
+}
+
+// nonNil 把 nil 切片换成空切片，避免 JSON 里出现 null（前端 .length 会炸）。
+func nonNil(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
+}
+
+func nonNilAgents(in []upstream.ModelFetchAgent) []upstream.ModelFetchAgent {
+	if in == nil {
+		return []upstream.ModelFetchAgent{}
+	}
+	return in
+}
+
+func nonNilPinned(in []upstream.PinnedModel) []upstream.PinnedModel {
+	if in == nil {
+		return []upstream.PinnedModel{}
+	}
+	return in
 }
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
