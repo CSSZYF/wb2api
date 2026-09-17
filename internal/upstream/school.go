@@ -245,3 +245,30 @@ func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[st
 		},
 	}
 }
+
+// ---- 我的券码（#/prizes?tab=vouchers，2026-09-16 接入）----
+
+// SchoolVoucher 开学季抽奖抽中的第三方券（KFC/瑞幸/酷狗等）。
+// 字段结构按真实响应样本：GET /vouchers 单次拉全（无分页），data.items[]。
+type SchoolVoucher struct {
+	GrantID   int64  `json:"grant_id"`
+	DrawUUID  string `json:"draw_uuid,omitempty"`
+	SKUCode   string `json:"sku_code,omitempty"`   // kfc_ice_cream / voucher_luckin / voucher_kugou …
+	PrizeName string `json:"prize_name,omitempty"` // 肯德基冰淇淋
+	Code      string `json:"code"`                 // 券码本体（复制给店员核销）
+	ValidFrom string `json:"valid_from,omitempty"` // 上游常为空
+	ValidTo   string `json:"valid_to,omitempty"`   // "2026-10-24"
+	GrantedAt string `json:"granted_at,omitempty"` // RFC3339
+}
+
+// SchoolVouchers 查询账号的开学季券码列表（只读）。
+// 抽到积分的记录不在此端点（那是 /rewards 的 type=credit 条目）。
+func (c *Client) SchoolVouchers(a *auth.Auth) ([]SchoolVoucher, error) {
+	var out struct {
+		Items []SchoolVoucher `json:"items"`
+	}
+	if err := c.schoolJSON(a, http.MethodGet, "/vouchers", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}

@@ -367,9 +367,10 @@ func runFirstBuddy(p *Panel, a *auth.Auth) (string, error) {
 // runModelChat 完成 Model_chat_GLM5.2：accept → 真实对话 → 对齐模型上报。
 func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 	const code, modelID, modelName = "Model_chat_GLM5.2", "glm-5.2", "GLM-5.2"
-	// 1. accept（报名；失败不阻塞——行为事件才是判据）
-	if err := p.cfg.Upstream.AcceptTasks(a, []string{code}); err != nil {
-		log.Printf("panel: accept %s: %v（继续走行为链路）", code, err)
+	// 1. accept（报名；失败不阻塞——行为事件才是判据）。
+	// 带登记验证：上游 200+OK 但未落账时行为事件不归账，未登记则重试一次。
+	if accepted, failed := p.acceptVerified(a, []string{code}); len(accepted) == 0 {
+		log.Printf("panel: accept %s 未登记生效（%v），继续走行为链路", code, failed)
 	}
 	time.Sleep(reportGap)
 	// 2. 真实对话一次（判据的最直接证据）
@@ -699,15 +700,21 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			}
 		}
 		if len(codes) > 0 {
-			if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
+			// 验证通过才计数：上游 200+OK 但未登记时归入 error（旧口径只看请求是否成功）。
+			accepted, failed := p.acceptVerified(a, codes)
+			if len(accepted) == 0 {
 				out = append(out, map[string]any{
 					"task_code": "(批量接受)", "status": "error",
-					"message": "接受任务失败（不阻塞后续）: " + err.Error(),
+					"message": fmt.Sprintf("接受任务未登记（%d 个，不阻塞后续）", len(failed)),
 				})
 			} else {
+				msg := fmt.Sprintf("已接受 %d 个任务", len(accepted))
+				if len(failed) > 0 {
+					msg += fmt.Sprintf("，%d 个上游未登记（可重试）", len(failed))
+				}
 				out = append(out, map[string]any{
 					"task_code": "(批量接受)", "status": "done",
-					"message": fmt.Sprintf("已接受 %d 个任务", len(codes)),
+					"message": msg,
 				})
 				time.Sleep(reportGap)
 			}

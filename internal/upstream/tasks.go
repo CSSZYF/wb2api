@@ -120,10 +120,57 @@ func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
 	return out, nil
 }
 
+// AcceptResult 单个任务码的 accept 结果（上游 data.results[] 元素）。
+type AcceptResult struct {
+	TaskCode string `json:"task_code"`
+	Status   string `json:"status"` // accepted / not_accepted / 其他上游口径
+}
+
 // AcceptTasks 接受任务（幂等：已 accepted 时上游返回成功或业务提示，均不视为致命错误）。
-func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
-	_, err := c.growthJSON(a, http.MethodPost, tasksAcceptPath, map[string]any{"task_codes": taskCodes})
-	return err
+//
+// 返回值语义（对照上游 scripts/task_runner.py 的 accept 登记验证）：
+//   - err != nil：请求失败（HTTP/信封错误）；
+//   - err == nil 但 results 为空：上游未给逐条结果（老口径），调用方按"接受成功"处理；
+//   - err == nil 且 results 非空：逐条 status 由调用方判定，**不能只看 HTTP 200**——
+//     实测上游存在 200 + msg=OK 但 results[].status != accepted、服务端未落账的形态，
+//     此时后续行为事件全部不归账（任务永远点不亮）。
+func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) ([]AcceptResult, error) {
+	data, err := c.growthJSON(a, http.MethodPost, tasksAcceptPath, map[string]any{"task_codes": taskCodes})
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Results []AcceptResult `json:"results"`
+	}
+	// data 为空（老响应/无 body）不算错：返回空结果，调用方走宽松分支。
+	if len(data) == 0 || string(data) == "null" {
+		return nil, nil
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, nil // 形状不符时同样走宽松分支，不因解析失败阻断 accept 语义
+	}
+	return resp.Results, nil
+}
+
+// VerifyAccepted 回读任务列表确认 accept 已登记生效。
+//
+// 为什么不能只看 accept 响应：上游可能回 200 + msg=OK 但服务端未落账
+// （accept_status 仍为 not_accepted），此时上报的行为事件全部不归账——
+// 这是"上报成功却不点亮"的根因。判定以回读为准（响应 status 只是初筛）。
+// 查询失败（网络/上游错误）返回 false，由调用方决定是否重试。
+func (c *Client) VerifyAccepted(a *auth.Auth, code string) bool {
+	tasks, err := c.ListTasks(a)
+	if err != nil {
+		return false
+	}
+	for _, t := range tasks {
+		if t.TaskCode != code {
+			continue
+		}
+		// accepted/claimed/completed 等任意非 not_accepted 态都视为登记生效。
+		return t.AcceptStatus != "" && t.AcceptStatus != "not_accepted"
+	}
+	return false // 列表里没有该任务码 → 无法确认登记
 }
 
 // ClaimReward 领取单个任务奖励。
