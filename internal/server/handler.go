@@ -793,10 +793,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats)
+			sErr := upstream.Stream(w, stats)
+			if upstream.IsEmptyStreamError(sErr) {
+				// 上游 200 但空流（0 有效帧）：Stream 已写 error 帧 + [DONE] 兜底
+				// （HTTP 头已发出只能 200），但这是上游缺陷不是成功——日志/状态收敛到
+				// 502 观测，与非流式 Aggregate 空流→502 upstream_parse 同语义
+				// （此前 `_ =` 吞错把失败流记成 200 假成功，运维看到假成功）。
+				// 只认 IsEmptyStreamError：客户端断连的写失败不误标（人已走，
+				// 502 观测没有意义）。
+				st.status = http.StatusBadGateway
+				log.Printf("WARN: [server] stream uid=%s model=%s: empty upstream stream (200+0 frames)", uidPrefix(acct.UID), bareModel)
+			}
 			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
 			st.ttfb = stats.TTFB()
-			st.toks, _ = stats.Tokens()
+			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
+			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
+			// 与非流式走 completionTokens 返回 -1 的口径不一致。
+			if toks, ok := stats.Tokens(); ok {
+				st.toks = toks
+			}
 			rc.Close()
 			return
 		}
