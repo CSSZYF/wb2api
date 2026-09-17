@@ -252,18 +252,32 @@ func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[stri
 	}
 }
 
-// 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
-var staticModels = []map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+// staticCNModelIDs 静态 CN 模型名表（api-reference §5，动态接口失败时的回退）。
+//
+// 只存模型名：窗口 / 输出上限由 upstream.context_catalog 知识表按 id 补真值
+// （2026-09-17 去 1M 编造）。旧实现给全表硬编码 context_length=131072——那是假值，
+// 会让 Codex/ZCode 等按 context_length 决策的客户端提前截断、白白丢上下文。
+var staticCNModelIDs = []string{
+	"glm-5.2",
+	"glm-5.1",
+	"glm-5v-turbo",
+	"kimi-k2.7",
+	"minimax-m3",
+	"hy3",
+	"hy3-preview",
+	"hy3-preview-agent",
+	"deepseek-v4-pro",
+	"deepseek-v4-flash",
+}
+
+// staticCNModels 静态 CN 表条目：走与动态分支同一条 modelEntry 渲染路径，
+// 窗口 / 输出上限取自知识表（未收录则省略字段，不编造）。
+func staticCNModels() []map[string]any {
+	out := make([]map[string]any, 0, len(staticCNModelIDs))
+	for _, id := range staticCNModelIDs {
+		out = append(out, modelEntry("", upstream.ModelInfo{ID: id}))
+	}
+	return out
 }
 
 // dynamicModelsCache 动态模型缓存。
@@ -287,11 +301,57 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length 与 reasoning 档位）。
-// supported_efforts/default_effort 透出上游实际能力（客户端据此渲染思考档位选择）；
-// 未知（静态回退表 / 上游未返回）时省略字段，客户端按自身默认处理。
-// globalModels 国际版（global realm）模型名名单（PLAN §7.2 附录）。
-// 只含模型名、不含倍率。探测失败 / 无 global 账号时直接输出此名单。
+// modelEntry 把上游 ModelInfo 包装成 OpenAI /v1/models 条目（CN 与 global 共用）。
+//
+// 共用同一函数是刻意的：两侧字段集合必须一致，否则一方新增能力（如窗口）时另一方会静默缺失
+// —— global 分支漏 context_length 正是这么来的。任何字段增删都只在此处发生。
+//
+// prefix 为 id 的域前缀；本仓的域前缀统一在 realmEntry 合并阶段按
+// models.strip_realm_prefix 施加（见 modelList），故两处调用都传 ""（裸 id 才能跨域去重）。
+//
+// context_length / max_output_tokens 走 upstream.context_catalog 两级查找
+// （上游动态值权威 → 知识表），**未知即省略字段**：旧实现在这里兜底 131072 是编造值，
+// 会让按 context_length 决策的客户端（Codex/ZCode 等）提前截断、白白丢上下文。
+func modelEntry(prefix string, mi upstream.ModelInfo) map[string]any {
+	entry := map[string]any{
+		"id":       prefix + mi.ID,
+		"object":   "model",
+		"created":  1753600000,
+		"owned_by": "workbuddy",
+	}
+	if ctx, ok := upstream.ContextWindowListing(mi.ID, mi.ContextWindow); ok {
+		entry["context_length"] = ctx
+	}
+	if mo, ok := upstream.MaxOutputTokensListing(mi.ID, mi.MaxTokens); ok {
+		entry["max_output_tokens"] = mo
+	}
+	if len(mi.Efforts) > 0 {
+		entry["supported_efforts"] = mi.Efforts
+	}
+	if mi.DefaultEffort != "" {
+		entry["default_effort"] = mi.DefaultEffort
+	}
+	if mi.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = mi.MaxAllowedSize
+	}
+	if mi.SupportsReasoning {
+		entry["supports_reasoning"] = mi.SupportsReasoning
+		entry["can_disable_thinking"] = mi.CanDisableThinking
+	}
+	if mi.SupportsImages {
+		entry["supports_images"] = true // P1：多模态能力透出
+	}
+	if mi.Credits != "" {
+		entry["credits"] = mi.Credits
+	}
+	return entry
+}
+
+// globalModels 国际版（global realm）模型名静态名单（PLAN §7.2 附录 21 名）。
+// 只含模型名、不含倍率与元数据：无 global 账号 / 探测失败（5min 负缓存）/
+// GlobalEnabled=false 时以此兜底输出（窗口 / 输出上限由 context_catalog 知识表按 id 补齐）；
+// 探测成功时以探测结果为基底，本名单中探测未返回的 id 才按 id 补齐
+// （见 upstream.mergeGlobalModelInfos）。
 var globalModels = upstream.GlobalModelNames
 
 // modelList 模型列表：只列「池内确实有账号的域」，缺省输出裸模型名
@@ -301,6 +361,10 @@ var globalModels = upstream.GlobalModelNames
 // 单域部署（只登国际版账号）结果 = 国际版名单 + 无前缀 + 零 CN 上游调用。
 // 双域都有账号时两域名单合并去重，同名条目按 realm_precedence 先入（展示的是
 // 真正会接这个请求的那一份，与 router 口径一致）。
+//
+// 两域条目共用 modelEntry（字段集合不再漂移）：context_length / max_output_tokens
+// 上游动态值权威、零值时查知识表、未知省略；supported_efforts / default_effort
+// 透出上游实际能力，未知时省略字段（客户端按自身默认处理）。
 func (h *Handler) modelList() []map[string]any {
 	cnOn := h.realmAvailable("cn")
 	glOn := h.realmAvailable("global")
@@ -320,46 +384,13 @@ func (h *Handler) modelList() []map[string]any {
 		infos = h.cfg.HiddenModels.FilterInfo(infos)
 		if len(infos) > 0 {
 			for _, mi := range infos {
-				entry := map[string]any{
-					"id":                mi.ID,
-					"object":            "model",
-					"created":           1753600000,
-					"owned_by":          "workbuddy",
-					"context_length":    mi.ContextWindow,
-					"max_output_tokens": mi.MaxTokens,
-				}
-				if mi.ContextWindow == 0 {
-					entry["context_length"] = 131072 // 兜底
-				}
-				if len(mi.Efforts) > 0 {
-					entry["supported_efforts"] = mi.Efforts
-				}
-				if mi.DefaultEffort != "" {
-					entry["default_effort"] = mi.DefaultEffort
-				}
-				if mi.MaxAllowedSize > 0 {
-					entry["max_allowed_size"] = mi.MaxAllowedSize
-				}
-				if mi.SupportsReasoning {
-					entry["supports_reasoning"] = mi.SupportsReasoning
-					entry["can_disable_thinking"] = mi.CanDisableThinking
-				}
-				if mi.SupportsImages {
-					entry["supports_images"] = true // P1：多模态能力透出
-				}
-				if mi.Credits != "" {
-					entry["credits"] = mi.Credits
-				}
-				cnEntries = append(cnEntries, realmEntry{"cn", entry})
+				cnEntries = append(cnEntries, realmEntry{"cn", modelEntry("", mi)})
 			}
 		} else {
-			for _, m := range staticModels {
-				if id, _ := m["id"].(string); h.cfg.HiddenModels.Has(id) {
+			// 静态兜底：元数据留空，窗口 / 输出上限由知识表按 id 补真值。
+			for _, e := range staticCNModels() {
+				if id, _ := e["id"].(string); h.cfg.HiddenModels.Has(id) {
 					continue
-				}
-				e := make(map[string]any, len(m))
-				for k, v := range m {
-					e[k] = v
 				}
 				cnEntries = append(cnEntries, realmEntry{"cn", e})
 			}
@@ -367,11 +398,11 @@ func (h *Handler) modelList() []map[string]any {
 	}
 
 	// global 模型名单：仅在有 global 账号且 GlobalEnabled=true 时列出（逃生门）。
-	// 名单 = 探测结果 ∪ 静态兜底（fetchGlobalModels 内合并去重）；无 global 账号时
-	// 该分支整体不进（both 场景下 fetchGlobalModels 返回静态名单，仍零上游调用）。
+	// 条目 = 探测结果（带窗口 / 能力元数据）∪ 静态独有 id（fetchGlobalModelInfos 内合并）；
+	// 无 global 账号时该分支整体不进（both 场景下返回静态名单，仍零上游调用）。
 	//
-	// 注意：该名单只有名字、没有能力字段。写死条目（PinnedModels）命中时改用其完整
-	// 快照，避免"列表里有 deepseek、但倍率/窗口全空"的半截投影。
+	// 写死条目（PinnedModels）命中时改用其完整快照，避免"列表里有 deepseek、
+	// 但倍率/窗口全空"的半截投影。
 	pinnedByID := make(map[string]upstream.PinnedModel, len(h.cfg.PinnedModels))
 	for _, pm := range h.cfg.PinnedModels {
 		if pm.ID != "" {
@@ -379,15 +410,10 @@ func (h *Handler) modelList() []map[string]any {
 		}
 	}
 	if glOn || both {
-		for _, id := range h.cfg.HiddenModels.FilterNames(h.fetchGlobalModels()) {
-			entry := map[string]any{
-				"id":       id,
-				"object":   "model",
-				"created":  1753600000,
-				"owned_by": "workbuddy",
-			}
-			if pm, ok := pinnedByID[id]; ok {
-				entry = pm.Entry()
+		for _, mi := range h.cfg.HiddenModels.FilterInfo(h.fetchGlobalModelInfos()) {
+			entry := modelEntry("", mi)
+			if pm, ok := pinnedByID[mi.ID]; ok {
+				entry = pm.Entry() // 完整快照覆盖（含倍率 / 档位）
 			}
 			glEntries = append(glEntries, realmEntry{"global", entry})
 		}
@@ -450,14 +476,22 @@ func (h *Handler) realmAvailable(realm string) bool {
 	return h.cfg.Pool.HasRealm(realm)
 }
 
-// fetchGlobalModels 拉 global realm 模型名目录（探测 ∪ 静态名单，1h 缓存 + 5min 负缓存）。
-// GlobalEnabled=false 时 modelList 已不进入本分支（逃生门在调用方 gate）。
-func (h *Handler) fetchGlobalModels() []string {
+// fetchGlobalModelInfos 拉 global realm 模型目录（探测 ∪ 静态独有 id，1h 缓存 +
+// 5min 负缓存），返回带窗口 / 能力元数据的条目。GlobalEnabled=false 时 modelList 已不
+// 进入本分支（逃生门在调用方 gate）。
+func (h *Handler) fetchGlobalModelInfos() []upstream.ModelInfo {
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
 	if acct == nil {
-		return globalModels // 无 global 账号：直接静态名单，零上游调用
+		// 无 global 账号：输出静态名单（仅 ID，元数据留空），零上游调用。
+		out := make([]upstream.ModelInfo, 0, len(globalModels))
+		for _, id := range globalModels {
+			if id = strings.TrimSpace(id); id != "" {
+				out = append(out, upstream.ModelInfo{ID: id})
+			}
+		}
+		return out
 	}
-	return h.cfg.Upstream.FetchGlobalModels(acct)
+	return h.cfg.Upstream.FetchGlobalModelInfos(acct)
 }
 
 // fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
