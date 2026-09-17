@@ -414,8 +414,15 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.DisabledReason = e.reason
 	}
 	if st.Cooling {
-		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
+		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。口径与 Cooling 判定一致：
+		// 取 until 与 breakerUntil 中更远的截止（发现 5——熔断冷却的号原实现只算
+		// until，显示"冷却中却 0 秒恢复"；BreakerUntil 虽单独透出，两口径不一致
+		// 误导排查）。两者都过期不会进入本分支（Cooling=false）。
+		remain := time.Until(e.until)
+		if b := time.Until(e.breakerUntil); b > remain {
+			remain = b
+		}
+		st.CoolRemaining = int64(remain.Seconds() + 0.999)
 		if st.CoolRemaining < 0 {
 			st.CoolRemaining = 0
 		}
@@ -450,8 +457,10 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 				Until:  mc.Until,
 				Reason: mc.Reason,
 			}
-			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
-			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
+			// 上游「将在 … 重置」的原始墙钟：无论是否被 soft_rate_max 截断都透出——
+			// 未截断时 Until==ResetAt（两者同值），截断时 ResetAt 是真实恢复时刻，
+			// 台账据此始终可见上游权威时点（omitempty 仅在无 ResetAt 的旧数据上省略）。
+			if !mc.ResetAt.IsZero() {
 				row.ResetAt = mc.ResetAt
 			}
 			rows = append(rows, row)

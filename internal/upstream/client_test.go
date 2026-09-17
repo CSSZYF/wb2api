@@ -24,9 +24,25 @@ func TestClassify(t *testing.T) {
 		{402, ``, ErrHardCredit},
 		{400, `{"code":1,"msg":"余额不足"}`, ErrHardCredit},
 		{403, `insufficient credits`, ErrHardCredit},
+		{403, `credits exhausted`, ErrHardCredit},
+		{200, `{"code":1,"msg":"credits exhausted, please top up"}`, ErrHardCredit},
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
+		// 429 + 余额措辞 → 限流语义（fork-scan-absorb T-3，本次修复点）：限流响应
+		// body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+		// hardMarkers 在 429 之前会误判 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。
+		// 状态码是比关键词更权威的信号：真余额耗尽走 402，非 429 的 quota 措辞
+		// 仍归 hardMarkers（上方 {200,"quota exceeded"} 语义不变）。
+		{429, `quota exceeded`, ErrSoftRate},
+		{429, `{"code":1,"msg":"quota exceeded, please wait"}`, ErrSoftRate},
+		{429, `insufficient credits`, ErrSoftRate},
+		{429, `{"code":1,"msg":"额度不足"}`, ErrSoftRate},
+		{429, `积分不足，请充值`, ErrSoftRate},
+		// 429 + 账号级故障码防回归（accountFault 仍先于 429 判定）：429+14017 若
+		// 落到 status==429 会误归 soft_rate，账号级故障等不来自愈。
+		{429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
+		{429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
 		// 限流文案（issue #28）：状态码不是 429 时也必须识别为软限流，
 		// 否则账号不会被冷却，下次请求仍会被选中。
 		{200, `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`, ErrSoftRate},
@@ -66,6 +82,54 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestClassifyRateLimitWithQuotaIsSoft 429 + quota/额度措辞 → ErrSoftRate（fork-scan-absorb T-3）。
+// 修复前 hardMarkers 先于 status==429 判定，429 body 高频携带的 "quota exceeded"/"额度不足"
+// 会被误归 ErrHardCredit → CooldownUntilTomorrow4AM 硬冷却到次日 04:00（白扔号约 12h），
+// 多号同因被推即"全池一起熔断"。状态码是比关键词更权威的信号：真余额耗尽走 402，
+// 非 429 的 quota 措辞仍归 hardMarkers（见 TestClassify 的 {200,"quota exceeded"}）。
+func TestClassifyRateLimitWithQuotaIsSoft(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"纯文本 quota exceeded", `quota exceeded`},
+		{"信封 msg quota exceeded", `{"code":1,"msg":"quota exceeded, please wait"}`},
+		{"insufficient credits", `insufficient credits`},
+		{"中文 额度不足", `{"code":1,"msg":"额度不足"}`},
+		{"中文 积分不足", `积分不足，请充值`},
+		{"quota exhaust", `{"code":1,"msg":"quota exhaust"}`},
+	}
+	for _, c := range cases {
+		if got := Classify(429, c.body); got != ErrSoftRate {
+			t.Errorf("%s: Classify(429,%q)=%v want ErrSoftRate（429 限流语义优先于计费措辞）", c.name, c.body, got)
+		}
+	}
+	// 非 429 的同一措辞仍归 hardMarkers（历史语义不变，只有 429 前置接管）。
+	if got := Classify(200, `quota exceeded`); got != ErrHardCredit {
+		t.Errorf("Classify(200, quota exceeded)=%v want ErrHardCredit（非 429 语义不变）", got)
+	}
+	if got := Classify(403, `insufficient credits`); got != ErrHardCredit {
+		t.Errorf("Classify(403, insufficient credits)=%v want ErrHardCredit（非 429 语义不变）", got)
+	}
+}
+
+// TestClassifyCreditsExhaustedPlural 余额不足词表补英文复数 "credits exhausted"
+// （对齐上游口径）：漏判会落到 4xx → ErrClient 只换号不硬冷却，坏号留在池内反复刷计费失败。
+func TestClassifyCreditsExhaustedPlural(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{403, `credits exhausted`},
+		{200, `{"code":1,"msg":"credits exhausted, please top up"}`},
+		{400, `Credits Exhausted`},
+	} {
+		if got := Classify(tc.status, tc.body); got != ErrHardCredit {
+			t.Errorf("Classify(%d,%q)=%v want ErrHardCredit（复数 credits exhausted 已收录）", tc.status, tc.body, got)
+		}
+	}
+}
+
 // TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
 func TestIsModelRateLimit(t *testing.T) {
 	cases := []struct {
@@ -86,8 +150,10 @@ func TestIsModelRateLimit(t *testing.T) {
 	}
 }
 
-// TestParseSoftRateReset 解析上游 429 6004 msg 里的「将在 … 重置」时间（## UTC+8）。
-func TestParseSoftRateReset(t *testing.T) {
+// TestParseRateReset 统一解析任意限流响应（6004 **和** 非 6004，如 11140 rate-limiting）
+// msg 里的「将在 … 重置」时间（UTC+8）。旧语义（非 6004 带时间 → false）是有意推翻的：
+// 11140 的 rate-limiting 变体带重置时间时同样应被精确对齐到上游重置墙钟。
+func TestParseRateReset(t *testing.T) {
 	future := time.Now().Add(35 * time.Minute)
 	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
 	cases := []struct {
@@ -97,14 +163,14 @@ func TestParseSoftRateReset(t *testing.T) {
 	}{
 		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
+		{"11140 rate-limiting 带时间(账号级也应对齐)", `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
-		{"非 6004 但带时间（不是模型级）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := ParseSoftRateReset(c.body)
+			got, ok := ParseRateReset(c.body)
 			if ok != c.ok {
 				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
 			}
@@ -121,6 +187,60 @@ func TestParseSoftRateReset(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestParseSoftRateResetAlias 旧函数名保留为兼容别名：与 ParseRateReset 等价
+// （含「非 6004 带时间 → true」的新语义，不再被 6004 门禁）。
+func TestParseSoftRateResetAlias(t *testing.T) {
+	future := time.Now().Add(35 * time.Minute)
+	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
+	body := `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`
+	got, ok := ParseSoftRateReset(body)
+	if !ok {
+		t.Fatalf("alias should parse non-6004 body with reset time (body=%s)", body)
+	}
+	want, ok2 := ParseRateReset(body)
+	if !ok2 || !got.Equal(want) {
+		t.Errorf("alias=%v want %v（与 ParseRateReset 等价）", got, want)
+	}
+}
+
+// TestClassifyPromptTooLong 11115「prompt is too long」三形态分类：
+// code 数字 / code 字符串 / msg 文案，均归 ErrPromptTooLong；只认 400/404/413。
+func TestClassifyPromptTooLong(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   ErrKind
+	}{
+		{"400 code 数字", 400, `{"code":11115,"msg":"prompt is too long"}`, ErrPromptTooLong},
+		{"400 code 字符串", 400, `{"code":"11115","msg":"x"}`, ErrPromptTooLong},
+		{"400 msg 文案", 400, `{"code":1,"msg":"prompt is too long: 120000 tokens > 65536 maximum"}`, ErrPromptTooLong},
+		{"404 code 数字（不落 ErrNotFound）", 404, `{"code":11115,"msg":"prompt is too long"}`, ErrPromptTooLong},
+		{"413 code 数字", 413, `{"code":11115,"msg":"prompt is too long"}`, ErrPromptTooLong},
+		{"400 大小写不敏感", 400, `Prompt Is Too Long`, ErrPromptTooLong},
+		// 状态码门禁：429 限流语义优先、5xx 服务端故障优先（只认请求级 4xx）。
+		{"429 带 11115 仍限流", 429, `{"code":11115,"msg":"prompt is too long"}`, ErrSoftRate},
+		{"500 带 11115 仍 5xx", 500, `{"code":11115,"msg":"prompt is too long"}`, ErrServer},
+		// 撞 requestId 不算（只认 code 字段形态与 msg 文案）。
+		{"400 requestId 含 11115 不算", 400, `{"requestId":"11115","msg":"ok"}`, ErrClient},
+	}
+	for _, c := range cases {
+		if got := Classify(c.status, c.body); got != c.want {
+			t.Errorf("%s: Classify(%d,%q)=%v want %v", c.name, c.status, c.body, got, c.want)
+		}
+	}
+	// IsPromptTooLong 与 Classify 同口径（handler 末端透传分支用）。
+	if !IsPromptTooLong(400, `{"code":11115,"msg":"prompt is too long"}`) {
+		t.Error("IsPromptTooLong(400, 11115) should be true")
+	}
+	if IsPromptTooLong(429, `{"code":11115,"msg":"prompt is too long"}`) {
+		t.Error("IsPromptTooLong must reject 429 (rate-limit semantics first)")
+	}
+	if IsPromptTooLong(400, `{"code":1,"msg":"ok"}`) {
+		t.Error("IsPromptTooLong must reject bodies without 11115 markers")
 	}
 }
 
@@ -179,6 +299,68 @@ func TestRefreshPreservesExpiryWhenOmitted(t *testing.T) {
 	}
 	if a.RefreshToken != "rt" {
 		t.Errorf("refreshToken should be preserved, got %s", a.RefreshToken)
+	}
+}
+
+// TestRefreshTokenExpiresInCap expiresIn 量级上限：上游脏值（如 99999999999 秒 ≈ 3170 年）
+// 不得把 ExpiresAt 推到荒谬未来（NeedsRefresh 永假 → token 永不刷新反而真过期失效）。
+// 上限 10 年（上游实测响应恒 expiresIn=5184000=60d，10 年是纯防御量级）。
+// 超限按脏值处理：保留旧 ExpiresAt（与缺省分支同语义），token 本身仍写回。
+func TestRefreshTokenExpiresInCap(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":99999999999}}`), nil
+	})
+	oldExpiry := time.Now().Add(time.Hour).Unix()
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: oldExpiry}
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if a.ExpiresAt != oldExpiry {
+		t.Errorf("脏 expiresIn 应保留旧 ExpiresAt=%d, got %d（被推到荒谬未来）", oldExpiry, a.ExpiresAt)
+	}
+	// token 本身仍应写回（脏 expiresIn 只否决过期时间，不否决凭证）。
+	if a.AccessToken != "newat" || a.RefreshToken != "newrt" {
+		t.Errorf("tokens not updated: %+v", a)
+	}
+}
+
+// TestRefreshTokenExpiresInWithinCapApplied 正常量级（60d，上游恒 5184000）不受上限
+// 影响：ExpiresAt 照常推进。
+func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}
+	before := time.Now().Unix()
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	want := before + 5184000
+	if a.ExpiresAt < want-2 || a.ExpiresAt > want+2 {
+		t.Errorf("ExpiresAt=%d want ~%d (60d 正常推进)", a.ExpiresAt, want)
+	}
+}
+
+// TestRefreshTokenExpiresInOverflowRejected 溢出窗口守卫（本仓加强版，**不**照抄上游
+// `time.Duration(tok.ExpiresIn)*time.Second < max` 的写法）：极大 expiresIn 让 Duration
+// 乘法溢出成负数，上游写法会判「在上限内」而写回**过去时刻**（NeedsRefresh 恒真 →
+// 刷新风暴）。本仓用 int64 秒比较，无溢出路径。
+func TestRefreshTokenExpiresInOverflowRejected(t *testing.T) {
+	// 1<<63-1 纳秒 ≈ 292 年；乘 time.Second 必溢出。这里取 maxInt64/1e9*2 量级。
+	const huge = int64(1) << 62 // 4.6e18 秒，Duration 乘法必溢出为负
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, fmt.Sprintf(`{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":%d}}`, huge)), nil
+	})
+	oldExpiry := time.Now().Add(time.Hour).Unix()
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: oldExpiry}
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if a.ExpiresAt != oldExpiry {
+		t.Errorf("溢出 expiresIn 必须保留旧 ExpiresAt=%d, got %d（写回过去时刻会引发刷新风暴）", oldExpiry, a.ExpiresAt)
+	}
+	if a.ExpiresAt < time.Now().Unix() {
+		t.Errorf("ExpiresAt=%d 落在过去时刻（刷新风暴）", a.ExpiresAt)
 	}
 }
 

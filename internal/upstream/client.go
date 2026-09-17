@@ -34,6 +34,7 @@ const (
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -55,6 +56,8 @@ func (k ErrKind) String() string {
 		return "bad_params"
 	case ErrAccountFault:
 		return "account_fault"
+	case ErrPromptTooLong:
+		return "prompt_too_long"
 	case ErrClient:
 		return "client"
 	default:
@@ -75,7 +78,7 @@ func (e *Error) Error() string {
 
 // hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
 var hardMarkers = []string{
-	"insufficient credit", "no credit", "credit exhausted", "out of credit",
+	"insufficient credit", "no credit", "credit exhausted", "credits exhausted", "out of credit",
 	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
 	"not enough credit",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
@@ -112,13 +115,54 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 //     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
 //
 // 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（下方 softRateMarkers
-// 后判定）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案）。
-// 14017 文案唯一（无软限流歧义），可安全收录。
+// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（softRateMarkers 层
+// 判定，见 Classify 顺序）。故此处只收 msg 关键词 "request illegal"（auth_forbidden
+// 的真实文案）。14017 文案唯一（无软限流歧义），可安全收录。
 var accountFaultMarkers = []string{
 	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
+}
+
+// promptTooLongMarkers 11115「prompt is too long」关键词（大小写不敏感子串匹配 +
+// JSON 空格容差 code 形态）。
+//
+// 定位：上下文超限是**请求的问题不是账号的问题**——同一个 body 换任何账号发都会
+// 超限，与内容策略拦截（ErrContentBlocked）同哲学（确定与账号无关的错误不罚号不
+// 轮转，白白浪费健康号的请求配额）。双通道 marker：
+//   - `"code":11115`：业务信封 code 字段（JSON 空格容差，与 11101/6004 的 code 判定
+//     同形态；`"code":"11115"` 字符串形态也命中）；
+//   - "prompt is too long"：msg 文案（大小写不敏感）。
+//
+// 只认 400/404/413 请求级状态码（见 isPromptTooLongStatus）——429 限流语义、5xx
+// 服务端故障优先（与 IsModelRateLimit 只认 6004 同口径：只认确定语义的状态码）。
+// 误判代价（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端
+// 看到上游原文可自行排查。
+var promptTooLongMarkers = []string{
+	`"code":11115`,
+	`"code":"11115"`,
+	"prompt is too long",
+}
+
+// isPromptTooLongStatus 11115 只在请求级 4xx 上判（见 promptTooLongMarkers 注释）。
+func isPromptTooLongStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound ||
+		status == http.StatusRequestEntityTooLarge
+}
+
+// IsPromptTooLong 报告 status+body 是否为上游 11115「prompt is too long」答复。
+// handler 末端透传分支用（透传原文，不罚号不轮转）。
+func IsPromptTooLong(status int, body string) bool {
+	if !isPromptTooLongStatus(status) {
+		return false
+	}
+	lower := strings.ToLower(body)
+	for _, m := range promptTooLongMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
@@ -210,14 +254,16 @@ func IsModelRateLimit(body string) bool {
 	return re.MatchString(body)
 }
 
-// ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
-// 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
-// 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。
-func ParseSoftRateReset(body string) (time.Time, bool) {
-	if !IsModelRateLimit(body) {
-		return time.Time{}, false
-	}
+//
+// 与旧 ParseSoftRateReset 的关键差异：不再被 IsModelRateLimit（6004）门禁。只要是
+// 带「将在 … 重置」的限流文案——6004 模型级、11140 "The model provider is
+// rate-limiting requests." 等任意形态——都提取同一上游权威重置墙钟。是否走模型级
+// 豁免、时点对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
+// IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
+// 的限流也照常由调用方退回有界退避（绝不臆造时间）。
+func ParseRateReset(body string) (time.Time, bool) {
 	re := regexp.MustCompile(softRateResetRe)
 	m := re.FindStringSubmatch(body)
 	if len(m) < 2 {
@@ -232,37 +278,53 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 	return t, true
 }
 
+// ParseSoftRateReset 旧函数名的兼容别名：等价于 ParseRateReset（统一入口）。
+// 保留仅为避免旧调用点/外部引用断裂；新增代码应直接使用 ParseRateReset。
+func ParseSoftRateReset(body string) (time.Time, bool) {
+	return ParseRateReset(body)
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
-//  1. 402 / hardMarkers —— 计费额度耗尽，最严、最不可自愈，必须最先判。
-//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
-//     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
+//  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 //  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
 //     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
 //     比限流层的大范围子串更具体，具体优先于宽泛。
 //  3. accountFaultMarkers —— 账号级授权/配额故障（11140 request illegal auth 风控、
 //     14017 trial not activated register 未完成）。与 429 一起纳入轮换冷却，且必须
-//     先于 softRate/status429 判定：14017 常带 429 状态码，若落到 status==429 兜底
-//     会误归 soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
+//     先于 status==429 判定：14017 常带 429 状态码，若落到 status==429 会误归
+//     soft_rate（"限流"语义不符：限流可退避等自愈，账号级故障等不来）。
 //     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
-//     落到 softRateMarkers 层，不受影响。
-//  4. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
-//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
-//     结果同为 soft_rate，与下一层一致。
-//  5. status==429 —— body 无文案时的兜底识别。
-//  6. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
+//     不在此层命中，后续走 softRateMarkers 层，不受影响。
+//  4. status==429 —— 限流状态码兜底（本层先于 hardMarkers，fork-scan-absorb T-3）：
+//     429 body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+//     若 hardMarkers 先判会把限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约
+//     12h。状态码是比关键词更权威的信号：上游既然给了 429，就按限流语义处理
+//     （宁可短冷却自愈，不可长冷却弃号）；真正的余额耗尽由 402（第 1 层）捕获，
+//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 5 层）。
+//  5. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit；429 场景已由
+//     第 4 层前置接管（issue #28 记录的非 429 反向误判风险保持原样，待上游
+//     原始响应确认后再定）。
+//  6. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 4 层
+//     短路，结果同为 soft_rate。
+//  7. 11115（IsPromptTooLong）—— 「prompt is too long」请求级语义：判在 404/5xx 与
+//     通用 4xx 兜底之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限
+//     与账号无关）。只认 400/404/413（429/5xx 已在上方各自状态码层短路）。
+//  8. 404 / 5xx —— 与限流无关的常规分类。
+//  9. 内容策略/参数错误/其他 4xx —— 通用兜底（内容策略拦截须先于通用 ErrClient，
+//     前者是误报信号、不罚账号，由网关降级重试处理）。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
 	lower := strings.ToLower(body)
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrHardCredit
-		}
-	}
+	// sessionDead / accountFault 先于 status==429（原顺序已如此，此处只是跟随
+	// 429 前移保持相对次序）：账号级终态等不来自愈，限流状态码不得掩盖它们
+	// （429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须 sessionDead）。
 	for _, m := range sessionDeadMarkers {
 		if strings.Contains(body, m) {
 			return ErrSessionDead
@@ -273,13 +335,30 @@ func Classify(status int, body string) ErrKind {
 			return ErrAccountFault
 		}
 	}
+	// status==429 先于 hardMarkers（fork-scan-absorb T-3，本次修复点）：限流响应 body
+	// 高频携带 "quota exceeded"/"额度不足" 等跨两界措辞，hardMarkers 先判会误归
+	// ErrHardCredit 硬冷却到次日 04:00。402 真余额在上层已判；非 429 的 quota
+	// 措辞仍走下方 hardMarkers，历史语义不变。
+	if status == http.StatusTooManyRequests {
+		return ErrSoftRate
+	}
+	for _, m := range hardMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return ErrHardCredit
+		}
+	}
 	for _, m := range softRateMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrSoftRate
 		}
 	}
-	if status == http.StatusTooManyRequests {
-		return ErrSoftRate
+	// 11115「prompt is too long」：判在 404/5xx/内容策略/参数错误/通用 4xx
+	// 之前——请求级语义最具体（上下文超限），须先于宽泛的状态码兜底（404 兜底会
+	// 误归 ErrNotFound 只冷却不透传；ErrClient 只换号，浪费健康号配额）。只认
+	// 请求级 4xx 状态码（见 isPromptTooLongStatus），429/5xx 在上方已被各自
+	// 状态码层短路（限流/服务端故障语义优先）。
+	if IsPromptTooLong(status, body) {
+		return ErrPromptTooLong
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
@@ -616,6 +695,11 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 // refreshIOTimeout 刷新端点网络 I/O 上限（两段式锁外执行，防上游 hang 长占锁）。
 const refreshIOTimeout = 30 * time.Second
 
+// refreshTokenExpiresInMax refresh 响应 expiresIn 的量级上限（10 年，纯防御值：
+// 实测上游响应恒 5184000=60d）。超限视为上游脏数据，不写 ExpiresAt（保留旧值），
+// 防止 NeedsRefresh 永假导致 token 永不刷新反而真过期失效。
+const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
+
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。
 //
@@ -676,6 +760,11 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	// 第 2 段（锁内）：校验快照一致后写回。
 	a.Lock()
 	defer a.Unlock()
+	// 写回守卫是 AND 语义：锁外期间另一刷新已完成 → 两 token 必同时变化（上游
+	// refresh 响应 accessToken/refreshToken 总是一起 rotate，写回也同时写两个），
+	// AND 即「并发刷新已完成」判据；AND 与 OR 在真实形态下等价。唯 OR 会额外放弃的
+	// 「只有单 token 变化」（如手工只改 auth 文件一个字段）不构成放弃条件——本次
+	// 结果覆盖手工编辑。
 	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
 		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
 		// （两个并发刷新拿到的新 token 都有效，后写会覆盖先写，但二者等价可用；
@@ -690,7 +779,16 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		a.Domain = tok.Domain
 	}
 	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
-	if tok.ExpiresIn > 0 {
+	// 实测上游响应恒带 expiresIn=5184000（60d）——缺省分支仅为防御，保留旧值
+	// 避免过期判定漂移。同理，超过 10 年的 expiresIn 按脏值处理保留旧值：
+	// 超量级值只会是上游脏数据，照写会把 ExpiresAt 推到荒谬未来 → NeedsRefresh
+	// 永假 → token 永不刷新反而真过期失效。
+	//
+	// 守卫写法：用 int64 比较（秒 < 上限秒数），**不**写
+	// time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax——后者
+	// 在 int64 溢出窗口内（ExpiresIn 极大时 Duration 溢出成负数）会判为「在上限内」
+	// 而写回过去时刻，直接引发刷新风暴。int64 秒比较无溢出。
+	if tok.ExpiresIn > 0 && tok.ExpiresIn < int64(refreshTokenExpiresInMax/time.Second) {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return nil

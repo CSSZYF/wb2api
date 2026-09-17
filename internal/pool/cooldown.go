@@ -1,5 +1,6 @@
-// 冷却与熔断：Cooldown/CooldownSoftForModel（软退避指数升级）、软冷却封顶、
-// 熔断失败累计、签到解冻（ReenableIfCredits/reviveCoolingLocked）。
+// 冷却与熔断：Cooldown（固定时长账号级冷却）、CooldownSoftRate（账号级软冷却，对齐
+// 上游重置时间或有界退避）、CooldownSoftForModel（模型级软冷却，对齐重置墙钟）、
+// 软冷却封顶、熔断失败累计、签到解冻（ReenableIfCredits/reviveCoolingLocked）。
 package pool
 
 import (
@@ -37,22 +38,17 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
 }
 
 // Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）。
-// 冷却入口同时是熔断器的失败信号：喂入 fails，达到阈值按指数退避熔断（与 until 正交）。
 //
-// CoolSoft 额外做**连续软限流指数退避**：同一账号连续触发软冷却时，实际时长按
-// d << (softStreak-1) 逐次翻倍（封顶 softRateMax，见 softDurationLocked）。
-// 首 streak=1 → 实际时长 = d，单次调用语义与旧行为一致。
-// 这就是与熔断器并存的双重升级，且是**有意为之**：软退避管"近期被限流"，
-// 在 600s 起按分钟~小时级放大；熔断管"病态反复失败"，按 30m→1h→2h→6h 长期封禁。
-// 二者喂入路径共用本入口但计数器独立（softStreak vs fails），互不污染。
+// 重构后本入口是「固定时长的账号级冷却」，不再做两件旧事：
+//   - 不再喂熔断器失败计数：熔断器只对「反复失败」（NoteError，5xx）退避。
+//     软限流/余额耗尽各有权威恢复时刻（重置墙钟 / 04:00 签到），再并入"连续失败"
+//     会让用户正常重试越堆越厚。熔断语义由 NoteError 唯一驱动（与 until 正交保持）。
+//   - 不再做 softStreak 指数堆加：固定 d 即最终时长。软限流的精确对齐/有界退避
+//     走 CooldownSoftRate（账号级）与 CooldownSoftForModel（模型级）。
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		if kind == CoolSoft {
-			e.softStreak++
-			d = p.softDurationLocked(d, e.softStreak)
-		}
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
@@ -60,69 +56,100 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		// 避免上一次模型级限流的模型豁免泄漏到本次**账号级**限流上
 		// （否则换模型请求会错误绕过本次冷却）。
 		e.modelCooldowns = nil
-		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
 		p.dirty.Store(true)
 	}
 }
 
-// CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）。
-// 区别于 Cooldown：当上游 6004 明说「将在 … 重置」时，把 **该模型** 的冷却截止精确
-// 设为 resetAt（上游给定时间，不再靠固定基数+指数退避猜测），记录到独立的
-// modelCooldowns[model]——每模型独立计时，多个模型同时 6004 互不覆盖（这是单 until
-// 字段做不到的）。不写 until（全账号级冷却不受 6004 污染）。
+// CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）：把该模型的冷却截止
+// 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
 //
-// 收窄规则（与旧实现一致）：
-//   - resetAt 非零（6004 带解析时间）→ modelCooldowns[model].Until = min(resetAt,
-//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。指数退避
-//     **不适用**：重置时间已是上游权威，再指数放大会无视它明说的恢复时刻。
-//   - resetAt 零值（6004 无时间文案 / 非 6004 的 soft）→ 完全退回 Cooldown 现状
-//     （soft_streak 指数退避 + 封顶 soft_rate_max，写 until），不记录模型（不豁免）。
+//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
+//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
+//     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
+//   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
+//     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
+//     冷却越堆越厚）。不记录模型（不豁免）。
 //
-// 熔断信号照旧喂入（冷却与熔断正交，行为与 Cooldown 一致）；softStreak 仍递增
-// （无论是否命中解析时间）——解析时间的冷却**不**参与指数退避，但 softStreak 计数
-// 照常累加，后续无时间的 6004 从当前 streak 继续退避（与任务书口径一致）。
+// 与旧实现的差异：有上游重置时间时绝对不做指数堆加（旧实现无论是否命中解析时间都
+// softStreak++，退避计数被无谓污染）；无重置时间时，「冷却中兜底探测再 429」不再
+// softStreak++ 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.softStreak++
-		hasReset := !resetAt.IsZero()
-		d := p.softDurationLocked(base, e.softStreak)
-		if hasReset {
-			// 有上游重置时间：直接取 min(重置墙钟, now+softRateMax)，不做指数放大。
-			now := time.Now()
-			cap := now.Add(p.softRateMaxOr())
-			if resetAt.After(cap) {
-				d = cap.Sub(now)
-			} else if resetAt.After(now) {
-				d = resetAt.Sub(now)
-			} else {
-				// 重置时间已过（时钟偏移/文案过期）：冷却极短，立即恢复。
-				d = time.Millisecond
-			}
-		}
-		e.coolKind = CoolSoft
-		e.reason = reason
-		if hasReset {
-			// 6004 带解析时间：写该模型的独立冷却表（不写 until）。until 截断到封顶，
-			// ResetAt 保留上游原始墙钟（台账 ResetAt 呈现真实恢复时刻）。
-			now := time.Now()
+		now := time.Now()
+		if !resetAt.IsZero() {
+			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
 			e.modelCooldowns[model] = modelCooldown{
-				Until:   now.Add(d),
+				Until:   p.cappedSoftUntilLocked(now, resetAt),
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
 		} else {
-			// 无解析时间（普通软冷却/非 6004）：退回账号级 until 冷却，且清空模型豁免。
-			e.until = time.Now().Add(d)
+			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
+			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
+			if e.coolKind != CoolSoft || !now.Before(e.until) {
+				d := p.softDurationLocked(base, e.softStreak+1)
+				e.softStreak++
+				e.until = now.Add(d)
+			}
+			e.coolKind = CoolSoft
+			e.reason = reason
 			e.modelCooldowns = nil
 		}
-		p.recordBreakerFailureLocked(e) // 冷却入口也是熔断器的失败信号
 		p.dirty.Store(true)
 	}
+}
+
+// CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
+//
+// 语义：
+//   - resetAt 非零（上游带权威重置时间，无论 6004 还是 11140 rate-limiting）→
+//     账号级直到该墙钟（截断到 softRateMax，绝不指数堆加）；**不**在
+//     modelCooldowns 记模型（账号级语义，不产生切模型豁免——普通账号级限流不该因
+//     切模型绕过）。
+//   - resetAt 零值且**不在冷却中**（首次/恢复后的新限流）→ 有界退避：按 softStreak
+//     指数退避并封顶 softRateMax（默认 2h，并经 softDurationLocked 统一封顶）。
+//     softStreak 只在真正进入一次新冷却时计数，由 NoteSuccess/reviveCoolingLocked
+//     清零（既有恢复语义）。
+//   - resetAt 零值且**已在软冷却中**（兜底探测再次撞 429）→ 不推进 streak、不延长
+//     until：用户重试/并发兜底探测不得把冷却越堆越厚——这正是旧实现「越重试越冷、
+//     全池被推到 2h 封顶」的元凶（每次探测都 softStreak++ 指数翻倍）。
+func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Time, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		now := time.Now()
+		if !resetAt.IsZero() {
+			e.until = p.cappedSoftUntilLocked(now, resetAt)
+		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
+			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
+			d := p.softDurationLocked(base, e.softStreak+1)
+			e.softStreak++
+			e.until = now.Add(d)
+		}
+		e.coolKind = CoolSoft
+		e.reason = reason
+		e.modelCooldowns = nil // 账号级软冷却：清空模型豁免（切模型不绕过）
+		p.dirty.Store(true)
+	}
+}
+
+// cappedSoftUntilLocked 把上游重置墙钟截断到 softRateMax（now+softRateMax 与 resetAt
+// 取较早者）。resetAt 已过期（时钟偏移/文案过期）时日长短钳到时间零点附近，立即恢复。
+// 调用方必须已持有 p.mu。
+func (p *Pool) cappedSoftUntilLocked(now, resetAt time.Time) time.Time {
+	cap := now.Add(p.softRateMaxOr())
+	if resetAt.After(cap) {
+		return cap
+	}
+	if resetAt.After(now) {
+		return resetAt
+	}
+	return now.Add(time.Millisecond)
 }
 
 // softRateMaxOr 返回生效的 softRateMax（未注入时按默认 2h），供封顶计算。

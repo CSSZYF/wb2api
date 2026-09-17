@@ -9,10 +9,10 @@
 // 迁移矩阵（事件 → 动作 → 字段）：
 //
 //	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
-//	until/coolKind     ← Cooldown(CoolSoft/Hard) / CooldownSoftForModel 无解析分支
+//	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked 清
-//	breakerUntil       ← recordBreakerFailureLocked（Cooldown/NoteError 喂入）；NoteSuccess 清
-//	softStreak         ← Cooldown(CoolSoft)/CooldownSoftForModel；NoteSuccess/reviveCoolingLocked 清
+//	breakerUntil       ← recordBreakerFailureLocked（NoteError 唯一喂入）；NoteSuccess 清
+//	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/reviveCoolingLocked 清
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
 //
 // 关键正交性（疑点 4 修正）：

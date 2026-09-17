@@ -39,7 +39,7 @@ type Config struct {
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
 	RedisMode    string
-	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
+	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（无重置时间时有界退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
@@ -143,7 +143,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.MaxRotate = 3
 	}
 	if cfg.SoftCooldown <= 0 {
-		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）
+		cfg.SoftCooldown = 600 * time.Second // 软限流基数（无上游重置时间时按有界退避放大）
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
@@ -485,8 +485,9 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
-		h.cfg.Pool.NoteError(acct.UID)
+		// 拉取失败只进负缓存（5min lastFail），不 NoteError（P1-6/发现 6）：
+		// NoteError 喂的是 chat 熔断器，models 端点偶发 5xx 会跨界惩罚 chat 通道
+		// 健康的账号；models 拉取失败 ≠ 账号 chat 不可用。
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
@@ -761,6 +762,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
+			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
+			// 与内容策略拦截同哲学：确定与账号无关的错误直接终止轮转）。
+			// applyErrorPolicy ErrPromptTooLong 分支零动作（不冷却/不熔断/不 NoteError，
+			// 不喂连败），fail 只释放租约。error-passthrough：message 装上游 body 原文
+			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
+			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
+			if kind == upstream.ErrPromptTooLong {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
+				fail(acct.UID)
+				writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)))
+				st.status = http.StatusBadRequest
+				return
+			}
+			// lastErr 携带完整 body（不透传上游侧截断后的短文案，末端 503 需要原文
+			// 全量以便排查）+ Kind/Status（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
 			fail(acct.UID)
@@ -810,17 +827,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
 //
-// 七条路径，各司其职：
+// 路径清单，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 默认 Cooldown(CoolSoft, soft_rate) 连续触发指数退避（封顶 soft_rate_max）；
-//     若上游 body 为模型级 6004 且带重置时间 → CooldownSoftForModel（until=重置墙钟，
-//     封顶 soft_rate_max，记录触发模型供切模型豁免）。
+//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
+//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
+//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError），passthrough 模式走降级重试。
+//   - ErrPromptTooLong → 11115「prompt is too long」：请求的问题不是账号的问题
+//     （同一 body 换任何号都超限）。零动作（不冷却/不熔断/不 NoteError、不喂连败，
+//     同 ErrContentBlocked 待遇），chatCompletions 已直接透传原文返回不轮转——
+//     该分支只为文档完备，不指望走到换号路径。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
-//     达到 breakerThreshold 触发熔断（指数退避）。
+//     达到 breakerThreshold 触发熔断（指数退避）。这是**唯一**的熔断入口。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
@@ -835,19 +856,25 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 模型级 6004 且带「将在 … 重置」时间（issue #31）：冷却到上游明说的重置墙钟
-		// （封顶 soft_rate_max），记录触发模型 → 该账号对**其他模型**请求可豁免冷却。
-		// 解析失败（无时间文案 / 非 6004）→ 退回既有 600s 基数 + 指数退避现况。
+		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
+		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
+		// softStreak 指数堆加。
+		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
+		//     豁免（既有 issue #31 语义）。
+		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
+		//     （普通账号级限流不该因切模型绕过）。
 		// 基数一律取 h.softCooldown()（热改优先），管理面板改 soft_rate 后立即生效。
-		if upstream.IsModelRateLimit(body) {
-			if resetAt, ok := upstream.ParseSoftRateReset(body); ok {
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
+			if upstream.IsModelRateLimit(body) {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
 				return
 			}
+			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
+			return
 		}
-		// 其余 soft_rate：软冷却基数来自 soft_rate（默认 600s）；同一账号连续触发时
-		// pool 内部按 softStreak 指数退避并封顶 soft_rate_max。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "429 rate limit")
+		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
+		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
+		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
@@ -874,6 +901,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrContentBlocked:
 		// 内容策略拦截（误报）：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 模式由 chatCompletions 内降级重试处理；custom 模式本不会到此分支。
+	case upstream.ErrPromptTooLong:
+		// 11115「prompt is too long」：请求的问题不是账号的问题（同一 body 换任何
+		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked
+		// 待遇），chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备，
+		// 不指望走到换号路径。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
@@ -882,6 +914,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}
+}
+
+// promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/
+// 上限值/requestId，客户端自行排查）；空 body 兜底为可读分类短文案（不编造原文）。
+func promptTooLongMessage(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return "prompt is too long"
+	}
+	return body
 }
 
 // ---------------------------------------------------------------------------

@@ -65,7 +65,7 @@ type Status struct {
 	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
 	Until         time.Time `json:"until,omitempty"`
 	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（有界退避指数；有重置时间时不计数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
@@ -92,8 +92,8 @@ type RateLimitedModel struct {
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
 	Until time.Time `json:"until,omitempty"`
-	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）；
-	// 截断后 Until==ResetAt 时省略 ResetAt 让台账自然减少一列。
+	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）；未截断时
+	// Until==ResetAt（两者同值）。截断/未截断都透出，台账始终可见上游权威时点。
 	ResetAt time.Time `json:"reset_at,omitempty"`
 	// Reason 触发原因（运维可读文案）。
 	Reason string `json:"reason,omitempty"`
@@ -141,6 +141,9 @@ type entry struct {
 	retryCount   int       // 已熔断次数（指数退避的指数）
 	// softStreak 连续软冷却次数（CoolSoft），独立于熔断器 fails 的**冷却域**计数器：
 	// fails 会被熔断触发清零、且被 hard 冷却与 NoteError 污染，无法表达"连续软限流"。
+	// 只在 CooldownSoftRate / CooldownSoftForModel（无解析时间分支）**进入一次新冷却**
+	// 时递增——冷却中的兜底探测不推进（旧实现每次探测都翻倍，是"全池被推到 2h 封顶"
+	// 的元凶）。有上游权威重置时间时绝不计数（对齐墙钟即最终时长，无退避）。
 	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
@@ -291,8 +294,8 @@ const (
 	defaultBreakerCooldownMax = 6 * time.Hour
 )
 
-// defaultSoftRateMax 软冷却指数退避的默认封顶：softRateMax 未注入（<=0）时按此值算，
-// 避免测试/裸用池时退避无上限。
+// defaultSoftRateMax 软冷却的默认封顶（有界退避的封顶 + 重置墙钟的截断上限）：
+// softRateMax 未注入（<=0）时按此值算，避免测试/裸用池时退避无上限。
 const defaultSoftRateMax = 2 * time.Hour
 
 // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。

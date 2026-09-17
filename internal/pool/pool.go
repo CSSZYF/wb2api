@@ -22,7 +22,8 @@ type Pool struct {
 	breakerThreshold   int
 	breakerCooldown    time.Duration
 	breakerCooldownMax time.Duration
-	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
+	// softRateMax 软冷却的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）：
+	// 同时封顶「无重置时间的有界退避」与「对齐上游重置墙钟时的截断」。
 	softRateMax time.Duration
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
@@ -92,7 +93,8 @@ func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 	}
 }
 
-// SetSoftRateMax 注入软冷却指数退避的封顶时长（main 从 config 解析后调用）。
+// SetSoftRateMax 注入软冷却的封顶时长（main 从 config 解析后调用）：既封顶无重置
+// 时间时的有界退避，也截断对齐上游重置墙钟的冷却截止。
 // 非正值保留原值（用默认 2h），风格同 SetBreaker。
 func (p *Pool) SetSoftRateMax(d time.Duration) {
 	p.mu.Lock()

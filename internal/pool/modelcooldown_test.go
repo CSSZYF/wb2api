@@ -72,7 +72,8 @@ func TestModelCooldownsBDoesNotOverwriteA(t *testing.T) {
 }
 
 // TestCooldownSoftForModelDoesNotClobberUntil 带解析时间的 6004 不写 until
-// （否则全账号级冷却被模型重置时间污染），只写 modelCooldowns[model]。
+// （否则全账号级冷却被模型重置时间污染），只写 modelCooldowns[model]，且不推进
+// softStreak（有上游权威重置时间时绝不做指数堆加）。
 func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -81,10 +82,14 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	p.mu.RLock()
 	e := p.byUID["u1"]
 	until := e.until
+	streak := e.softStreak
 	mc, ok := e.modelCooldowns["glm-5.3"]
 	p.mu.RUnlock()
 	if !until.IsZero() {
 		t.Errorf("until=%v 应零值（6004 不写 until）", until)
+	}
+	if streak != 0 {
+		t.Errorf("soft_streak=%d 应保持 0（有重置时间绝不指数堆加）", streak)
 	}
 	if !ok || mc.Until.IsZero() {
 		t.Errorf("modelCooldowns[glm-5.3]=%+v ok=%v，应已记录模型冷却", mc, ok)
@@ -92,7 +97,8 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 }
 
 // TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
+// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）；
+// 且不推进 softStreak（截断是封顶而非退避）。
 func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -101,9 +107,13 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	streak := p.byUID["u1"].softStreak
 	p.mu.RUnlock()
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
+	}
+	if streak != 0 {
+		t.Errorf("soft_streak=%d 应保持 0（有重置时间绝不指数堆加）", streak)
 	}
 	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
 		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)

@@ -457,65 +457,102 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	}
 }
 
-// TestApplyErrorPolicySoftRateExponentialBackoff handler 层回归：同一账号连续被限流，
-// 冷却时长必须 600s → 1200s → 2400s 指数增长（时长断言全部取自注入值，不依赖真实等待）。
-// 直接驱动 applyErrorPolicy 而非发 HTTP 请求：账号在冷却期内不会被再次选中，
-// 走完整请求会需要等冷却自然到期（真实 sleep），而这里要验的正是"连续限流"的退避本身。
+// TestApplyErrorPolicySoftRateNoDoubleWhenCooling handler 层回归：无重置时间的 429
+// 保留有界冷却，但**冷却中的兜底探测不得翻倍**（这正是旧实现「越重试越冷」的根因，
+// 全池被推到 2h 封顶的元凶）。时长断言全部取自注入值，不依赖真实等待。
 // Classify→applyErrorPolicy 的接线由 TestChatSoftCoolsOnRateLimitBody 端到端覆盖。
-func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
+func TestApplyErrorPolicySoftRateNoDoubleWhenCooling(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-	for i, want := range []int64{600, 1200, 2400} {
+	// 第 1 次：进入冷却，streak=1，600s（固定基数，无重置时间）。
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("call 1: 应为 soft_rate 冷却: %+v", st)
+	}
+	if st.SoftStreak != 1 {
+		t.Errorf("call 1: soft_streak=%d want 1", st.SoftStreak)
+	}
+	if st.CoolRemaining < 597 || st.CoolRemaining > 600 {
+		t.Errorf("call 1: cool_remaining_sec=%d want ~600", st.CoolRemaining)
+	}
+
+	// 冷却中重复触发（兜底探测）→ 不翻倍、不推进 streak。
+	before := st.CoolRemaining
+	for n := 0; n < 3; n++ {
 		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
-		st, _ := p.Status("u1")
-		if !st.Cooling || st.CoolKind != "soft_rate" {
-			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i+1, st)
-		}
-		if st.SoftStreak != i+1 {
-			t.Errorf("call %d: soft_streak=%d want %d", i+1, st.SoftStreak, i+1)
-		}
-		if st.CoolRemaining < want-3 || st.CoolRemaining > want {
-			t.Errorf("call %d: cool_remaining_sec=%d want ~%d", i+1, st.CoolRemaining, want)
-		}
+	}
+	st, _ = p.Status("u1")
+	if st.SoftStreak != 1 {
+		t.Fatalf("already-cooling probe must not advance soft_streak, got %d", st.SoftStreak)
+	}
+	if got := st.CoolRemaining; got < before-3 || got > before {
+		t.Errorf("already-cooling probe must not extend, cool_remaining_sec=%d want ~%d", got, before)
+	}
+}
+
+// TestApplyErrorPolicySoftRateResetTime11140 handler 层回归：非 6004 形态的限流
+// （code 11140 "The model provider is rate-limiting requests." +「将在 … 重置」）同样
+// 必须**精确对齐**到上游重置墙钟，而不是走 600s 基数/有界退避，更不得 softStreak
+// 指数堆加。与 6004 的分野：11140 走账号级 CooldownSoftRate（写 until、不计模型、
+// 不产生切模型豁免），6004 走模型级 CooldownSoftForModel（写 modelCooldowns）。
+func TestApplyErrorPolicySoftRateResetTime11140(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+
+	reset := time.Now().Add(35 * time.Minute) // 远超 soft_rate 基数，验证确实对齐墙钟而非固定 600s
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	body := `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`
+
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "glm-5.3")
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("u1 missing")
+	}
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("应为账号级 soft_rate 冷却: %+v", st)
+	}
+	if st.SoftStreak != 0 {
+		t.Errorf("带重置时间的 429 绝不 softStreak 堆加，soft_streak=%d want 0", st.SoftStreak)
+	}
+	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("账号级 until=%v want ~reset=%v（精确对齐，无退避）", st.Until, reset)
+	}
+	// 非 6004 走账号级，不写模型级台账（不存在切模型豁免）。
+	if len(st.RateLimitedModels) != 0 {
+		t.Errorf("11140 账号级限流不应产生模型级台账: %+v", st.RateLimitedModels)
 	}
 }
 
 // TestApplyErrorPolicyNotFoundUsesFixedBase 404 分流：偶发上游 404 的冷却基数固定 60s
-// （notFoundCooldown），不取 soft_rate 的 600s 基数，也不受其配置值影响。
-//
-// 关于退避：404 仍走 Cooldown(CoolSoft)，因此与 429 共用同一 softStreak（本用例锚定这一
-// 现状）。这不构成"偶发 404 罚过重"的场景——streak 只在**连续**无成功时累积，
-// 中间任何一次成功（NoteSuccess）都会把它清零；故只有持续 404 的坏号才会退避升级。
+// （notFoundCooldown），不取 soft_rate 的 600s 基数，也不受其配置值影响，且不参与
+// softStreak 指数退避（404 是偶发路径缺失，不是限流信号，不该因 404 升级惩罚，
+// 也不该因 404 与 429 共用 softStreak 导致催促升级）。
+// （重构后 404 仍走 Cooldown(CoolSoft) 固定时长分支，softStreak 不再被 404 推进。）
 func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: 20 * time.Minute}) // soft_rate 配得很大，验证 404 不受其影响
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
-	for i, want := range []int64{notFoundSec, 2 * notFoundSec, 4 * notFoundSec} {
+	for i := 0; i < 3; i++ {
 		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft 冷却: %+v", i+1, st)
 		}
-		if st.SoftStreak != i+1 {
-			t.Errorf("call %d: soft_streak=%d want %d", i+1, st.SoftStreak, i+1)
+		if st.SoftStreak != 0 {
+			t.Errorf("call %d: 404 must not advance soft_streak, got %d", i+1, st.SoftStreak)
 		}
-		// 基数取自 notFoundCooldown（60s）而非注入的 soft_rate（20m）。
-		if st.CoolRemaining < want-3 || st.CoolRemaining > want {
-			t.Errorf("call %d: 404 cool_remaining_sec=%d want ~%d（固定基数 %ds，非 soft_rate）",
-				i+1, st.CoolRemaining, want, notFoundSec)
+		// 基数取自 notFoundCooldown（60s）而非注入的 soft_rate（20m），且固定不翻倍
+		// （冷却中重复 404 是兜底探测，不得把 404 冷却也越堆越厚）。
+		if st.CoolRemaining < notFoundSec-3 || st.CoolRemaining > notFoundSec {
+			t.Errorf("call %d: 404 cool_remaining_sec=%d want ~%d（固定基数，非 soft_rate，不翻倍）",
+				i+1, st.CoolRemaining, notFoundSec)
 		}
-	}
-
-	// 成功后 streak 归零 → 下次 404 回到 60s 基数。
-	// （签到解冻 ReenableIfCredits 不适用于本场景：它保留 streak，是冷却域的续期。）
-	p.NoteSuccess("u1")
-	h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
-	if st, _ := p.Status("u1"); st.SoftStreak != 1 || st.CoolRemaining > notFoundSec {
-		t.Errorf("success should reset 404 backoff: %+v", st)
 	}
 }
 
@@ -1016,7 +1053,11 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	}
 }
 
-func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
+// TestModelsFetchFailureDoesNotPenalize models 拉取失败与 chat 熔断解耦
+// （P1-6/发现 6）：/v1/models 的动态拉取失败（Billing/Models 端点网络抖动）不喂
+// NoteError——该熔断器保护的是 chat 选号，models 拉取失败 ≠ 账号 chat 不可用，
+// 跨界惩罚会让上游 models 端点偶发 5xx 把好号提前打进熔断。失败只进 5min 负缓存。
+func TestModelsFetchFailureDoesNotPenalize(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
@@ -1025,7 +1066,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	dynamicModelsCache.Unlock()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
+	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：若误喂 NoteError 一次即熔断
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
@@ -1036,8 +1077,23 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 		t.Fatalf("code=%d (static fallback)", rec.Code)
 	}
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatalf("fetch failure should trip breaker with threshold=1: %+v", st)
+	// 熔断器零观测：不喂 fails（breaker_fails=0）、不熔断（Cooling=false）、
+	// 不记 last_err/err_total。负缓存是唯一的失败退避（另测）。
+	if st.BreakerFails != 0 {
+		t.Errorf("models fetch failure should not feed breaker: breaker_fails=%d", st.BreakerFails)
+	}
+	if st.Cooling {
+		t.Errorf("models fetch failure should not trip breaker with threshold=1: %+v", st)
+	}
+	if st.ErrTotal != 0 {
+		t.Errorf("models fetch failure should not record err_total: %d", st.ErrTotal)
+	}
+	// 负缓存仍然生效：拉取失败进 lastFail（5min 冷却）。
+	dynamicModelsCache.RLock()
+	failTs := dynamicModelsCache.lastFail
+	dynamicModelsCache.RUnlock()
+	if failTs.IsZero() {
+		t.Error("negative cache (lastFail) should be set on fetch failure")
 	}
 }
 
