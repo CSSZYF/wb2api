@@ -4,13 +4,26 @@ package upstream
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 )
+
+// errEmptyStream 上游返回 200 但没有有效 SSE 数据帧（空流/只有注释/[DONE]）。
+// 用哨兵错误替代裸 fmt.Errorf：Stream 的调用方（handler 流式路径）需要区分
+// 「上游空流」与「客户端断连写失败」——空流是上游缺陷，应记 502 观测；写失败是
+// 客户端已走，日志口径不同。Aggregate 与 Stream 共用同一哨兵（errors.Is 判定）。
+var errEmptyStream = errors.New("upstream stream contained no valid data events")
+
+// IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
+// 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
+// upstream_parse 同语义），与客户端断连类错误区分。
+func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
@@ -27,9 +40,106 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		usage         map[string]any
 		gotAnyContent bool
 		validEvents   int
+		sawDone       bool // 上游显式发过 data: [DONE]（正常收尾，非 EOF 截断）
 		toolCalls     = map[int]map[string]any{}
 		toolOrder     []int
+		// toolSeq 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，
+		// 同帧内递增（见 mergeToolCallsChunk 注释）。
+		toolSeq int
+		// idIndex id → 已分配的 index：跨帧持续（延续碎片的 id 常出现在后续帧），
+		// 供缺 index 时按 id 归位既有调用（见 mergeToolCallsChunk 注释）。
+		idIndex = map[string]int{}
 	)
+	// appendContent 是「已取到正文」（gotAnyContent latch）的唯一写入点：delta 与
+	// message 两路 content 都必须经此并入，规约只有一份（issue #142）——
+	//   S1 空串不算「已取到正文」、不占 latch 名额：OpenAI 风格 role-only 首帧
+	//      （delta.content=""）和整条空 message 帧是常态帧，若空串置位 latch，
+	//      后续真正文会被 message 回退分支的 !gotAnyContent 守卫静默拒绝；
+	//   S2 空串本身也无可追加字节，跳过 WriteString 与追加语义自洽。
+	appendContent := func(txt string) {
+		if txt == "" {
+			return
+		}
+		content.WriteString(txt)
+		gotAnyContent = true
+	}
+	// nextToolIndex 分配下一个不冲突的缺 index 序号：从 toolSeq 起递增跳过既有
+	// index（合规流的 index 是 0..N-1，缺 index 的补位不能覆盖它们）。
+	nextToolIndex := func() int {
+		for {
+			idx := toolSeq
+			toolSeq++
+			if _, used := toolCalls[idx]; !used {
+				return idx
+			}
+		}
+	}
+	// mergeToolCallsChunk 把一段 tool_calls 数组按 index 合并进累计表。
+	// delta（流式分片，按 index 累积）与 message（非 delta 整条）共用同一合并逻辑，
+	// 保证「上游给的身份/函数名不丢、arguments 拼接语义一致」。
+	//
+	// index 缺失兼容：OpenAI 规范要求 delta 帧的 tool_call 带 index（标记分片归属），
+	// 但部分上游省略它。缺 index 一律归 0 会让多调用场景的不同 call 被合并进同一
+	// index 槽（arguments 串联、name 互相覆盖，数据污染）。按「id 优先、lastIdx 兜底」分派：
+	//   - 带 index → 按 index 累积（合规形态，零改动）；
+	//   - 缺 index 带 id 且 id 已见过 → 延续该 id 所在 index；
+	//   - 缺 index 带 id 且 id 是新的 → 开新序号（多调用不合并）；
+	//   - 缺 index 无 id → 追加到最近收到碎片的 index（单个调用的延续分片无 id
+	//     是标准形态），无既往则开新号。
+	mergeToolCallsChunk := func(tcs []any) {
+		for _, tc := range tcs {
+			call, ok := tc.(map[string]any)
+			if !ok {
+				continue
+			}
+			idx := -1
+			if v, ok := call["index"].(float64); ok {
+				idx = int(v)
+			} else if cid, _ := call["id"].(string); cid != "" {
+				if mid, seen := idIndex[cid]; seen {
+					idx = mid // 该 id 已归位过：延续既有调用（跨帧有效）
+				} else {
+					idx = nextToolIndex()
+				}
+			} else if len(toolOrder) > 0 {
+				idx = toolOrder[len(toolOrder)-1] // 无 id 碎片：延续最近调用
+			} else {
+				idx = nextToolIndex()
+			}
+			merged, seen := toolCalls[idx]
+			if !seen {
+				merged = map[string]any{"index": idx}
+				toolCalls[idx] = merged
+				toolOrder = append(toolOrder, idx)
+			}
+			// 合并后回填 id → index：上游首片带 id、后续分片缺 id 时仍能归位；
+			// 合并前也回填（本片带 id 而 merged 尚无 id 时即生效）。
+			if cid, _ := call["id"].(string); cid != "" {
+				idIndex[cid] = idx
+			}
+			if cid, _ := merged["id"].(string); cid != "" {
+				idIndex[cid] = idx
+			}
+			mergeToolCallDelta(merged, call)
+		}
+	}
+	// mergeMessageFields 把非 delta 的完整 message 内容并入聚合（message 是整条下发，
+	// 非流式拼接，content 只取一次）。role/content/reasoning_content/tool_calls 与
+	// delta 分支同构透出——此前只合并 content，其余三项全丢。
+	mergeMessageFields := func(msg map[string]any) {
+		if r2, ok := msg["role"].(string); ok && r2 != "" {
+			role = r2
+		}
+		if txt, ok := msg["content"].(string); ok {
+			appendContent(txt)
+		}
+		if rc, ok := msg["reasoning_content"].(string); ok {
+			reasoning.WriteString(rc)
+		}
+		if tcs, ok := msg["tool_calls"].([]any); ok {
+			mergeToolCallsChunk(tcs)
+		}
+	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -40,6 +150,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			payload := strings.TrimPrefix(line, "data: ")
 			if payload == "[DONE]" {
 				// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
+				sawDone = true
 				break
 			} else {
 				var chunk map[string]any
@@ -72,37 +183,21 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 									role = r2
 								}
 								if txt, ok := delta["content"].(string); ok {
-									content.WriteString(txt)
-									gotAnyContent = true
+									appendContent(txt)
 								}
 								if rc, ok := delta["reasoning_content"].(string); ok {
 									reasoning.WriteString(rc)
 								}
 								if tcs, ok := delta["tool_calls"].([]any); ok {
-									for _, tc := range tcs {
-										call, ok := tc.(map[string]any)
-										if !ok {
-											continue
-										}
-										idx := 0
-										if v, ok := call["index"].(float64); ok {
-											idx = int(v)
-										}
-										merged, seen := toolCalls[idx]
-										if !seen {
-											merged = map[string]any{"index": idx}
-											toolCalls[idx] = merged
-											toolOrder = append(toolOrder, idx)
-										}
-										mergeToolCallDelta(merged, call)
-									}
+									mergeToolCallsChunk(tcs)
 								}
 							}
-							// 有的上游把完整消息放在 message 里（非 delta）
+							// 有的上游把完整消息放在 message 里（非 delta）：
+							// 整条并入（role/content/reasoning_content/tool_calls），
+							// 与 delta 分支同构。delta 已取过正文（gotAnyContent）则跳过
+							// （避免与 delta 路径重复拼接——#134 的 latch 语义）。
 							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
-								if txt, ok := msg["content"].(string); ok {
-									content.WriteString(txt)
-								}
+								mergeMessageFields(msg)
 							}
 						}
 					}
@@ -116,7 +211,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if validEvents == 0 {
 		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
 		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
-		return nil, fmt.Errorf("upstream stream contained no valid data events")
+		return nil, errEmptyStream
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -137,7 +232,40 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		for _, idx := range toolOrder {
 			calls = append(calls, toolCalls[idx])
 		}
-		message["tool_calls"] = calls
+		// 第 1 步：截断过滤。流被截断时 tool_call 的 arguments 是残缺 JSON（解析失败），
+		// 不把脏参数交给客户端——残留分片会被客户端解析成非法 JSON 卡死会话。两个来源：
+		//   - finish_reason=="length"（模型因 max_tokens 提前中止）；
+		//   - 上游连接中断（EOF 收尾但未发 data: [DONE]，sawDone=false）。
+		// 完整参数原样保留（正例零改动）；空参数（无参工具）不是截断，同样保留。
+		if finishReason == "length" || !sawDone {
+			before := len(calls)
+			calls = dropTruncatedToolCalls(calls)
+			// 偏离上游：过滤非空时必须留痕，不静默丢——排障需要看到「流被截断、
+			// 丢了几个调用」；静默丢弃会让客户端拿到的 tool_calls 数量与上游实际
+			// 产出的对不上而无从追查。
+			if dropped := before - len(calls); dropped > 0 {
+				log.Printf("WARN: [upstream] drop %d truncated tool_call(s) finish=%s sawDone=%v", dropped, finishReason, sawDone)
+			}
+		}
+		// 第 2 步：占位过滤（hub 241be21 语义）。上游会在流末尾发
+		// function.name 与 function.arguments **双空**的 tool_call 占位，被聚合后会
+		// 变成 finish_reason="tool_calls" 却无实际调用的响应，严格客户端（sub2api 等）
+		// 会死等终止事件。只双空才丢：单空（有 name 无参 / 有参无 name）是真实调用
+		// 的残缺形态，保留交客户端 schema 校验判定，不在此替客户端做决定。
+		if len(calls) > 0 {
+			calls = dropPlaceholderToolCalls(calls)
+		}
+		// 条件写回：过滤后为空时不留空 tool_calls 键（空数组同样会让部分客户端误判
+		// 「有工具调用」，与降级后的 stop 语义矛盾）。
+		if len(calls) > 0 {
+			message["tool_calls"] = calls
+		}
+	}
+	// 第 3 步：判空降级。最终无任何 tool_calls（占位被全部滤掉，或上游声明了
+	// finish_reason="tool_calls" 却压根没发调用）时降级为 "stop"——客户端收到
+	// 「无 tool_calls 的 tool_calls 结束」会无限挂起等工具调用（hub 同口径）。
+	if _, hasCalls := message["tool_calls"]; !hasCalls && finishReason == "tool_calls" {
+		finishReason = "stop"
 	}
 	resp := map[string]any{
 		"id":      id,
@@ -460,7 +588,7 @@ readLoop:
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
 	if validFrames == 0 {
-		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error"}}`)
+		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
@@ -470,7 +598,7 @@ readLoop:
 		fl.Flush()
 	}
 	if validFrames == 0 {
-		return fmt.Errorf("upstream stream contained no valid data events")
+		return errEmptyStream
 	}
 	return nil
 }

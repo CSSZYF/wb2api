@@ -46,6 +46,19 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize, zeroWidth bool, e
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
+	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
+	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
+	// 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，
+	// 先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
+	if msgs, ok := obj["messages"].([]any); ok {
+		msgs, _ = repackToolResultBlocks(msgs)
+		msgs, _ = cleanupOrphanToolCalls(msgs)
+		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
+		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
+		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
+		obj["messages"] = msgs
+	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
