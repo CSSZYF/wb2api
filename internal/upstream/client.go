@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -240,8 +241,17 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetRe = `将在 (.+?) 重置`
+// softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
+const softRateResetPattern = `将在 (.+?) 重置`
+
+// 限流判定正则预编译为包级 var：IsModelRateLimit / ParseRateReset 在每次错误分类、
+// 每个限流 body 上调用，函数体内 MustCompile 每次重新分配+编译，429 轰炸时是纯浪费。
+// 模式串均为纯常量，与 sanitize.go 的包级预编译先例保持一致。regexp 并发安全
+// （匹配只读），无需额外锁。
+var (
+	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
+)
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
@@ -250,8 +260,7 @@ const softRateTimeLayout = "2006-01-02 15:04:05"
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
 	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	re := regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	return re.MatchString(body)
+	return reModelRateLimit.MatchString(body)
 }
 
 // ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
@@ -264,8 +273,7 @@ func IsModelRateLimit(body string) bool {
 // IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
 // 的限流也照常由调用方退回有界退避（绝不臆造时间）。
 func ParseRateReset(body string) (time.Time, bool) {
-	re := regexp.MustCompile(softRateResetRe)
-	m := re.FindStringSubmatch(body)
+	m := reSoftRateReset.FindStringSubmatch(body)
 	if len(m) < 2 {
 		return time.Time{}, false
 	}
@@ -474,15 +482,10 @@ type Client struct {
 	GlobalEnabled bool
 }
 
-// New 生产默认值。配置连接池减少 TLS 握手。
+// New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：禁 h2 /
+// TLS 握手超时 / 短 keepalive 探测，参数见 transport.go），配置连接池减少 TLS 握手。
 func New() *Client {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
-		ResponseHeaderTimeout: 120 * time.Second,
-	}
+	tr := newTransport()
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
@@ -842,6 +845,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		if err != nil {
 			cancel()
 			log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
+			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能
+			// 仍留在空闲池里，下一个请求会继续捡到它（仅靠 IdleConnTimeout 等过期
+			// 不够，主动清池才断根）。CloseIdleConnections 只关空闲连接，不影响在途请求。
+			roundTripCloseIdle(c.chatHTTP().Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -1507,10 +1514,8 @@ func IsAlreadyCheckin(err error) bool {
 	return false
 }
 
+// truncate 转发 logfmt.Truncate（按 rune 边界截断 + 省略标记，见该函数契约）：
+// 上游错误 body 多为中文（"将在 … 重置"），按字节切会出半截 UTF-8 序列乱码。
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
+	return logfmt.Truncate(s, n)
 }
