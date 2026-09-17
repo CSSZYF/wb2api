@@ -586,13 +586,18 @@ func (c *Client) webBase(a *auth.Auth) string {
 }
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
+// body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
+// Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
@@ -716,12 +721,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var cancel context.CancelFunc
 	// global 首次路径 404/405 时换 fallback 路径重试。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
+	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
+	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	for attempt, path := range c.chatPaths(a) {
 		endpoint := c.chatBase(a) + path
 		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
@@ -740,9 +747,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
 			cancel()
+			// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
+			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
+			if rerr != nil {
+				log.Printf("chat_stream uid=%s: read body: %v", a.UID, rerr)
+				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
+			}
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 				a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
@@ -757,8 +770,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
 		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
-	cancel()
-	return nil, 0, nil, nil
+	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
@@ -883,7 +895,11 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 		return nil, diag, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		// 读失败 → 传输层错误（handler 侧该路径不 NoteError）。
+		return nil, diag, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, diag, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}

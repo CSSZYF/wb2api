@@ -272,6 +272,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		return nil
 	}
 	e.lastUsed = now
+	// 粘性路径同样推进 usedSeq/pickSeq：粘性重度使用的账号在 LRU 兜底
+	// （pick 按 usedSeq 选最旧）眼中不再是"最旧"，与 pick 的严格全序语义对齐
+	// （entry.usedSeq 注释声明「每次被选中时取 pickSeq 自增值」，粘性命中也是选中）。
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
 	return e.a
 }
 

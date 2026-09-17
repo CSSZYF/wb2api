@@ -1747,3 +1747,188 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 		t.Fatalf("state.json contains credential field: %s", raw)
 	}
 }
+
+// TestFallbackEarliestExpiryAdvancesUsedSeq 全冷却兜底选号
+// （pickEarliestExpiryLocked）同样推进 usedSeq/pickSeq。
+//
+// entry.usedSeq 的契约是「每次被选中时取 p.pickSeq 自增值」（entry.go），pick() 正常
+// 路径与粘性命中（PickByUIDForModel）都已遵守。兜底路径此前只写 lastUsed 就 return：
+// 被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的 LRU 兜底（按 usedSeq 取最旧，pick.go）
+// 眼里永远是「最旧」，刚被用过就被立刻再选——防集中/防惊群失效，且与同一函数里已更新
+// lastUsed 的事实自相矛盾。
+func TestFallbackEarliestExpiryAdvancesUsedSeq(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "late"})
+	p.Add(&auth.Auth{UID: "early"})
+	// 两个都软冷却（全冷却 → 走兜底）；early 更早到期 → 兜底选 early。
+	p.Cooldown("late", CoolSoft, 2*time.Hour, "x")
+	p.Cooldown("early", CoolSoft, time.Hour, "x")
+
+	got := p.Pick()
+	if got == nil || got.UID != "early" {
+		t.Fatalf("全冷却兜底应选最早到期的 early, got %+v", got)
+	}
+
+	p.mu.RLock()
+	seqEarly := p.byUID["early"].usedSeq
+	seqLate := p.byUID["late"].usedSeq
+	pickSeq := p.pickSeq
+	p.mu.RUnlock()
+
+	if seqEarly == 0 {
+		t.Errorf("兜底选号未推进 usedSeq: early=%d（兜底也是选中，违反 entry.usedSeq 契约「每次被选中时取 p.pickSeq 自增值」）", seqEarly)
+	}
+	if seqEarly != pickSeq {
+		t.Errorf("兜底推进的 usedSeq 应等于 pickSeq: early=%d pickSeq=%d", seqEarly, pickSeq)
+	}
+	if seqEarly <= seqLate {
+		t.Errorf("兜底被选中的 early usedSeq=%d 应高于未被选中的 late=%d（否则 LRU 兜底误判其为最旧）", seqEarly, seqLate)
+	}
+}
+
+// TestStickyPickAdvancesUsedSeq 粘性命中（PickByUIDForModel）推进 usedSeq/pickSeq
+// ——LRU 兜底不再把粘性重度使用的号当「最旧」。
+//
+// 本仓自查发现：上游 49930b2 只修了兜底路径，本仓的粘性路径同样缺 usedSeq 推进
+// （PickByUIDForModel 只写 lastUsed），一并补上以维持 entry.usedSeq 契约。
+func TestStickyPickAdvancesUsedSeq(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "sticky"})
+	p.Add(&auth.Auth{UID: "other"})
+	p.mu.RLock()
+	seqBefore := p.byUID["sticky"].usedSeq
+	p.mu.RUnlock()
+	for i := 0; i < 5; i++ {
+		if a := p.PickByUIDForModel("sticky", "m"); a == nil {
+			t.Fatalf("粘性选号第 %d 次返回 nil", i)
+		}
+	}
+	p.mu.RLock()
+	seqAfter := p.byUID["sticky"].usedSeq
+	p.mu.RUnlock()
+	if seqAfter <= seqBefore {
+		t.Errorf("粘性选号应推进 usedSeq: before=%d after=%d", seqBefore, seqAfter)
+	}
+}
+
+// TestStickyUsedSeqMaintainsTotalOrder 粘性推进后，LRU 兜底眼中粘性重度号不再是
+// 「最旧」：粘性号被 PickByUIDForModel 连续使用后，其 usedSeq 应高于从未使用的 other。
+func TestStickyUsedSeqMaintainsTotalOrder(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "sticky"})
+	p.Add(&auth.Auth{UID: "other"})
+	for i := 0; i < 3; i++ {
+		if a := p.PickByUIDForModel("sticky", "m"); a == nil {
+			t.Fatalf("粘性选号第 %d 次返回 nil", i)
+		}
+	}
+	p.mu.RLock()
+	sSticky, sOther := p.byUID["sticky"].usedSeq, p.byUID["other"].usedSeq
+	p.mu.RUnlock()
+	if sSticky <= sOther {
+		t.Errorf("粘性重度号的 usedSeq=%d 应高于从未选中的 other=%d（LRU 兜底不误判）", sSticky, sOther)
+	}
+}
+
+// TestLRUFallbackStrictTotalOrderAfterFallbackPick 兜底推进 usedSeq 后，LRU 兜底
+// 维持严格全序：刚被兜底选中的账号不再被 LRU 立刻再选。
+//
+// 场景：三号全软冷却 → 第一次 Pick 走兜底选最早到期的 early（推进 usedSeq）；
+// 随后把三号都置为「刚被用过」（minPickGap 超大 → top5 全不合格）走 LRU 兜底，
+// 此时 early 因 usedSeq 已被推进，不应再被选中（否则「刚用过就被立刻再选」）。
+func TestLRUFallbackStrictTotalOrderAfterFallbackPick(t *testing.T) {
+	oldGap := minPickGap
+	minPickGap = time.Hour // 超大窗口：所有 lastUsed 都在窗口内 → 走 LRU 兜底
+	defer func() { minPickGap = oldGap }()
+
+	p := New("")
+	p.Add(&auth.Auth{UID: "a1"})
+	p.Add(&auth.Auth{UID: "a2"})
+	p.Add(&auth.Auth{UID: "a3"})
+	// 全软冷却 → 第一次 Pick 走全冷却兜底，a1 最早到期被选中。
+	p.Cooldown("a1", CoolSoft, time.Minute, "x")
+	p.Cooldown("a2", CoolSoft, 2*time.Minute, "x")
+	p.Cooldown("a3", CoolSoft, 3*time.Minute, "x")
+	first := p.Pick()
+	if first == nil || first.UID != "a1" {
+		t.Fatalf("首次兜底应选 a1, got %+v", first)
+	}
+
+	// 让三号重新 healthy（冷却过期）且 lastUsed 都是 now → 走 LRU 兜底。
+	p.mu.Lock()
+	now := time.Now()
+	for _, uid := range []string{"a1", "a2", "a3"} {
+		e := p.byUID[uid]
+		e.until = time.Time{} // 清冷却截止 → healthy（health 只看 until/breakerUntil/disabled）
+		e.lastUsed = now
+	}
+	p.mu.Unlock()
+
+	second := p.Pick()
+	if second == nil {
+		t.Fatal("第二次 Pick 返回 nil")
+	}
+	if second.UID == "a1" {
+		t.Errorf("LRU 兜底不应再选刚被兜底选中的 a1（usedSeq 未推进 → 误判为最旧）")
+	}
+	// 严格全序：a2/a3 的 usedSeq 均为 0，选中的应是其中之一；被选中者 usedSeq 已推进。
+	p.mu.RLock()
+	seqPicked := p.byUID[second.UID].usedSeq
+	seqA1 := p.byUID["a1"].usedSeq
+	p.mu.RUnlock()
+	if seqPicked <= seqA1 {
+		t.Errorf("LRU 兜底选中者 usedSeq=%d 应高于刚被兜底选中的 a1=%d", seqPicked, seqA1)
+	}
+}
+
+func TestRestoreUsesRedisWhenLocalMissing(t *testing.T) {
+	// 本地 state.json 不存在（首次在新卷/新节点启动）+ 有效 Redis 快照 → 必须采用快照。
+	// 此时本地没有可"优先"的状态，快照是本轮唯一来源（快照作为"启动恢复备份"的核心场景，
+	// 见 StoreSnapshotter 契约）。旧实现把该情形并进「本地较新」的 fall-through：快照被
+	// 静默丢弃（既不改内存也不置 dirty），全池运行态清零，且打出"本地较新于快照"的假日志。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json") // 刻意不创建：模拟新卷首启
+
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 999}}}, SavedAt: time.Now()}
+	ms.loadData, _ = json.Marshal(snap)
+
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatalf("本地缺失时应采用 Redis 快照恢复账号，但池内无 u1（有效快照被丢弃）")
+	}
+	if st.Credits != 999 {
+		t.Fatalf("should restore from Redis snapshot when local missing: credits=%d want 999", st.Credits)
+	}
+}
+
+// TestRestoreFromSnapshotMarksDirtyWhenLocalMissing 采用快照后必须置 dirty：
+// 否则快照只在内存生效，下一次崩溃恢复又回到旧的本地文件（adoptSnapshot 的存在意义）。
+func TestRestoreFromSnapshotMarksDirtyWhenLocalMissing(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json") // 本地缺失
+
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 7}}}, SavedAt: time.Now()}
+	ms.loadData, _ = json.Marshal(snap)
+
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+	if !p.dirty.Load() {
+		t.Errorf("采用快照后应置 dirty（让下一次落盘把快照物化回本地 state.json）")
+	}
+	// Flush 后本地文件应已写出快照内容（物化验证）。
+	p.Flush()
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("Flush 后本地 state.json 应存在: %v", err)
+	}
+	if !strings.Contains(string(raw), `"credits": 7`) {
+		t.Errorf("本地 state.json 应物化快照内容: %s", raw)
+	}
+}

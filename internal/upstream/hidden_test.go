@@ -9,13 +9,13 @@ func TestNormalizeModelName(t *testing.T) {
 		{"deepseek: DeepSeek V4.1 Flash", "DeepSeek V4.1 Flash"}, // 厂商大小写不同也算
 		{"DeepSeek:DeepSeek V4.1 Flash", "DeepSeek V4.1 Flash"},  // 冒号后无空格
 		{"  GLM: GLM-5.3  ", "GLM-5.3"},
-		{"Auto", "Auto"},                       // 无冒号 → 原样
-		{"GPT 5.4", "GPT 5.4"},                 // 无冒号 → 原样
-		{"GLM: GLMX-1", "GLM: GLMX-1"},         // 同前缀但不是同一个词 → 不剥
+		{"Auto", "Auto"},                         // 无冒号 → 原样
+		{"GPT 5.4", "GPT 5.4"},                   // 无冒号 → 原样
+		{"GLM: GLMX-1", "GLM: GLMX-1"},           // 同前缀但不是同一个词 → 不剥
 		{"DeepSeek: Qwen 3", "DeepSeek: Qwen 3"}, // 厂商不重复 → 不剥
 		{"", ""},
-		{": X", ": X"},   // 冒号在首 → 原样
-		{"X:", "X:"},     // 冒号在尾 → 原样
+		{": X", ": X"}, // 冒号在首 → 原样
+		{"X:", "X:"},   // 冒号在尾 → 原样
 	}
 	for _, c := range cases {
 		if got := normalizeModelName(c.in); got != c.want {

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -132,5 +133,82 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 		if len(id) != 32 {
 			t.Errorf("TurnRequestID value %q len=%d want 32", id, len(id))
 		}
+	}
+}
+
+// TestRequestIDForKeyBoundedCache 缓存有界：条目数达 requestIDsMax 后整体重建，
+// 旧键被清（下次调用生成新 ID）、新键照常工作；同键在未触发重建时仍稳定。
+//
+// 背景：原实现用 sync.Map 且注释称"值只增不减，不泄漏——key 与粘性会话键同源，
+// 数量有限"。该假设不成立——客户端可任意伪造 conversationId，键数随请求无限增长，
+// 长期运行下进程内存单调上升。改为 map+互斥锁+阈值重建。
+func TestRequestIDForKeyBoundedCache(t *testing.T) {
+	// 清空缓存（其他测试可能已写入），并保证测试结束后恢复干净状态。
+	requestIDsMu.Lock()
+	requestIDs = map[string]string{}
+	requestIDsMu.Unlock()
+	defer func() {
+		requestIDsMu.Lock()
+		requestIDs = map[string]string{}
+		requestIDsMu.Unlock()
+	}()
+
+	// 未达上界：同键稳定。
+	first := RequestIDForKey("bounded-k0")
+	if again := RequestIDForKey("bounded-k0"); again != first {
+		t.Fatalf("同键应稳定: %q vs %q", first, again)
+	}
+
+	// 灌入 requestIDsMax 个键，触发重建。第 requestIDsMax 个键写入前会清表。
+	for i := 0; i < requestIDsMax; i++ {
+		RequestIDForKey("bounded-fill-" + strconv.Itoa(i))
+	}
+	requestIDsMu.Lock()
+	n := len(requestIDs)
+	requestIDsMu.Unlock()
+	if n > requestIDsMax {
+		t.Fatalf("缓存条目超上界: len=%d max=%d", n, requestIDsMax)
+	}
+	if n < 1 {
+		t.Fatalf("重建后缓存应可继续工作: len=%d", n)
+	}
+
+	// 旧键已被清：重建后 k0 重新生成（不保证与旧值不同，故断言缓存内不再持有旧值
+	// 或返回的仍是合法 32 hex——真正的行为断言是"缓存不无限增长"，此处校验可用性）。
+	if got := RequestIDForKey("bounded-k0"); len(got) != 32 {
+		t.Errorf("重建后旧键应可正常取值: %q", got)
+	}
+	// 新键照常工作且稳定。
+	nk := RequestIDForKey("bounded-new-after-rebuild")
+	if nk2 := RequestIDForKey("bounded-new-after-rebuild"); nk != nk2 {
+		t.Errorf("重建后新键应稳定: %q vs %q", nk, nk2)
+	}
+}
+
+// TestRequestIDForKeyEvictsOldKeys 超限后旧键确实被清出缓存：填满后，早期键在
+// 缓存中不存在（Load 未命中），而新键存在。
+func TestRequestIDForKeyEvictsOldKeys(t *testing.T) {
+	requestIDsMu.Lock()
+	requestIDs = map[string]string{}
+	requestIDsMu.Unlock()
+	defer func() {
+		requestIDsMu.Lock()
+		requestIDs = map[string]string{}
+		requestIDsMu.Unlock()
+	}()
+
+	RequestIDForKey("evict-old")
+	for i := 0; i < requestIDsMax; i++ {
+		RequestIDForKey("evict-fill-" + strconv.Itoa(i))
+	}
+	requestIDsMu.Lock()
+	_, oldPresent := requestIDs["evict-old"]
+	_, newPresent := requestIDs["evict-fill-"+strconv.Itoa(requestIDsMax-1)]
+	requestIDsMu.Unlock()
+	if oldPresent {
+		t.Errorf("超限重建后旧键 evict-old 应已被清出缓存")
+	}
+	if !newPresent {
+		t.Errorf("超限重建后新键 evict-fill-%d 应在缓存中", requestIDsMax-1)
 	}
 }

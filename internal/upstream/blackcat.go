@@ -95,8 +95,10 @@ func (c *Client) ClaimCompensation(a *auth.Auth) (int64, error) {
 }
 
 // HeatmapYesterdayMissed 检查昨日是否漏签（heatmap cell score==0）。
+// 昨日按 CST 自然日口径（GrowthYesterdayDate，先转 CST 再减一日）——与
+// scheduler.makeupYesterday 的 target_date 同源，避免容器夏令时时区下判据错位。
 func (c *Client) HeatmapYesterdayMissed(a *auth.Auth) (bool, error) {
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := GrowthYesterdayDate(time.Now())
 	data, err := c.growthJSON(a, http.MethodGet, "/activity/growth/heatmap", nil)
 	if err != nil {
 		return false, err

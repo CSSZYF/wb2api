@@ -98,7 +98,11 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// 读失败 → 传输层错误：半截 body 不进 Unmarshal（避免误报 parse failed）。
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
 	}

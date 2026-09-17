@@ -91,7 +91,7 @@ func main() {
 	p := pool.New(cfg.StateFile)
 	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（消除 goroutine 泄漏）
 	p.SetStore(store)
-	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
+	p.RestoreFromSnapshot() // 择新恢复：Redis 快照不早于本地才采用；本地缺失/不可读时采用快照
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。

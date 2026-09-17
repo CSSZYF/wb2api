@@ -132,8 +132,9 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 }
 
 // RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
-// 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
-// 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
+// 本地不可用（不存在/不可读）时采用快照（本地无可"优先"的状态）；无快照、快照无
+// savedAt 时本地优先（无判据可比），同时打一条恢复来源日志。
+// 必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
 	e, ok := p.byUID[uid]

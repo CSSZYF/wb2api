@@ -578,3 +578,118 @@ func TestMergeModelCapabilitiesKeepsCLIWhenOverlayEmpty(t *testing.T) {
 		t.Errorf("empty overlay wiped CLI fields: %+v", got[0])
 	}
 }
+
+// failReader 读即失败（模拟连接中断/截断），用于验证读 body 错误被显式处理。
+type failReader struct{}
+
+func (failReader) Read([]byte) (int, error) { return 0, errors.New("boom: connection reset") }
+
+// TestDoJSONReadBodyErrorNotClassified doJSON 的 body 读失败必须返回普通错误
+// （非 *Error）：半截 body 不进 Classify、不参与账号惩罚（传输层故障不误罚号）。
+//
+// 原实现 `raw, _ := io.ReadAll(...)` 吞掉读错误，把半截 body 交给 Classify——
+// 实证误罚链：500 + 半截 credit 文案曾被判 ErrHardCredit（长冷却罚号）。
+func TestDoJSONReadBodyErrorNotClassified(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 500,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       nopCloserBody{failReader{}},
+		}, nil
+	})
+	req, _ := http.NewRequest(http.MethodGet, "https://billing.example/x", nil)
+	_, err := c.doJSON(req)
+	if err == nil {
+		t.Fatal("read body failure must return an error, got nil")
+	}
+	var ue *Error
+	if errors.As(err, &ue) {
+		t.Fatalf("read body failure must NOT be *Error (would feed breaker/cooldown): %+v", ue)
+	}
+	if !strings.Contains(err.Error(), "read body") {
+		t.Errorf("error should wrap read body: %v", err)
+	}
+}
+
+// TestChatStreamErrorStatusReadBodyError 流式 ≥400 分支的 body 读失败同样返回
+// 传输层错误（非 status+半截 body）：调用方 applyErrorPolicy 不会按误判分类罚号。
+func TestChatStreamErrorStatusReadBodyError(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 500,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       nopCloserBody{failReader{}},
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
+	if err == nil {
+		t.Fatal("chat stream read body failure must return an error")
+	}
+	if status != 0 || respBody != nil {
+		t.Errorf("must not hand half body to caller: status=%d body=%q", status, respBody)
+	}
+	if !strings.Contains(err.Error(), "read body") {
+		t.Errorf("error should wrap read body: %v", err)
+	}
+}
+
+// TestFetchModelsReadBodyError FetchModels 的 body 读失败返回传输层错误
+// （该路径不 NoteError，正确行为是换号而非罚号）。
+func TestFetchModelsReadBodyError(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       nopCloserBody{failReader{}},
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	_, err := c.FetchModels(a)
+	if err == nil {
+		t.Fatal("fetch models read body failure must return an error")
+	}
+	if !strings.Contains(err.Error(), "read body") {
+		t.Errorf("error should wrap read body: %v", err)
+	}
+}
+
+// TestChatStreamSuccessThenNoShadowedCancelNilPanic 成功分支不再触碰外层 shadowed
+// cancel：删掉外层 `var cancel context.CancelFunc` 后，成功路径只依赖内层 := 的
+// cancel（已移交 monitorBody），不得 panic。同时覆盖 404 换路径重试后成功的情形
+// （循环尾兜底代码已删，靠各出口 return）。
+func TestChatStreamSuccessThenNoShadowedCancelNilPanic(t *testing.T) {
+	paths := 0
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		paths++
+		if strings.Contains(r.URL.Path, "console") {
+			// 兜底路径：直接成功
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+			}, nil
+		}
+		return jsonResp(404, `{}`), nil
+	})
+	c.ChatBaseCN = "https://global.example"
+	c.GlobalEnabled = true
+	a := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "copilot.tencent.com"}
+	if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+		t.Fatal(err)
+	}
+	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
+	if err != nil {
+		t.Fatalf("global 404 → fallback 成功路径不应报错: %v", err)
+	}
+	if status != 200 {
+		t.Fatalf("status=%d want 200", status)
+	}
+	if rc == nil {
+		t.Fatal("rc must not be nil on success")
+	}
+	rc.Close()
+	if paths < 2 {
+		t.Errorf("expected 404 fallback retry, paths hit=%d", paths)
+	}
+}
