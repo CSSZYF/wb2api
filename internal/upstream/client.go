@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -525,15 +526,10 @@ type Client struct {
 	GlobalEnabled bool
 }
 
-// New 生产默认值。配置连接池减少 TLS 握手。
+// New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：禁 h2 /
+// TLS 握手超时 / 短 keepalive 探测，参数见 transport.go），配置连接池减少 TLS 握手。
 func New() *Client {
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
-		ResponseHeaderTimeout: 120 * time.Second,
-	}
+	tr := newTransport()
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
@@ -893,6 +889,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		if err != nil {
 			cancel()
 			log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
+			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能
+			// 仍留在空闲池里，下一个请求会继续捡到它（仅靠 IdleConnTimeout 等过期
+			// 不够，主动清池才断根）。CloseIdleConnections 只关空闲连接，不影响在途请求。
+			roundTripCloseIdle(c.chatHTTP().Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -1558,10 +1558,8 @@ func IsAlreadyCheckin(err error) bool {
 	return false
 }
 
+// truncate 转发 logfmt.Truncate（按 rune 边界截断 + 省略标记，见该函数契约）：
+// 上游错误 body 多为中文（"将在 … 重置"），按字节切会出半截 UTF-8 序列乱码。
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
+	return logfmt.Truncate(s, n)
 }

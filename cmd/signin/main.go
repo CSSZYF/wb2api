@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -110,7 +111,7 @@ func main() {
 			remain = fmt.Sprintf("%d", r.remain)
 		}
 		fmt.Printf("%-36s | %-11s | %-12s | %-6s | %s\n",
-			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)
+			logfmt.Truncate(r.uid, 36), logfmt.Truncate(r.nick, 11), r.status, remain, r.detail)
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
 }
@@ -122,13 +123,6 @@ func isAlready(msg string) bool {
 		strings.Contains(s, "already") ||
 		strings.Contains(s, "checkin") ||
 		strings.Contains(s, "code=400")
-}
-
-func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
 }
 
 func short(s string) string {

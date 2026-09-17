@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -651,6 +653,8 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
+	// 连接层加固后本字段保持 config 驱动（构造默认仍 120s，main.go 会覆盖）；
+	// 其余加固项断言见 transport_test.go 的 TestNewTransportHardening。
 	if htr.ResponseHeaderTimeout != 120*time.Second {
 		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
 	}
@@ -908,5 +912,78 @@ func TestChatStreamSuccessThenNoShadowedCancelNilPanic(t *testing.T) {
 	rc.Close()
 	if paths < 2 {
 		t.Errorf("expected 404 fallback retry, paths hit=%d", paths)
+	}
+}
+
+// TestRateRegexesPrecompiledConcurrent 正则预编译为包级 var 后，两个限流判定
+// 函数在高并发下结果恒定。旧实现（函数体内 MustCompile）在此测试下同样通过
+// （纯只读），该测试锁的是「预编译不改变语义」+ 并发安全，防止未来有人把包级
+// var 改回带状态的调用侧编译。
+func TestRateRegexesPrecompiledConcurrent(t *testing.T) {
+	const bodies = 50
+	const workers = 8
+	rlBody := `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`
+	resetBody := `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < bodies; i++ {
+				if !IsModelRateLimit(rlBody) {
+					errs <- fmt.Errorf("IsModelRateLimit concurrent miss")
+					return
+				}
+				if _, ok := ParseRateReset(resetBody); !ok {
+					errs <- fmt.Errorf("ParseRateReset concurrent miss")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}
+
+// TestTruncateRuneBoundaryOnCJKErrorBody 三份截断实现合一后的回归：上游错误 body
+// 多为中文（"将在 … 重置"），旧实现按字节切会产出半截 UTF-8 序列（乱码）。这里
+// 直接断言包内 truncate 转发到 logfmt.Truncate 后输出合法 UTF-8 且带省略标记。
+func TestTruncateRuneBoundaryOnCJKErrorBody(t *testing.T) {
+	// Arrange：120 字节上限恰好切在某个汉字的中间字节上。
+	s := strings.Repeat("中", 50) // 150 字节
+
+	// Act
+	got := truncate(s, 120)
+
+	// Assert
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncate 输出不是合法 UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("超长截断应补省略标记，got %q", got)
+	}
+	if strings.HasSuffix(strings.TrimSuffix(got, "…"), "\uFFFD") {
+		t.Errorf("截断不得留下替换字符: %q", got)
+	}
+	// 120 是 3 的倍数 → 恰好落在 rune 边界，保留 40 个汉字。
+	if want := strings.Repeat("中", 40) + "…"; got != want {
+		t.Errorf("truncate(中×50, 120)=%q want %q", got, want)
+	}
+}
+
+// TestTruncateShortBodyUnchanged 短 body（未触发截断）不补省略标记：否则每个正常
+// 错误消息尾巴都会多一个 "…"，反而让「是否被截断」失去信息量。
+func TestTruncateShortBodyUnchanged(t *testing.T) {
+	// Arrange
+	s := `{"code":6004,"msg":"short"}`
+
+	// Act + Assert
+	if got := truncate(s, 200); got != s {
+		t.Errorf("truncate(short, 200)=%q want 原样 %q", got, s)
 	}
 }

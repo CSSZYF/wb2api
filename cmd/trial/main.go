@@ -26,6 +26,7 @@ import (
 	"sort"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -109,7 +110,7 @@ func main() {
 	fmt.Printf("-------------------------------------+-------------+---------+------------------------------\n")
 	for _, r := range rows {
 		fmt.Printf("%-36s | %-11s | %-7s | %s\n",
-			trunc(r.uid, 36), trunc(r.nick, 11), r.status, r.detail)
+			logfmt.Truncate(r.uid, 36), logfmt.Truncate(r.nick, 11), r.status, r.detail)
 		switch r.status {
 		case trialOK:
 			okN++
@@ -123,11 +124,4 @@ func main() {
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d na=%d fail=%d\n",
 		len(rows), okN, alreadyN, notAppN, failN)
-}
-
-func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
 }
