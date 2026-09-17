@@ -38,7 +38,7 @@ import (
 // 之所以用 var 而非 const：const 无法被 -ldflags -X 覆盖，版本号就得手改源码，
 // 于是很容易留下 `+dirty` / `+realmfix` 这类构建期后缀与源码里写死的字符串对不上。
 // 单一来源 = git tag，产物版本号永远可复现、无后缀。
-var appVersion = "v1.9.10"
+var appVersion = "v1.9.11"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -307,6 +307,12 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
+		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
+		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
+		// Noop 的 Close 是空操作；单写上限 5s × 上限 8，Close 内部另有 10s 超时兜底。
+		if cErr := store.Close(); cErr != nil {
+			log.Printf("WARN: [server] redisstore close: %v", cErr)
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
