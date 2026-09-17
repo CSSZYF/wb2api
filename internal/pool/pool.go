@@ -30,6 +30,9 @@ type Pool struct {
 	idleWeightMax     float64
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
+	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
+	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
+	maxInFlightGlobal int
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -125,6 +128,29 @@ func (p *Pool) SetMaxInFlight(n int) {
 	}
 }
 
+// SetMaxInFlightGlobal 注入 global 域单账号在途上限（WAF 403 修复 P1-1 分档）；
+// 0 = 未设置，global 账号回落 maxInFlight（不分档）。负值保留原值。
+func (p *Pool) SetMaxInFlightGlobal(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.maxInFlightGlobal = n
+	}
+}
+
+// inFlightLimit 报告账号的生效在途上限（global 分档优先，回落 maxInFlight）；
+// 0 = 不限。调用方需已持 p.mu（或快照过 limit，见 Acquire 注释）。
+//
+// 锁序说明：本函数在 p.mu 内调 e.a.Realm()——Realm() 现持 auth 自己的 a.mu。
+// auth 锁与 pool 锁是两把互相独立的锁，且不存在反向的「持 a.mu 再取 p.mu」路径
+// （pool 不回调持有 auth 锁的代码），故不构成自锁/死锁。
+func (p *Pool) inFlightLimit(e *entry) int {
+	if p.maxInFlightGlobal > 0 && e.a.Realm() == "global" {
+		return p.maxInFlightGlobal
+	}
+	return p.maxInFlight
+}
+
 // SetStore 注入池状态快照镜像（redisstore.Store）。nil 表示不镜像（纯本地恢复）。
 // 必须在 SyncToDir 之前调用，使"择新恢复"发生在账号对齐之前。
 func (p *Pool) SetStore(s StoreSnapshotter) {
@@ -137,14 +163,21 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 // 本地不可用（不存在/不可读）时采用快照（本地无可"优先"的状态）；无快照、快照无
 // savedAt 时本地优先（无判据可比），同时打一条恢复来源日志。
 // 必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
+// Acquire 为 uid 占一个在途名额（会话粘性命中后调用）；池上限内返回 true。
+// 名额用 entry.inFlight 原子自增，满额返回 false。上限按账号 realm 分档
+// （global 档 maxInFlightGlobal，WAF 403 修复 P1-1；未设置回落 maxInFlight）。
+//
+// 顺序约束：!ok 判空必须在 inFlightLimit 之前——后者按 realm 取值时会解引用
+// e.a（uid 不在池内时 e 为 nil，如会话粘性路由仍持已移除/禁用账号的 uid）。
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
 	e, ok := p.byUID[uid]
-	limit := p.maxInFlight
-	p.mu.RUnlock()
 	if !ok {
+		p.mu.RUnlock()
 		return false
 	}
+	limit := p.inFlightLimit(e)
+	p.mu.RUnlock()
 	if limit <= 0 {
 		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)

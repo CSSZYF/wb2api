@@ -165,8 +165,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if a.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	if at := a.AccessTokenValue(); at != "" {
+		req.Header.Set("Authorization", "Bearer "+at)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
@@ -186,8 +186,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 		} else {
 			req.Header.Set("X-No-Enterprise-Id", "1")
 		}
-		if a.Domain != "" {
-			req.Header.Set("X-Domain", a.Domain)
+		if d := a.DomainValue(); d != "" {
+			req.Header.Set("X-Domain", d)
 		} else {
 			req.Header.Set("X-No-Department-Info", "1")
 		}
@@ -337,7 +337,8 @@ func ExtractClientIP(r *http.Request) string {
 // UA 语义：默认**不设置**（保持现状，Go 客户端自带默认 UA）；仅当显式配置
 // c.UserAgent 非空才覆盖——避免默认路径给 billing 引入新的 UA 指纹。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	// AccessToken 加锁快照（同 ChatHeaders：keepalive 定时刷新会在 a.mu 内改写它）。
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
@@ -355,17 +356,19 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
 	c.injectDeviceToken(req, a)
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
+// 调用方（Client.RefreshToken）传的是**锁内快照**副本，故本函数内的取值不走
+// 活体并发面；X-Refresh-Token 仍经访问器取值保持全出站口径统一。
 func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 	c.CommonHeaders(req, a)
-	req.Header.Set("X-Refresh-Token", a.RefreshToken)
+	req.Header.Set("X-Refresh-Token", a.RefreshTokenValue())
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 	}

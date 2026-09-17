@@ -145,7 +145,7 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	}
 	// Web 端请求头形状（对照浏览器实际请求）：Origin/Referer 指向 workbuddy.cn 成长中心，
 	// 带 x-client-platform: web 标记来源端。
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://www.workbuddy.cn")
@@ -161,8 +161,8 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
 	}
 
 	data, err := c.doJSON(req)

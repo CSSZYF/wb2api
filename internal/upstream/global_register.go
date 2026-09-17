@@ -98,7 +98,7 @@ func (c *Client) GlobalFetchCountries(a *auth.Auth, intlOnly bool) ([]GlobalCoun
 	if a == nil || a.Realm() != "global" {
 		return nil, fmt.Errorf("fetch countries: only global accounts")
 	}
-	req, err := c.globalRegisterReq(http.MethodPost, c.globalRegisterBase()+"/billing/area/get-country-code", a.AccessToken, map[string]any{"filterForbidden": 1})
+	req, err := c.globalRegisterReq(http.MethodPost, c.globalRegisterBase()+"/billing/area/get-country-code", a.AccessTokenValue(), map[string]any{"filterForbidden": 1})
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +151,7 @@ func (c *Client) GlobalRegisterStatus(a *auth.Auth) (activated bool, needsRegion
 	}
 	req, err := c.globalRegisterReq(http.MethodGet,
 		c.globalRegisterBase()+"/auth/realms/copilot/overseas/user/register?userId="+a.UID,
-		a.AccessToken, nil)
+		a.AccessTokenValue(), nil)
 	if err != nil {
 		return false, false, "", err
 	}
@@ -181,7 +181,7 @@ func (c *Client) GlobalSubmitRegion(a *auth.Auth, country GlobalCountry) error {
 		"countryName":     []string{country.IOS2},
 	}
 	req, err := c.globalRegisterReq(http.MethodPost, c.globalRegisterBase()+"/console/login/account",
-		a.AccessToken, map[string]any{"attributes": attrs})
+		a.AccessTokenValue(), map[string]any{"attributes": attrs})
 	if err != nil {
 		return err
 	}

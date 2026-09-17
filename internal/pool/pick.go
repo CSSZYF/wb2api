@@ -196,13 +196,15 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	return best.a
 }
 
-// inFlightFull 报告账号是否已占满在途名额（max=0 不限 → 恒 false）。
-// 调用方需已持 p.mu（读锁或写锁均可，本方法只读 p.maxInFlight）。
+// inFlightFull 报告账号是否已占满在途名额（上限 0 = 不限 → 恒 false）。
+// 调用方需已持 p.mu（读锁或写锁均可，本方法只读上限字段）。上限按 realm
+// 分档（global 档 maxInFlightGlobal，WAF 403 修复 P1-1；未设置回落 maxInFlight）。
 func (p *Pool) inFlightFull(e *entry) bool {
-	if p.maxInFlight <= 0 {
+	limit := p.inFlightLimit(e)
+	if limit <= 0 {
 		return false
 	}
-	return e.inFlight.Load() >= int64(p.maxInFlight)
+	return e.inFlight.Load() >= int64(limit)
 }
 
 // minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。

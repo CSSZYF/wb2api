@@ -78,6 +78,9 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.Pool.MaxInFlight != 3 {
 		t.Errorf("max_in_flight=%d want 3", c.Pool.MaxInFlight)
 	}
+	if c.Pool.MaxInFlightGlobal != 2 {
+		t.Errorf("max_in_flight_global=%d want 2 (WAF P1-1 global 档默认)", c.Pool.MaxInFlightGlobal)
+	}
 	if c.Pool.BreakerThreshold != 3 {
 		t.Errorf("breaker_threshold=%d want 3", c.Pool.BreakerThreshold)
 	}
@@ -111,6 +114,7 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 		"upstash":{"url":"https://foo.upstash.io","token":"tok"},
 		"pool":{
 			"max_in_flight":5,
+			"max_in_flight_global":4,
 			"breaker_threshold":4,
 			"breaker_cooldown":"10m",
 			"breaker_cooldown_max":"2h",
@@ -128,6 +132,9 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 	}
 	if c.Pool.MaxInFlight != 5 || c.Pool.BreakerThreshold != 4 {
 		t.Errorf("pool=%+v", c.Pool)
+	}
+	if c.Pool.MaxInFlightGlobal != 4 {
+		t.Errorf("max_in_flight_global=%d want 4 (config 覆盖默认)", c.Pool.MaxInFlightGlobal)
 	}
 	if c.BreakerCooldownDur.Minutes() != 10 || c.BreakerCooldownMaxD.Hours() != 2 {
 		t.Errorf("breaker durations=%v/%v", c.BreakerCooldownDur, c.BreakerCooldownMaxD)
@@ -607,6 +614,34 @@ func TestMaxBodyInvalid(t *testing.T) {
 		if !strings.Contains(err.Error(), "server.max_body_mb") {
 			t.Errorf("error should name config key server.max_body_mb: %v", err)
 		}
+	}
+}
+
+// TestMaxInFlightGlobalNormalize max_in_flight_global 的 normalize 语义：
+// 0/负数视为「未设置」回落默认 2（WAF 403 修复 P1-1）。与 max_in_flight 的
+// 0=不限不同——分档键的 0 没有合理语义，回退分档默认最稳。
+func TestMaxInFlightGlobalNormalize(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		c := Default()
+		c.Pool.MaxInFlightGlobal = 0
+		if v == "-1" {
+			c.Pool.MaxInFlightGlobal = -1
+		}
+		if err := c.normalize(); err != nil {
+			t.Fatalf("normalize(%s): %v", v, err)
+		}
+		if c.Pool.MaxInFlightGlobal != 2 {
+			t.Errorf("max_in_flight_global=%s normalize 后=%d want 2（回落默认）", v, c.Pool.MaxInFlightGlobal)
+		}
+	}
+	// 显式正值保持不动（分档可调）。
+	c := Default()
+	c.Pool.MaxInFlightGlobal = 5
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Pool.MaxInFlightGlobal != 5 {
+		t.Errorf("max_in_flight_global=5 normalize 后=%d want 5", c.Pool.MaxInFlightGlobal)
 	}
 }
 

@@ -264,7 +264,7 @@ func (s *Scheduler) RunCheckinNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
 		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
@@ -310,7 +310,7 @@ func (s *Scheduler) RunActivityNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
 		if a.IsGlobal() {
@@ -360,7 +360,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {

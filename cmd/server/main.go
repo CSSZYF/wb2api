@@ -97,7 +97,8 @@ func main() {
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
-	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
+	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
 	// 会话粘性路由（可配关闭）。
@@ -387,6 +388,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	up.ZeroWidthSanitize = newCfg.Features.ZeroWidthSanitize // 面板勾选后即时生效，无需重启
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
+	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal) // global 域在途分档（面板改完即时生效）
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	sch.Reconfigure(
