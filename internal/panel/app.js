@@ -143,6 +143,47 @@ document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDef
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+/* 模型级冷却台账（overview 的 rate_limited_models，issue #36）：6004 模型级限流 /
+   11102 该后端无此模型时，账号本身仍「可用」且能服务其他模型——不渲染台账，面板上
+   就是「账号可用但某模型 503」，只能翻日志的 6004 才知道是谁。 */
+
+// 模型级恢复时刻文本：优先 reset_at（上游权威恢复墙钟，未经 soft_rate_max 截断），
+// 为零值退回 until（6004 截断后的冷却截止 / 11102 的退避 TTL）。Go 的 time.Time 零值
+// 经 omitempty 仍会序列化成 "0001-01-01T00:00:00Z"，须按前缀判零（同 ago()）。
+// 输出绝对时刻 HH:MM（跨天补 MM-DD）：账号级已有相对倒计时，模型级给墙钟才便于对照
+// 上游「将在 … 重置」文案，也不必每 5s 重算。
+function modelResetText(r) {
+  // 判零必须带"字段存在"判断：reset_at 缺失/为空串时 reg.test('') 亦为 false，
+  // 只测零前缀会把空值当成可用值返回（模型级时间整体消失）。
+  const valid = v => v && !/^0001-/.test(v) ? v : '';
+  const iso = valid(r.reset_at) || valid(r.until);
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return sameDay ? hm : String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' + hm;
+}
+
+// 模型级标签：计数在标签上、明细入 title（悬停看哪个模型、何时恢复），多模型不撑爆
+// 状态列。reason 前缀区分 11102（该后端无此模型，时间只是再试窗口）与 6004（上游限流）。
+// quiet：账号本身已在冷却/禁用（主标签已占据 warn/bad 语义）时用中性色，避免两个同色
+// 标签并列分不清主次；账号本身「可用」时用 warn——此时它是这一行唯一的问题信号。
+function modelLimitTag(list, quiet) {
+  if (!list || !list.length) return '';
+  const rows = list.map(r => {
+    const t = modelResetText(r);
+    const kind = /^11102/.test(r.reason || '') ? '不可用' : '限流';
+    return (r.model || '?') + '（' + kind + (t ? ' · 至 ' + t + ' 恢复' : '') + '）';
+  });
+  // 台账里全是 11102（该后端无此模型、重试无意义）时换文案：与 6004「等上游重置」
+  // 是两种完全不同的处置（换模型 vs 干等），标签上一眼看得出。
+  const allBlocked = list.every(r => /^11102/.test(r.reason || ''));
+  return '<div style="margin-top:3px"><span class="tag ' + (quiet ? 'mute' : 'warn') +
+    '" title="' + esc(rows.join(' / ')) + '">' + (allBlocked ? '模型不可用 ' : '模型限流 ') + list.length + '</span></div>';
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -179,7 +220,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + '</td>' +
+      '<td>' + tag + note + modelLimitTag(s.rate_limited_models, frozen) + '</td>' +
       '<td class="cred" title="' + credTip + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
