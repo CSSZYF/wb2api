@@ -65,16 +65,12 @@ func TestFeedbackSentenceRewritten(t *testing.T) {
 	}
 }
 
-// 上游反探测：请求体里出现裸数字 11128 即整单拦截（与上下文无关）。
-// 回归用例：该串会被改写为 11-128 以打断精确匹配。
-func TestUpstreamErrorCodeRewritten(t *testing.T) {
+// 上游错误码不做改写：请求体里出现 11128 时原样通过（2026-09-17 判定，
+// 旧的 11128→11-128 改写已移除——直发无碍，且改写会破坏用户内容）。
+func TestUpstreamErrorCodeNotRewritten(t *testing.T) {
 	in := "upstream returned code=11128 for this request"
-	out := sanitizeText(in)
-	if strings.Contains(out, "11128") {
-		t.Errorf("error code not rewritten: %q", out)
-	}
-	if !strings.Contains(out, "11-128") {
-		t.Errorf("error code not rewritten as expected: %q", out)
+	if out := sanitizeText(in); out != in {
+		t.Errorf("error code should pass through unchanged: %q -> %q", in, out)
 	}
 }
 
@@ -86,7 +82,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
 			map[string]any{"id": "c1", "type": "function", "function": map[string]any{
 				"name":      "Bash",
-				"arguments": `{"command":"echo 11128"}`,
+				"arguments": `{"command":"echo x-anthropic-billing-header"}`,
 			}},
 		}},
 	}
@@ -95,7 +91,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 	}
 	fn := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	got := fn["arguments"].(string)
-	if strings.Contains(got, "11128") {
+	if strings.Contains(got, "x-anthropic-billing-header") {
 		t.Errorf("tool_call arguments 未被净化: %q", got)
 	}
 }
@@ -109,7 +105,7 @@ func TestBillingHeaderStrippedValueIrrelevant(t *testing.T) {
 
 // 附加验证：正常对话里出现 github.com/anthropics/ 链接（但不是反馈句整句）
 // 时，预检特征命中（进入净化），但改写层只动精确匹配的整句——普通链接文本
-// 不该被改写。同理，既不含 11128 也不含反馈整句的文本原样返回。
+// 不该被改写。同理，不含任何预检特征的普通文本原样返回。
 func TestNormalAnthropicLinkNotRewritten(t *testing.T) {
 	in := "see https://github.com/anthropics/anthropic-cookbook for examples"
 	if out := sanitizeText(in); out != in {

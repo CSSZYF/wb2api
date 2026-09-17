@@ -711,7 +711,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 与上游连接继续生成无人消费的流）。成功流的 cancel 仍由 monitorBody 的 Close
 // 接管（reqCtx 取消与显式 Close 任一触发即断）。
 // global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
-// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
+// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11128）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
