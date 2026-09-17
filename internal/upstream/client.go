@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -666,11 +667,14 @@ type Client struct {
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
-	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
-	SanitizeFingerprints bool
-	// ZeroWidthSanitize 零宽字符脱敏开关（默认 false）：在 system 消息的指纹词内部
-	// 插入 U+200B，破坏上游逐字匹配。与 SanitizeFingerprints 独立，可各自开关。
-	ZeroWidthSanitize bool
+	// sanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
+	// 面板保存配置时热改（SetSanitizeFingerprints），与请求路径 prepareBody 的读
+	// 属于不同 goroutine——裸 bool 在 Go 内存模型下是数据竞争，故用 atomic。
+	// 私有不导出：写必须走 setter，防回归成裸赋值。
+	sanitizeFingerprints atomic.Bool
+	// zeroWidthSanitize 零宽字符脱敏开关（默认 false）：在 system 消息的指纹词内部
+	// 插入 U+200B，破坏上游逐字匹配。与 sanitizeFingerprints 独立，可各自开关。
+	zeroWidthSanitize atomic.Bool
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -721,18 +725,33 @@ type Client struct {
 // TLS 握手超时 / 短 keepalive 探测，参数见 transport.go），配置连接池减少 TLS 握手。
 func New() *Client {
 	tr := newTransport()
-	return &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
-		WebBaseCN:            "https://www.workbuddy.cn",
+	c := &Client{
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ChatBaseCN:    "https://copilot.tencent.com",
+		BillingBaseCN: "https://www.codebuddy.cn",
+		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
 	}
+	// 指纹脱敏默认开（零宽脱敏默认关 = 零值），与改 atomic 前的字段默认值一致。
+	c.SetSanitizeFingerprints(true)
+	return c
 }
+
+// SetSanitizeFingerprints 热改出站请求体指纹脱敏开关（面板保存配置路径调用）。
+// 并发安全：请求路径 prepareBody 走 atomic 读，无需调用方加锁。
+func (c *Client) SetSanitizeFingerprints(v bool) { c.sanitizeFingerprints.Store(v) }
+
+// SetZeroWidthSanitize 热改零宽字符脱敏开关（面板保存配置路径调用）。并发安全同 setter。
+func (c *Client) SetZeroWidthSanitize(v bool) { c.zeroWidthSanitize.Store(v) }
+
+// SanitizeFingerprintsOn 报告指纹脱敏当前是否开启（读与写相对原子，取最近一次 Store）。
+func (c *Client) SanitizeFingerprintsOn() bool { return c.sanitizeFingerprints.Load() }
+
+// ZeroWidthSanitizeOn 报告零宽脱敏当前是否开启。
+func (c *Client) ZeroWidthSanitizeOn() bool { return c.zeroWidthSanitize.Load() }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
 func (c *Client) chatHTTP() *http.Client {
@@ -826,7 +845,8 @@ func (c *Client) chatBase(a *auth.Auth) string {
 	return c.ChatBaseCN
 }
 
-// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
+// prepareBody 组装出站请求体（脱敏开关由 Client.sanitizeFingerprints/zeroWidthSanitize
+// 控制，均经 atomic 读取——本函数在请求 goroutine 内被调，与面板保存配置并发）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
 //
 // WB2A_DEBUG_REASONING 非空时，改写前后各打一行"思考字段"诊断（in/out）：
@@ -836,7 +856,9 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	efforts := c.effortsSnapshot(realm)
 	defaults := c.defaultEffortsSnapshot(realm)
 	logReasoning("in ", body, efforts, defaults)
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, c.ZeroWidthSanitize, efforts, defaults)
+	// 两个开关各读一次并就地使用：读点与写点（Set*）成对走 atomic，消除数据竞争。
+	// 不缓存到局部再跨阶段复用——避免把"一次读到的旧值"错当成当前配置。
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprintsOn(), c.ZeroWidthSanitizeOn(), efforts, defaults)
 	logReasoning("out", body, efforts, defaults)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
