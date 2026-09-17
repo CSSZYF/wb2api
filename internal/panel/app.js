@@ -194,6 +194,7 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+        '<button class="xs ghost" data-a="testchat" data-u="' + esc(s.uid) + '" title="用该账号发一条消息，验证模型可用性">测试</button>' +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
@@ -251,6 +252,8 @@ $('accBody').addEventListener('click', async ev => {
       toast('已禁用', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'testchat') {
+      openTestChat(u);
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
@@ -719,6 +722,139 @@ $('taskBody').addEventListener('click', async ev => {
   } catch (e) { toast(e.message, 'err'); }
   finally { loadTasks(); }
 });
+
+/* ── 单账号对话测试（最小版）──────────────────────────────────────── */
+/* 弹窗 DOM 动态创建（index.html 结构不动）：只复用 .veil/.dlg/.xs/.state 既有
+   弹层体系，视觉与「积分任务」「添加账号」完全一致，不引入新样式语言。
+   后端 POST /panel/api/account/test_chat 走真实 chat 出站路径但不计账号统计。 */
+const TC_DEFAULT_MODEL = 'deepseek-v4.1-flash'; // 写死条目：目录没有它也可调用
+let tcUID = null, tcEl = null;
+
+// testChatEl 惰性建弹窗（只建一次，反复打开复用同一节点）。
+function testChatEl() {
+  if (tcEl) return tcEl;
+  const veil = document.createElement('div');
+  veil.className = 'veil';
+  veil.id = 'tcVeil';
+  veil.innerHTML =
+    '<div class="dlg" style="width:520px">' +
+      '<header>' +
+        '<h3>对话测试 <span class="hint" id="tcWho"></span></h3>' +
+        '<div class="hint">用该账号向所选模型发一条消息，验证「账号 + 模型」链路是否可用。仅诊断，不计入账号统计、冷却与熔断。</div>' +
+      '</header>' +
+      '<div class="body">' +
+        '<label class="fld"><span class="lb">模型</span>' +
+          '<select id="tcModel"><option value="">加载中…</option></select>' +
+          '<span class="hint" id="tcModelNote"></span></label>' +
+        '<label class="fld"><span class="lb">消息</span>' +
+          '<textarea id="tcMsg" rows="3">你好</textarea>' +
+          '<span class="hint">Ctrl/⌘ + Enter 发送；上限 4000 字。</span></label>' +
+        '<div id="tcResult" hidden>' +
+          '<div class="state" id="tcStatus"></div>' +
+          '<pre class="reply" id="tcOut" hidden></pre>' +
+        '</div>' +
+      '</div>' +
+      '<footer>' +
+        '<span class="grow"></span>' +
+        '<button class="primary" id="tcSend">发送</button>' +
+        '<button id="tcClose">关闭</button>' +
+      '</footer>' +
+    '</div>';
+  document.body.appendChild(veil);
+  tcEl = veil;
+  $('tcClose').onclick = closeTestChat;
+  $('tcSend').onclick = sendTestChat;
+  $('tcMsg').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendTestChat(); }
+  });
+  return veil;
+}
+
+function openTestChat(uid) {
+  tcUID = uid;
+  const el = testChatEl();
+  const s = (overviewData && (overviewData.accounts || []).find(x => x.uid === uid)) || {};
+  $('tcWho').textContent = (s.nickname ? s.nickname + ' · ' : '') + uid.slice(0, 16);
+  $('tcMsg').value = '你好';
+  $('tcResult').hidden = true;
+  $('tcStatus').textContent = '';
+  $('tcOut').hidden = true; $('tcOut').textContent = '';
+  el.classList.add('on');
+  loadTestChatModels(); // 不 await：下拉加载不阻塞弹窗出现
+  setTimeout(() => $('tcMsg').focus(), 60);
+}
+function closeTestChat() { if (tcEl) tcEl.classList.remove('on'); tcUID = null; }
+
+// 模型下拉复用 GET /panel/api/models（与「模型与档位」同一份目录）。
+// 拉取失败不阻塞测试：回落写死条目仍可手测（目录接口依赖上游可用账号）。
+async function loadTestChatModels() {
+  const sel = $('tcModel'), note = $('tcModelNote');
+  sel.disabled = true; sel.innerHTML = '<option value="">加载中…</option>';
+  note.textContent = '';
+  try {
+    const d = await api('models');
+    const ids = (d.models || []).map(m => m.id).filter(Boolean);
+    if (!ids.length) throw new Error('上游未返回模型');
+    sel.innerHTML = ids.map(id => '<option value="' + esc(id) + '">' + esc(id) + '</option>').join('');
+    sel.value = ids.includes(TC_DEFAULT_MODEL) ? TC_DEFAULT_MODEL : ids[0];
+    note.textContent = ids.length + ' 个模型 · 来源 ' + ((d.diag || {}).path || '上游目录');
+  } catch (e) {
+    sel.innerHTML = '<option value="' + esc(TC_DEFAULT_MODEL) + '">' + esc(TC_DEFAULT_MODEL) + '</option>';
+    note.textContent = '模型列表拉取失败（' + e.message + '），已回落默认模型';
+  }
+  sel.disabled = false;
+}
+
+// tcLatency 耗时展示：formatLatency 把 0 当"无数据"渲染成「—」，
+// 但本处 0 是真实的"没花时间"（本地/极快上游），照实显示 0ms。
+function tcLatency(ms) {
+  const n = Math.round(Number(ms) || 0);
+  return n > 0 ? formatLatency(n) : '0ms';
+}
+
+async function sendTestChat() {
+  if (!tcUID) return;
+  const model = $('tcModel').value, msg = $('tcMsg').value;
+  if (!model) { toast('请先选择模型', 'err'); return; }
+  if (!msg.trim()) { toast('消息不能为空', 'err'); return; }
+  const btn = $('tcSend'), st = $('tcStatus'), out = $('tcOut');
+  btn.disabled = true; btn.textContent = '发送中…';
+  $('tcResult').hidden = false;
+  st.className = 'state';
+  st.innerHTML = '<span class="dots">发送中</span>';
+  out.hidden = true; out.textContent = '';
+  try {
+    const r = await api('account/test_chat', {
+      method: 'POST',
+      body: JSON.stringify({ uid: tcUID, model: model, message: msg })
+    });
+    if (r.ok) {
+      st.className = 'state ok';
+      st.textContent = '成功 · ' + r.model + ' · ' + tcLatency(r.latency_ms) +
+        (r.reply_truncated ? ' · 回复 ' + r.reply_chars + ' 字（已截断）' : '');
+      out.hidden = false;
+      if (r.reply) {
+        out.textContent = r.reply;
+      } else {
+        // 空回复要给出判读：思考与最终回答共享 max_tokens 预算，思考型模型可能
+        // 整份预算都花在思考上（finish_reason=length）——链路其实是通的。
+        out.textContent = r.finish_reason === 'length'
+          ? '（空回复：思考可能占满了 ' + (r.max_tokens || '') + ' tokens 预算，链路本身可用；可换非思考型模型复测）'
+          : '（空回复，finish_reason=' + (r.finish_reason || '未知') + '）';
+      }
+    } else {
+      st.className = 'state err';
+      st.textContent = '失败 · ' + (r.status ? 'HTTP ' + r.status + ' · ' : '') + tcLatency(r.latency_ms);
+      out.hidden = false;
+      out.textContent = r.error || '未知错误';
+    }
+  } catch (e) {
+    st.className = 'state err';
+    st.textContent = '请求失败：' + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = '发送';
+  }
+}
 
 /* ── 任务中心：开学季 + 全账号扫描/队列 ──────────────────────────── */
 const SCHOOL_META = [
