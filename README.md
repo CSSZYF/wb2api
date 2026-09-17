@@ -308,6 +308,8 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 `login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + 凭证落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
 
+> 执行过下方「Docker 部署登录」里的 `chown -R 10001` 之后，宿主机当前 uid 对 `auths/` 就没有写权限了，此时 `./login.sh` 会在**启动浏览器授权之前**直接退出并提示容器内登录方式（不会白走一遍 OAuth）。凭证目录也可用 `WB2A_AUTH_DIR` 指定（容器内为 `/app/data/auths`）。
+
 > Windows 用户请用方式 A（或 WSL）；`login.sh` 需要 python3。
 
 ### 验证
@@ -762,6 +764,12 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 ```
 
 报错信息里自带这条指引；compose 的 `user` 已参数化为 `${PUID:-10001}:${PGID:-10001}`。
+
+> **chown 之后新增账号必须进容器内登录。** 方案 2 把 `./data`（`WB2A_AUTH_DIR=/app/data/auths` 所在卷）属主交给 10001 后，宿主机当前 uid 就失去了写权限——宿主机上再跑 `./login.sh` 会在 OAuth 启动前被可写性预检拦下并退出（不白走一遍浏览器授权）。容器内以 `app` 身份登录，属主自动正确、无需反复 chown；容器内没有 docker CLI，完成后回宿主机重启：
+>
+> ```bash
+> docker compose exec -it wb2api su-exec 10001:10001 ./login.sh && docker compose restart wb2api
+> ```
 
 ### 账号被 Disable 后如何恢复？
 

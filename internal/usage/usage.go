@@ -74,6 +74,13 @@ type Recorder struct {
 	dirty   bool
 	started time.Time
 
+	// saveMu 串行化落盘 I/O（快照复制与 marshal 仍在 mu 下，写文件不占数据锁）。
+	// 唯一临时文件名已经消除「共用 <path>.tmp 互相截断」，但两个写者仍会同时
+	// rename 同一个目标：POSIX 上后到者直接覆盖（无害），Windows 上对「正被另
+	// 一个句柄重命名的目标」会报 ACCESS_DENIED，失败路径再去 unlink 已 rename
+	// 走的临时文件，就会在目录里留下垃圾。串行化后写盘互斥，两个平台行为一致。
+	saveMu sync.Mutex
+
 	stopOnce sync.Once
 	stop     chan struct{}
 	done     chan struct{}
@@ -289,18 +296,50 @@ func (r *Recorder) flush(force bool) {
 		log.Printf("[usage] 序列化失败: %v", err)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
-		log.Printf("[usage] 建目录失败: %v", err)
-		return
+	// 落盘 I/O 串行化（不占 mu：marshal 与写盘都不阻塞 Add/Snapshot）。
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
+	if err := writeFileAtomic(r.path, raw); err != nil {
+		log.Printf("[usage] %v", err)
 	}
-	tmp := r.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("[usage] 写临时文件失败: %v", err)
-		return
+}
+
+// writeFileAtomic 原子写文件：同目录唯一临时文件 + rename 替换。
+//
+// 临时文件名必须带唯一后缀（os.CreateTemp 的随机段），不能是固定的
+// <path>.tmp：Save（面板刷新 / 关闭前）与 30s ticker 的 flush 会并发进入
+// 这里，共用一个临时路径时两个写者互相截断——先完成的一方把另一方尚未写完
+// 的文件 rename 进正式路径，后者再 rename 就报 ENOENT（hub 版 wb_proxy.py
+// 的 usage-summary 落盘是同一处竞态，修法一致）。
+// 临时文件与正式文件同目录：rename 才是同文件系统内的原子替换（跨设备 EXDEV）。
+//
+// 调用方需持 Recorder.saveMu 串行化（见该字段注释）。
+func writeFileAtomic(path string, raw []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("建目录失败: %v", err)
 	}
-	if err := os.Rename(tmp, r.path); err != nil {
-		log.Printf("[usage] 原子替换失败: %v", err)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("建临时文件失败: %v", err)
 	}
+	tmp := f.Name()
+	// CreateTemp 已按 0600 建；显式再设一次，避免 umask / 平台差异让用量数据外泄。
+	_ = f.Chmod(0o600)
+	_, werr := f.Write(raw)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		// 失败路径不留垃圾临时文件。
+		_ = os.Remove(tmp)
+		return fmt.Errorf("写临时文件失败: %v", werr)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("原子替换失败: %v", err)
+	}
+	return nil
 }
 
 // Save 立即落盘（面板「刷新」或关闭前调用）。
