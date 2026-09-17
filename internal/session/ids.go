@@ -58,9 +58,23 @@ func NewMessageID() string {
 }
 
 // requestIDs 会话键（sticky key）→ conversationRequestID 的进程内惰性缓存。
-// sync.Map：并发无锁读/写，Entry 不删除（会话 key 恒定，值只增不减，不泄漏——
-// key 与粘性会话键同源，进程生命周期内数量有限）。
-var requestIDs sync.Map
+//
+// 有界：会话键**并非**恒定有限——客户端可任意伪造 conversationId，长期运行下键数
+// 随请求增长（原注释"值只增不减，不泄漏"只在"键与粘性会话同源、数量有限"的假设下
+// 成立，而该假设不成立）。这里用 map + 互斥锁 + 计数阈值整体重建做上界：条目数达到
+// requestIDsMax 时丢弃整张表重建（摊还 O(1)，无第三方依赖，无需维护访问序）。
+//
+// 为什么选"整体重建"而非真 LRU：本缓存只影响聚合 ID 的稳定性（键被清后再取会换新
+// ID，上游用量明细多一条记录），不影响正确性；真 LRU 要维护访问序结构（额外内存 +
+// 锁竞争），收益仅是让热键更久存活——不值得。清空后热键在下一次调用即重新缓存。
+var (
+	requestIDsMu sync.Mutex
+	requestIDs   = map[string]string{}
+)
+
+// requestIDsMax 缓存条目上界。取 4096：单条 32 hex 值 + 键字符串约百字节量级，
+// 上限内存占用约几百 KB；同时远大于正常运行的并发会话数，正常场景永不触发重建。
+const requestIDsMax = 4096
 
 // RequestIDForKey 返回会话键的稳定 conversationRequestID：
 //   - 同 key：首次调用生成并缓存，此后恒返回同值（一次 user send/同会话多轮聚合）；
@@ -73,12 +87,19 @@ func RequestIDForKey(key string) string {
 	if key == "" {
 		return NewMessageID()
 	}
-	if v, ok := requestIDs.Load(key); ok {
-		return v.(string)
+	requestIDsMu.Lock()
+	if v, ok := requestIDs[key]; ok {
+		requestIDsMu.Unlock()
+		return v
 	}
 	id := NewMessageID()
-	actual, _ := requestIDs.LoadOrStore(key, id)
-	return actual.(string)
+	if len(requestIDs) >= requestIDsMax {
+		// 达上界：整体重建（旧键下次调用重新生成——只影响聚合 ID 稳定性，不影响正确性）。
+		requestIDs = map[string]string{}
+	}
+	requestIDs[key] = id
+	requestIDsMu.Unlock()
+	return id
 }
 
 // turnSalt 轮级聚合键的派生盐：进程启动时随机生成，让派生 ID 无法按消息内容

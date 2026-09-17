@@ -31,7 +31,15 @@ type StoreSnapshotter interface {
 	LoadState() ([]byte, bool)
 }
 
-// defaultIdle* 闲置补偿默认参数（claude-api selectWeightedRandom 参考口径）。
+// RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
+//
+// 本地**可用**时按新旧择一（快照不早于本地 → 采用快照，否则本地优先）；本地**不可用**
+// （state.json 缺失或不可读，典型为首次在新卷/新节点启动）时**采用快照**——此时本地根本
+// 没有可"优先"的状态，快照是本轮唯一的运行态来源，这正是快照作为「启动恢复备份」的核心
+// 场景。分支情形：无快照 / 快照无 savedAt → 本地优先（无判据可比）。
+//
+// 每种情形都打一条对应的恢复来源日志，便于对账。必须在 SyncToDir 之前调用
+// （SyncToDir 只增删不入值：值只能来自本地 load 或本函数采用快照）。
 func (p *Pool) RestoreFromSnapshot() {
 	store := p.store
 	if store == nil || p.stateFp == "" {
@@ -51,15 +59,25 @@ func (p *Pool) RestoreFromSnapshot() {
 		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
 	}
-	if localErr == nil && !localInfo.ModTime().After(snap.SavedAt) {
+	if localErr != nil {
+		// 本地不可用 → 采用快照（本地没有可"优先"的状态）。
+		//
+		// 旧实现把该情形与「本地较新」合并成同一个 fall-through：既不改内存、不置 dirty
+		// （有效快照被静默丢弃），又打出"本地 state.json（较新于 Redis 快照 …）"——一次
+		// 从未发生过的比较，把排障引向根本不存在的本地文件；随后 SyncToDir 只增删不入值，
+		// 全池运行态（credits/冷却/熔断计数/usedSeq/lastUsed）被清零。
+		p.adoptSnapshot(snap)
+		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)（本地 state.json 不可用: %v）",
+			snap.SavedAt.Format(time.RFC3339), localErr)
+		return
+	}
+	if !localInfo.ModTime().After(snap.SavedAt) {
 		// 快照不早于本地 → 采用快照。
-		p.mu.Lock()
-		p.applySnapshotLocked(snap)
-		p.mu.Unlock()
-		p.dirty.Store(true)
+		p.adoptSnapshot(snap)
 		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
 		return
 	}
+	// 走到这里必然是「本地存在且严格新于快照」，日志结论属实。
 	log.Printf("pool: 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
 }
 
@@ -137,6 +155,15 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			softStreak:   s.SoftStreak,
 		}
 	}
+}
+
+// adoptSnapshot 采用 Redis 快照为当前池状态，并置 dirty 让下一次落盘把它物化回本地
+// state.json（否则快照只在内存生效，下次崩溃恢复又回到旧本地文件）。
+func (p *Pool) adoptSnapshot(s snapshot) {
+	p.mu.Lock()
+	p.applySnapshotLocked(s)
+	p.mu.Unlock()
+	p.dirty.Store(true)
 }
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。

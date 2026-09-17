@@ -773,3 +773,98 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 		})
 	}
 }
+
+// TestEnsureUsageTotalSynthesizesMissingTotal RED：上游末帧 usage 缺 total_tokens
+// 但 prompt_tokens/completion_tokens 都在时，非流式聚合必须补齐 total（OpenAI
+// 非流式 usage 必含该字段）。已有 total / 缺单边 / 无 usage 三形态保持原样。
+func TestEnsureUsageTotalSynthesizesMissingTotal(t *testing.T) {
+	// 缺 total：补齐
+	syn := ensureUsageTotal(map[string]any{"prompt_tokens": float64(10), "completion_tokens": float64(5)})
+	if syn["total_tokens"] != float64(15) {
+		t.Errorf("synthesized total=%v want 15", syn["total_tokens"])
+	}
+	// 已有 total：不覆盖
+	keep := ensureUsageTotal(map[string]any{"prompt_tokens": float64(10), "completion_tokens": float64(5), "total_tokens": float64(100)})
+	if keep["total_tokens"] != float64(100) {
+		t.Errorf("existing total must not be overridden: %v", keep["total_tokens"])
+	}
+	// 缺单边：不合成
+	half := ensureUsageTotal(map[string]any{"prompt_tokens": float64(10)})
+	if _, ok := half["total_tokens"]; ok {
+		t.Errorf("must not synthesize with only one side present: %v", half)
+	}
+	// 集成：SSE 末帧 usage 缺 total → 聚合响应含补齐的 total
+	raw := `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}
+data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := resp["usage"].(map[string]any)
+	if u["total_tokens"] != float64(15) {
+		t.Errorf("aggregated usage total=%v want 15 (integration)", u["total_tokens"])
+	}
+	// 集成不可变：合成走新 map，原上游 usage map 不被改写。
+	src := map[string]any{"prompt_tokens": float64(10), "completion_tokens": float64(5)}
+	_ = ensureUsageTotal(src)
+	if _, polluted := src["total_tokens"]; polluted {
+		t.Errorf("ensureUsageTotal must not mutate the input map: %#v", src)
+	}
+}
+
+// TestEnsureUsageTotalNumericTypes num64 归一：int/int64 手构造 map（测试/内部调用方）
+// 与 float64（json.Unmarshal 产物）都必须能合成；非数字（字符串/null/bool）跳过合成。
+func TestEnsureUsageTotalNumericTypes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   map[string]any
+		want any // nil = 不应有 total
+	}{
+		{"float64", map[string]any{"prompt_tokens": float64(3), "completion_tokens": float64(4)}, float64(7)},
+		{"int", map[string]any{"prompt_tokens": 3, "completion_tokens": 4}, float64(7)},
+		{"int64", map[string]any{"prompt_tokens": int64(3), "completion_tokens": int64(4)}, float64(7)},
+		{"mixed int/float64", map[string]any{"prompt_tokens": 3, "completion_tokens": float64(4.5)}, float64(7.5)},
+		{"string tokens → no synth", map[string]any{"prompt_tokens": "3", "completion_tokens": 4}, nil},
+		{"null tokens → no synth", map[string]any{"prompt_tokens": nil, "completion_tokens": 4}, nil},
+		{"bool tokens → no synth", map[string]any{"prompt_tokens": true, "completion_tokens": 4}, nil},
+		{"zero values still synth", map[string]any{"prompt_tokens": 0, "completion_tokens": 0}, float64(0)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ensureUsageTotal(c.in)
+			tv, has := got["total_tokens"]
+			if c.want == nil {
+				if has {
+					t.Errorf("must not synthesize: %v", tv)
+				}
+				return
+			}
+			if !has || tv != c.want {
+				t.Errorf("total=%v want %v", tv, c.want)
+			}
+		})
+	}
+}
+
+// TestAggregateUsageTotalImmutable 集成级不可变：Aggregate 补齐 total 时，
+// 上游 usage map（来自 SSE 帧解析）不被改写——同一 map 若被复用会污染后续读取。
+func TestAggregateUsageTotalImmutable(t *testing.T) {
+	raw := `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"x"}}],"usage":{"prompt_tokens":7,"completion_tokens":2}}
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := resp["usage"].(map[string]any)
+	if u["total_tokens"] != float64(9) {
+		t.Fatalf("total=%v want 9", u["total_tokens"])
+	}
+	if u["prompt_tokens"] != float64(7) || u["completion_tokens"] != float64(2) {
+		t.Errorf("original fields must survive: %v", u)
+	}
+}

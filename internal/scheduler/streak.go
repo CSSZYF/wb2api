@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
@@ -97,6 +98,8 @@ func compactJSON(raw json.RawMessage) string {
 
 // makeupYesterday 昨日漏签且有补签卡时自动补签（保住连登连续天数）。
 // 无卡 / 无漏签 / 查询失败均静默（不影响主流程）。
+// 昨日按 CST 自然日口径（upstream.GrowthYesterdayDate，先转 CST 再减一日）——与
+// HeatmapYesterdayMissed 的判据同源，避免容器夏令时时区下查昨日/补今日错位。
 func (s *Scheduler) makeupYesterday(a *auth.Auth) {
 	missed, err := s.cfg.Upstream.HeatmapYesterdayMissed(a)
 	if err != nil || !missed {
@@ -106,7 +109,7 @@ func (s *Scheduler) makeupYesterday(a *auth.Auth) {
 	if err != nil || full.MakeupCards.Balance <= 0 {
 		return
 	}
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := upstream.GrowthYesterdayDate(time.Now())
 	if err := s.cfg.Upstream.UseMakeupCard(a, yesterday); err != nil {
 		log.Printf("streak-bonus %s: 补签 %s 失败: %v", a.UID, yesterday, err)
 		return
