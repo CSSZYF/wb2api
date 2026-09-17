@@ -1,7 +1,9 @@
 package panel
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -26,6 +28,36 @@ func TestAppJSSyntax(t *testing.T) {
 	out, err := exec.Command(node, "--check", path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("app.js syntax error:\n%s", out)
+	}
+}
+
+// TestAppJSTestChatWiring 单账号对话测试的前端接线必须齐全：
+// 行内按钮（data-a="testchat"）→ 端点路径 → 弹窗 DOM。三者任一被误删，
+// 面板上就是一个点了没反应的按钮，而所有 Go 测试仍会全绿（与 TestAppJSSyntax 同因）。
+func TestAppJSTestChatWiring(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	for _, must := range []string{
+		`data-a="testchat"`,               // 账号行按钮
+		`'account/test_chat'`,             // 后端端点（api() 会补 /panel/api/ 前缀）
+		`openTestChat(`,                   // 行点击分发
+		`'tcModel'`, `'tcMsg'`, `'tcOut'`, // 弹窗三要素：模型下拉/输入/结果区
+	} {
+		if !strings.Contains(s, must) {
+			t.Errorf("app.js 缺少对话测试接线：%s", must)
+		}
+	}
+	// 端点注册必须与前端调用同路径（改了一边忘另一边 = 404）。
+	pn := newTestPanel()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/panel/api/account/test_chat", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	pn.ServeHTTP(rec, req)
+	if rec.Code == http.StatusNotFound {
+		t.Error("panel.go 未注册 POST /panel/api/account/test_chat")
 	}
 }
 

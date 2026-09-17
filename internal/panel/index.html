@@ -162,11 +162,12 @@ button.danger { color: var(--bad); }
 button.danger:hover:not(:disabled) { border-color: var(--bad); }
 button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
 button.icon { padding: 7px 9px; }
-input, select {
+input, select, textarea {
   font: inherit; color: var(--ink); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
 }
-input:focus, select:focus { outline: none; border-color: var(--accent); }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+textarea { font: 12.5px/1.6 var(--mono); resize: vertical; }
 input[type=checkbox] { width: auto; accent-color: var(--accent); }
 label.fld { display: block; margin-bottom: 14px; }
 label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
@@ -315,6 +316,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
   padding: 11px 13px; font: 12px var(--mono); word-break: break-all; color: var(--accent);
   margin: 8px 0 12px; user-select: all;
+}
+/* 对话测试结果区：与 .url 同款框体，但正文色可读（.url 的强调色是给可复制链接的）。 */
+.reply {
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 11px 13px; font: 12px/1.7 var(--mono); white-space: pre-wrap; word-break: break-word;
+  color: var(--ink-2); margin: 10px 0 0; max-height: 220px; overflow: auto;
 }
 .state { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
 .state.ok { color: var(--ok); } .state.err { color: var(--bad); }
