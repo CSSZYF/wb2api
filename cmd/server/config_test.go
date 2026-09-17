@@ -617,6 +617,88 @@ func TestMaxBodyInvalid(t *testing.T) {
 	}
 }
 
+// TestMaxRotateDefault 默认 max_rotate=3（与 handler 侧 NewHandler 兜底口径一致，
+// 零行为变更：暴露前的写死值就是 3）。
+func TestMaxRotateDefault(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Server.MaxRotate != 3 {
+		t.Errorf("max_rotate=%d want 3", c.Server.MaxRotate)
+	}
+}
+
+// TestMaxRotateExplicit 文件覆盖 max_rotate（池内账号多时调大）。
+func TestMaxRotateExplicit(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"server":{"max_rotate":8}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxRotate != 8 {
+		t.Errorf("max_rotate=%d want 8", c.Server.MaxRotate)
+	}
+}
+
+// TestMaxRotateInvalidFallsBack 非法值（0/负数）回落默认 3 而非报错——与
+// max_body_mb 的 fail fast 相反，走 pool.max_in_flight_global 的「非正回落」先例：
+// max_rotate 的 0 没有"不限"之类的合理语义，无从误导用户，报错只会让手写配置起不来。
+func TestMaxRotateInvalidFallsBack(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(`{"server":{"max_rotate":`+v+`}}`), 0o600)
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("max_rotate=%s must fall back, not error: %v", v, err)
+		}
+		if c.Server.MaxRotate != 3 {
+			t.Errorf("max_rotate=%s normalize 后=%d want 3（回落默认）", v, c.Server.MaxRotate)
+		}
+	}
+	// 键缺席同样保持默认 3（零行为变更的回归锁定）。
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxRotate != 3 {
+		t.Errorf("max_rotate 键缺席=%d want 3", c.Server.MaxRotate)
+	}
+}
+
+// TestMaxRotateJSONKeyRoundTrip JSON 键名双向核对：面板 GET 回显（结构体序列化）
+// 与 POST 保存（反序列化）必须用同一个键名——两边漂移时表单值读不到也存不进。
+// 键名字面量用 hex 构造（显示的字符串未必等于真实字节，字面量断言可能假绿）。
+func TestMaxRotateJSONKeyRoundTrip(t *testing.T) {
+	key := string([]byte{0x6d, 0x61, 0x78, 0x5f, 0x72, 0x6f, 0x74, 0x61, 0x74, 0x65}) // max_rotate
+	if key != "max_rotate" {
+		t.Fatalf("hex decode mismatch: %q", key)
+	}
+	// 入站：用 hex 键走「面板保存」的解析路径。
+	c, err := ParseConfig([]byte(`{"server":{"` + key + `":7}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxRotate != 7 {
+		t.Errorf("hex-key max_rotate=%d want 7", c.Server.MaxRotate)
+	}
+	// 出站：序列化出来的键名必须逐字节等于 max_rotate（面板回显依赖它）。
+	out, err := json.Marshal(c.Server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m[key]; !ok {
+		t.Errorf("server 序列化缺 key %q: %s", key, out)
+	}
+}
+
 // TestMaxInFlightGlobalNormalize max_in_flight_global 的 normalize 语义：
 // 0/负数视为「未设置」回落默认 2（WAF 403 修复 P1-1）。与 max_in_flight 的
 // 0=不限不同——分档键的 0 没有合理语义，回退分档默认最稳。

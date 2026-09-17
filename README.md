@@ -347,6 +347,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。**面板在线修改即时生效** |
+| `server.max_rotate` | `3` | 单请求最多换号次数（0 / 负数回落默认 3）。池内账号多时（如 4-8 个）默认 3 次试不满所有号，可调大让单请求覆盖更多账号；上限大于池内账号数时试遍即止。**面板在线修改即时生效** |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |

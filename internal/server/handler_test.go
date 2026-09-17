@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -236,6 +237,125 @@ func TestSetMaxBodyBytesHotApply(t *testing.T) {
 		bytes.NewReader(append(body, make([]byte, 8<<20)...))))
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("code=%d want 413 (fallback 8MB, body > 8MB)", rec.Code)
+	}
+}
+
+// rotateCallsUntil503 发一次聊天请求，返回上游被调用次数与收到过请求的 Authorization
+// 集合。所有号一律回 11101（ErrBadParams）：不罚账号但**仍然轮转**，因此换号次数 =
+// 上游调用次数（每轮必换新号，不被冷却/熔断提前截断，正好量出轮转上限）。
+func rotateCallsUntil503(t *testing.T, h *Handler) (int, map[string]bool) {
+	t.Helper()
+	calls := map[string]bool{}
+	var n int
+	h.cfg.Upstream.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		n++
+		calls[r.Header.Get("Authorization")] = true
+		return &http.Response{
+			StatusCode: 400,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`)),
+		}, nil
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d want 503 (all rotate attempts exhausted), body=%s", rec.Code, rec.Body)
+	}
+	return n, calls
+}
+
+// maxRotateTestAuths 造 n 个健康账号（余额递减，选号次序确定）。
+func maxRotateTestAuths(n int) []*auth.Auth {
+	auths := make([]*auth.Auth, 0, n)
+	for i := 0; i < n; i++ {
+		uid := "u" + strconv.Itoa(i+1)
+		auths = append(auths, &auth.Auth{UID: uid, AccessToken: "at-" + uid, ExpiresAt: 9999999999})
+	}
+	return auths
+}
+
+// TestMaxRotateDefaultIsThree 默认（未设置 MaxRotate）轮转上限恒为 3：暴露成配置项
+// 前该值写死在 handler，零行为变更的回归锁定。池内 6 个号远超上限，故上限即调用数。
+func TestMaxRotateDefaultIsThree(t *testing.T) {
+	auths := maxRotateTestAuths(6)
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{Pool: testPoolWith(auths...), Upstream: up})
+	n, _ := rotateCallsUntil503(t, h)
+	if n != 3 {
+		t.Errorf("默认轮转次数=%d want 3（Config.MaxRotate 零值兜底）", n)
+	}
+	// 显式 0/负数同口径（NewHandler 兜底 3）。
+	h2 := NewHandler(Config{Pool: testPoolWith(auths...), Upstream: up, MaxRotate: 0})
+	n2, _ := rotateCallsUntil503(t, h2)
+	if n2 != 3 {
+		t.Errorf("MaxRotate=0 轮转次数=%d want 3（兜底）", n2)
+	}
+	h3 := NewHandler(Config{Pool: testPoolWith(auths...), Upstream: up, MaxRotate: -2})
+	n3, _ := rotateCallsUntil503(t, h3)
+	if n3 != 3 {
+		t.Errorf("MaxRotate=-2 轮转次数=%d want 3（兜底）", n3)
+	}
+}
+
+// TestSetMaxRotateHotApply 面板在线改 server.max_rotate 必须即时生效（与
+// SetMaxBodyBytes 同一热更新路径）：同一 handler 不重建，调大后单请求覆盖更多号、
+// 调小后立即收敛；SetMaxRotate(<=0) 与 NewHandler 兜底口径一致回落 3。
+func TestSetMaxRotateHotApply(t *testing.T) {
+	auths := maxRotateTestAuths(6)
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{Pool: testPoolWith(auths...), Upstream: up})
+
+	// 静态配置为 3（默认）：先确认基线。
+	if n, _ := rotateCallsUntil503(t, h); n != 3 {
+		t.Fatalf("基线轮转次数=%d want 3", n)
+	}
+	// 调大到 6（池内账号多时试满所有号）：6 个号全部被打过。
+	h.SetMaxRotate(6)
+	n, calls := rotateCallsUntil503(t, h)
+	if n != 6 {
+		t.Errorf("SetMaxRotate(6) 轮转次数=%d want 6", n)
+	}
+	if len(calls) != 6 {
+		t.Errorf("SetMaxRotate(6) 覆盖账号数=%d want 6（试满池内所有号）", len(calls))
+	}
+	// 调小到 1：立即收敛（不再走 6 次）。
+	h.SetMaxRotate(1)
+	if n, _ := rotateCallsUntil503(t, h); n != 1 {
+		t.Errorf("SetMaxRotate(1) 轮转次数=%d want 1", n)
+	}
+	// <=0 兜底回落 3。
+	h.SetMaxRotate(0)
+	if n, _ := rotateCallsUntil503(t, h); n != 3 {
+		t.Errorf("SetMaxRotate(0) 轮转次数=%d want 3（兜底默认）", n)
+	}
+	// 热改优先于静态字段：Config.MaxRotate=5 被 SetMaxRotate(2) 覆盖（面板改完即生效，
+	// 静态字段只是启动期快照）。
+	h2 := NewHandler(Config{Pool: testPoolWith(auths...), Upstream: up, MaxRotate: 5})
+	if n, _ := rotateCallsUntil503(t, h2); n != 5 {
+		t.Fatalf("静态 MaxRotate=5 轮转次数=%d want 5", n)
+	}
+	h2.SetMaxRotate(2)
+	if n, _ := rotateCallsUntil503(t, h2); n != 2 {
+		t.Errorf("SetMaxRotate(2) 覆盖静态 5 后轮转次数=%d want 2", n)
+	}
+}
+
+// TestMaxRotateAbovePoolSizeStopsAtPool 上限大于池内账号数时不死循环：号试遍即
+// 选号返回 nil 终止（503），调用数 = 池内账号数而非配置上限。
+func TestMaxRotateAbovePoolSizeStopsAtPool(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool:      testPoolWith(maxRotateTestAuths(2)...),
+		Upstream:  up,
+		MaxRotate: 9, // 远超池内账号数
+	})
+	n, calls := rotateCallsUntil503(t, h)
+	if n != 2 {
+		t.Errorf("轮转次数=%d want 2（号试遍即终止，不按配置上限硬跑）", n)
+	}
+	if len(calls) != 2 {
+		t.Errorf("覆盖账号数=%d want 2", len(calls))
 	}
 }
 

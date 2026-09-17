@@ -38,7 +38,7 @@ import (
 // 之所以用 var 而非 const：const 无法被 -ldflags -X 覆盖，版本号就得手改源码，
 // 于是很容易留下 `+dirty` / `+realmfix` 这类构建期后缀与源码里写死的字符串对不上。
 // 单一来源 = git tag，产物版本号永远可复现、无后缀。
-var appVersion = "v1.9.11"
+var appVersion = "v1.9.12"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -284,6 +284,7 @@ func main() {
 		HiddenModels:     hiddenModels,
 		PinnedModels:     pinnedModels,
 		MaxBodyBytes:     int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		MaxRotate:        cfg.Server.MaxRotate,              // 单请求最多换号次数（池内账号多时可调大）
 	})
 	chatHandler = h
 
@@ -343,6 +344,7 @@ func panelListenPath(listen string) string {
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
 //   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
+//   - server.max_rotate → handler.SetMaxRotate（同上一行口径：池内账号多时调大换号次数即时生效）
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 //   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
@@ -407,6 +409,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
 	if srv != nil {
 		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
+		srv.SetMaxRotate(newCfg.Server.MaxRotate) // 池内账号多时调大换号次数，保存后即时生效
 	}
 
 	return restartRequiredFields(newCfg), nil

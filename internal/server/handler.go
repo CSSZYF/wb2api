@@ -130,6 +130,10 @@ type Handler struct {
 	// 面板在线改 server.max_body_mb 时经 SetMaxBodyBytes 热生效，无需重启
 	// （issue #17：改了配置却静默不生效，用户仍被 8MB 413 拦截）。
 	maxBodyBytes atomic.Int64
+	// maxRotate 单请求最多换号次数的运行期值（cfg.MaxRotate 的原子镜像）。
+	// 面板在线改 server.max_rotate 时经 SetMaxRotate 热生效，无需重启
+	// （池内账号多时默认 3 次试不满所有号）。
+	maxRotate atomic.Int64
 }
 
 // SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
@@ -139,6 +143,26 @@ func (h *Handler) SetMaxBodyBytes(n int64) {
 		n = 8 << 20
 	}
 	h.maxBodyBytes.Store(n)
+}
+
+// SetMaxRotate 热更新单请求最多换号次数（面板保存配置路径调用）。
+// n<=0 与 NewHandler 兜底口径一致：回落默认 3。
+func (h *Handler) SetMaxRotate(n int) {
+	if n <= 0 {
+		n = 3
+	}
+	h.maxRotate.Store(int64(n))
+}
+
+// rotateLimit 返回当前生效的换号次数（运行期原子值，面板热改后立即反映）。
+// 兜底 3 与 NewHandler/SetMaxRotate 同口径：即便 handler 未经 NewHandler 装配
+// （原子值为零值）也保证 >=1——否则轮转循环一次都不进，请求直接 503。
+// 不读 h.cfg.MaxRotate：那是启动期快照，面板热改后会过期。
+func (h *Handler) rotateLimit() int {
+	if n := h.maxRotate.Load(); n > 0 {
+		return int(n)
+	}
+	return 3
 }
 
 // NewHandler 构建 handler。
@@ -169,6 +193,7 @@ func NewHandler(cfg Config) *Handler {
 		HasRealm:      hasRealm,
 	}
 	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
+	h.maxRotate.Store(int64(cfg.MaxRotate))
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -705,7 +730,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	// 换号上限本请求内固定一次（与 maxBodyBytes 同口径的"请求内快照"）：
+	// 轮转中途面板改值不影响本请求已定的次数，避免同请求内上限漂移。
+	maxRotate := h.rotateLimit()
+	for i := 0; i < maxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
