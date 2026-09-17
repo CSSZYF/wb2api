@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,6 +120,9 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
+	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
+	wafIP wafIPGate
 	// router 模型名 → realm 归属决策（显式前缀优先，裸名按池内可用域）。
 	// 与 cmd 侧粘性闭包同源，避免两处各写一套域判定而漂移。
 	router RealmRouter
@@ -698,6 +702,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if stickyUID != "" && acct.UID == stickyUID {
 				unbindSticky()
 			}
+			if !rotateBackoff(i, r.Context()) {
+				// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
+				break
+			}
 			continue // 最后一个名额被并发抢走 → 换号
 		}
 		heldUID = acct.UID
@@ -713,6 +721,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
 				fail(acct.UID)
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转（refresh 失败换号退避，WAF P0-2）
+				}
 				continue
 			}
 			if err := acct.SaveAtomic(); err != nil {
@@ -724,19 +735,36 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
 		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
-		if terr != nil {
+		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
+		// Retry-After 头解析，见 ChatStreamContext 注释）。传输层错误（非 *Error）走
+		// 抖动换号分支；防御分支（terr 为 nil 但 status>=400，如 ErrNone 兜底）回落
+		// 本地 Classify，双保险不改变语义。
+		var uerr *upstream.Error
+		if errors.As(terr, &uerr) {
+			status = uerr.Status
+		}
+		if uerr == nil && terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			fail(acct.UID)
+			if !rotateBackoff(i, r.Context()) {
+				break // ctx 取消：终止轮转（传输层错误换号退避，WAF P0-2）
+			}
 			continue
 		}
 		if status >= 400 {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
 			st.status = status
-			kind := upstream.Classify(status, string(respBody))
+			var kind upstream.ErrKind
+			if uerr != nil {
+				kind = uerr.Kind
+			} else {
+				kind = upstream.Classify(status, string(respBody))
+				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			}
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
@@ -755,7 +783,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// （此前会落到 503 no_healthy_account + lastErr 泄露 11128 与账号语义）。
 				// 不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError），但 content_blocked
 				// 是本请求的终态——换任何账号都会撞同一审核，轮转纯属浪费时间。
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				msg := upstream.ContentBlockedClientMessage(string(respBody))
 				writeOpenAIError(w, http.StatusBadRequest, "content_blocked", msg)
@@ -770,20 +798,35 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
 			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
 			if kind == upstream.ErrPromptTooLong {
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				writeOpenAIError(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)))
 				st.status = http.StatusBadRequest
 				return
 			}
-			// lastErr 携带完整 body（不透传上游侧截断后的短文案，末端 503 需要原文
-			// 全量以便排查）+ Kind/Status（末端映射与冷却时长共用）。
-			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
+			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
+			// 要求原文全量）+ Kind/Status（末端映射与冷却时长共用）+ RetryAfter
+			// （末端 429 映射与冷却对齐共用）。
+			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
+			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
+			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，IP 被拦而非账号）
+			// 则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍打同一出口 IP，
+			// 加重风控。账号级软冷却已在上方 applyErrorPolicy 照常记账（单号偶发 403
+			// 仍冷却），IP 级状态只改变「是否继续轮转」——协同不叠加。
+			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
+				break
+			}
+			if !rotateBackoff(i, r.Context()) {
+				break // ctx 取消：终止轮转（分类错误换号退避，WAF P0-2）
+			}
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 		if sessKey != "" && h.cfg.Session != nil {
@@ -834,19 +877,42 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
-	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+	code := "no_healthy_account"
+	// WAF IP 级拦截措辞（fail-fast 终止路径）：轮转已止损（继续换号只会打同一出口
+	// IP，加重风控），业务 code 换成 waf_ip_blocked 让客户端识别「换号无用、等窗口」。
+	// 透传语义（原文优先）：有上游 body 时 message 装原文（排障必需，不拼接本地
+	// 前缀）；空体（WAF 拦截页常见形态）才用本地可读文案兜底。单号偶发 403（IP 门
+	// 未激活）保持 no_healthy_account 通用文案不变。
+	var ue *upstream.Error
+	if errors.As(lastErr, &ue) && ue.Kind == upstream.ErrWafBlock && h.wafIP.active() {
+		code = "waf_ip_blocked"
+		if s := strings.TrimSpace(ue.Msg); s != "" {
+			msg = s
+		} else {
+			msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
+		}
+	}
+	writeOpenAIError(w, http.StatusServiceUnavailable, code, msg)
 	st.status = http.StatusServiceUnavailable
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
-// kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
-// 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
+// kind 是唯一权威分类（来自 upstream.Classify / ChatStreamContext 的 *Error 信封），
+// 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：调用方已
+// 准备好 lastErr 并打算 continue 换号（continue 前由 rotateBackoff 退避）。
 //
 // 路径清单，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
-//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。
+//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。P1-2 后冷却时长
+//     优先采信 Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
+//   - ErrWafBlock → 账号级软冷却（WAF 403 修复 P0-1）：**不 Disable**——WAF 403 是
+//     IP/指纹维频控信号（双账号 403 后账号本身健康），罚过即走、到期自愈。
+//     时长优先 Retry-After 头（P1-2）；缺失按 soft_rate 基数起 · 2^softStreak
+//     封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避（WAF 信号带 IP 级粘性，
+//     故指数升级保底存在）。基数经 jitterDur 抖动（复用 backoff.go 单一抖动来源，
+//     防多账号同相位冷却到期再聚团）。不喂熔断（WAF 拦截是频控不是账号故障）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError），passthrough 模式走降级重试。
@@ -855,17 +921,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //     同 ErrContentBlocked 待遇），chatCompletions 已直接透传原文返回不轮转——
 //     该分支只为文档完备，不指望走到换号路径。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
+//     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。这是**唯一**的熔断入口。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
-// 携带的模型名（触发 6004 时记录以便后续切模型豁免）。
+// 携带的模型名（出站裸名：6004 记模型豁免、11102 记 (账号,模型) 负缓存）。uerr 是
+// ChatStreamContext 返回的分类信封（可携带 RetryAfter，P1-2）；防御路径下为 nil，
+// 冷却时长回落既有计算。
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；余额恢复解冻（ReenableIfCredits→reviveCoolingLocked）
 // 仅对硬冷却放行（issue #199 收窄：软冷却/模型级冷却不被余额刷新/签到解冻），且只清冷却、不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string) {
+func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
@@ -888,9 +958,28 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
 			return
 		}
+		// P1-2：body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加，
+		// 与重置墙钟同一对齐语义）。头优先于「有界退避」，但**低于** body 重置文案
+		// （上方已 return）——文案是上游更权威的口径（Retry-After 只在无重置文案时兜底）。
+		if uerr != nil && uerr.RetryAfter > 0 {
+			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
+			return
+		}
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
+	case upstream.ErrWafBlock:
+		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族（本仓 v1.9.7
+		// 既有，不新建平行冷却系统）：基数取 soft_rate 基数（h.softCooldown()，热改优先）、
+		// softStreak 指数升级、封顶 soft_rate_max、冷却中兜底探测不翻倍——全部继承既有
+		// 语义。Retry-After 头优先（P1-2，WAF 拦截页可能带该头）。**不 Disable**：WAF 403
+		// 是 IP/指纹维频控信号（账号本身健康），罚过即走、到期自愈；也不喂熔断
+		// （拦截是频控不是账号故障，NoteError 只服务 ErrServer）。
+		if uerr != nil && uerr.RetryAfter > 0 {
+			h.cfg.Pool.CooldownSoftRate(uid, jitterDur(h.softCooldown()), time.Now().Add(uerr.RetryAfter), "waf 403 block (retry-after)")
+			return
+		}
+		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(h.softCooldown()), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
@@ -927,9 +1016,32 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
+	case upstream.ErrModelBlocked:
+		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
+		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
+		// 24h）。选号侧 healthyForModel 对该账号自动避开该模型；切模型/切账号即可用。
+		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
+		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}
+}
+
+// rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：
+// 第 i 次轮转失败（continue 换号前）等待 backoffAfter(i)（500ms·2^i 封顶 8s，
+// ±25% 抖动），ctx 取消（客户端断连/优雅停机）返回 false——调用方立即终止轮转
+// （客户端已走，换号重试无意义）。退避是「换号前歇一下」让上游频控窗口滑过；
+// 正常单号请求（首次成功）不经过本函数，零开销。
+func rotateBackoff(i int, ctx context.Context) bool {
+	d := backoffAfter(i)
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	if !sleepCtx(ctx, d) {
+		log.Printf("WARN: [server] rotate backoff aborted: ctx cancelled")
+		return false
+	}
+	return true
 }
 
 // promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/

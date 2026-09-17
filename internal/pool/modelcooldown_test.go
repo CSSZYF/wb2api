@@ -625,3 +625,146 @@ func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 		t.Error("旧文件 until 应照常加载（账号级冷却兼容）")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 11102「该后端无此模型」负缓存（复用 modelCooldowns 机制，BlockModelBackoff/Clear）
+// ---------------------------------------------------------------------------
+
+// TestBlockModelBackoffCooledAndExempt 11102 写 modelCooldowns[model]：该账号该模型被
+// 负缓存避让（healthyForModel=false），但其他模型豁免（账号级 healthy 仍真）——
+// 与 6004 豁免同域复用，语义「切模型即可用」。
+func TestBlockModelBackoffCooledAndExempt(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	mc, ok := e.modelCooldowns["deepseek-v3-2-volc"]
+	untilZero := e.until.IsZero()
+	p.mu.RUnlock()
+
+	if !ok || mc.Until.IsZero() {
+		t.Fatalf("11102 应写入 modelCooldowns[model], got ok=%v mc=%+v", ok, mc)
+	}
+	if !untilZero {
+		t.Errorf("11102 不写账号级 until（切模型不绕过），until=%v", e.until)
+	}
+	// 触发模型被负缓存拦截（healthyForModel=false），其他模型豁免（账号级 healthy 仍真）。
+	if e.healthyForModel(time.Now(), "deepseek-v3-2-volc") {
+		t.Errorf("11102 后该模型应被负缓存拦截，但 healthyForModel 放行了")
+	}
+	if !e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Errorf("11102 只锁触发模型，其他模型应仍可选")
+	}
+}
+
+// TestBlockModelBackoffExponentialTtl 11102 退避：首次 6h、二次 12h、封顶 24h。
+func TestBlockModelBackoffExponentialTtl(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	p.BlockModelBackoff("u1", "m", "11102 model not available")
+	p.mu.RLock()
+	first := time.Until(p.byUID["u1"].modelCooldowns["m"].Until)
+	p.mu.RUnlock()
+	if d := first - modelBlockBaseTTL; d > time.Second || d < -time.Second {
+		t.Errorf("首次 TTL=%v want ~6h", first)
+	}
+
+	p.BlockModelBackoff("u1", "m", "11102 model not available")
+	p.mu.Lock()
+	mc := p.byUID["u1"].modelCooldowns["m"]
+	hits := mc.Hits
+	second := time.Until(mc.Until)
+	p.mu.Unlock()
+	if hits != 2 {
+		t.Errorf("hits=%d want 2", hits)
+	}
+	if d := second - 12*time.Hour; d > time.Second || d < -time.Second {
+		t.Errorf("二次 TTL=%v want ~12h", second)
+	}
+
+	// 连打到远超封顶：TTL 封顶 24h。
+	for i := 0; i < 10; i++ {
+		p.BlockModelBackoff("u1", "m", "11102 model not available")
+	}
+	p.mu.RLock()
+	capped := time.Until(p.byUID["u1"].modelCooldowns["m"].Until)
+	p.mu.RUnlock()
+	if d := capped - modelBlockMaxTTL; d > time.Second || d < -time.Second {
+		t.Errorf("封顶 TTL=%v want ~24h", capped)
+	}
+}
+
+// TestBlockModelBackoffNoUIDNoop 空 uid/model 与不存在的 uid 均为空操作（防御性，不 panic）。
+func TestBlockModelBackoffNoUIDNoop(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.BlockModelBackoff("", "m", "11102 model not available")
+	p.BlockModelBackoff("u1", "", "11102 model not available")
+	p.BlockModelBackoff("missing", "m", "11102 model not available")
+	p.BlockModelClear("", "m")
+	p.BlockModelClear("missing", "m")
+	p.mu.RLock()
+	n := len(p.byUID["u1"].modelCooldowns)
+	p.mu.RUnlock()
+	if n != 0 {
+		t.Errorf("空参数调用不得写入 modelCooldowns，got %d 条", n)
+	}
+}
+
+// TestBlockModelClearOnly11102 成功清除只清 11102 条目，不碰 6004 独立冷却。
+func TestBlockModelClearOnly11102(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	now := time.Now()
+	p.CooldownSoftForModel("u1", time.Minute, now.Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+
+	p.BlockModelClear("u1", "deepseek-v3-2-volc")
+	p.mu.RLock()
+	_, blockedGone := p.byUID["u1"].modelCooldowns["deepseek-v3-2-volc"]
+	_, sixGone := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	p.mu.RUnlock()
+	if blockedGone {
+		t.Errorf("BlockModelClear 后 11102 条目应清除")
+	}
+	if !sixGone {
+		t.Errorf("BlockModelClear 不得清除 6004 条目（glm-5.3 仍在冷却）")
+	}
+}
+
+// TestBlockModelClear6004NotClearedByPrefix 6004 条目 reason 前缀非 11102，Clear 不误删。
+func TestBlockModelClear6004NotClearedByPrefix(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "m", "6004 model rate limit")
+	p.BlockModelClear("u1", "m") // Clear 不匹配 6004 reason
+	p.mu.RLock()
+	_, ok := p.byUID["u1"].modelCooldowns["m"]
+	p.mu.RUnlock()
+	if !ok {
+		t.Errorf("6004 条目不得被 BlockModelClear 删除")
+	}
+}
+
+// TestBlockModelBackoffPickSkips 11102 后选号器对该账号该模型避开（Pick 对 glm 豁免 u1 恢复）。
+func TestBlockModelBackoffPickSkips(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 1000, 0)
+	p.SetCredits("u2", 1, 0)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+	// 该模型请求应跳过 u1（u1 该模型被 11102 负缓存）、落到 u2。
+	if got := p.PickExcludingForRealm(nil, "deepseek-v3-2-volc", ""); got == nil || got.UID != "u2" {
+		t.Fatalf("11102 后该模型应跳过 u1, got %+v", got)
+	}
+	// 其他模型 u1 恢复可选（豁免保持）。
+	if got := p.PickExcludingForRealm(nil, "glm-5.3", ""); got == nil || got.UID != "u1" {
+		t.Fatalf("其他模型应豁免 u1, got %+v", got)
+	}
+}

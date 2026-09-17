@@ -99,16 +99,24 @@ type RateLimitedModel struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// modelCooldown 单个 (账号, 模型) 的 6004 独立冷却记录。运行态结构，经 stateModelCooldown
+// modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。运行态结构，经 stateModelCooldown
 // 持久化（stateAccount.ModelCooldowns）：重启后恢复，恢复时惰性过滤已过期条目。
+// 承载两种「该模型在此账号上不可用」语义：
+//   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
+//   - 11102 该后端无此模型：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
+//     累计命中次数驱动退避（6004 无 hits 概念，Hits 恒 0）。
 type modelCooldown struct {
-	// Until 该模型的冷却截止（= now+min(resetAt-now, soft_rate_max)，截断后）。
+	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11102：now+退避 TTL）。
 	Until time.Time
 	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）。
 	// 与 Until 的区别：Until 可能截断，ResetAt 是上游权威恢复时刻。
+	// 11102 无重置文案，ResetAt 恒零值。
 	ResetAt time.Time
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string
+	// Hits 11102 负缓存的累计命中次数（驱动指数退避）。运行态不落盘（同 modelCost 口径：
+	// 重启后从 6h 基数重新学习）；6004 条目 Hits 恒 0。持久化来回不会写入该字段。
+	Hits int
 }
 type entry struct {
 	a            *auth.Auth
@@ -362,6 +370,15 @@ const (
 // defaultSoftRateMax 软冷却的默认封顶（有界退避的封顶 + 重置墙钟的截断上限）：
 // softRateMax 未注入（<=0）时按此值算，避免测试/裸用池时退避无上限。
 const defaultSoftRateMax = 2 * time.Hour
+
+// 11102「该后端无此模型」负缓存的退避参数（复用 modelCooldowns 机制承载）。
+// 首次命中冷却 6h，半开到期放行重试；再命中按 Hits 指数退避（×2^min(hits-1,6)），
+// 封顶 24h（最多一天再试一次）；该模型请求成功即清。6004 限流不参与本退避（各自独立语义）。
+const (
+	modelBlockBaseTTL = 6 * time.Hour
+	modelBlockMaxTTL  = 24 * time.Hour
+	modelBlockShift   = 6 // 2^6=64 倍后封顶：6h×64>24h，实际封顶锚定 24h
+)
 
 // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
 // 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败即禁用的旧行为

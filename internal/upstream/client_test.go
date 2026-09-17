@@ -76,11 +76,219 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
+		// 11102「该后端无此模型」：确定性答复，归 ErrModelBlocked（(账号,模型) 负缓存避让）。
+		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
+		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
+		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
+		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
+		// WAF 403（P0-1）：403 + 无业务信封（无 "code":/"msg": 字段）→ ErrWafBlock。
+		// 空体 / HTML 拦截页 / 纯文本 / 非信封 JSON 均命中。
+		{403, ``, ErrWafBlock},
+		{403, `<html><body>403 Forbidden</body></html>`, ErrWafBlock},
+		{403, `Forbidden`, ErrWafBlock},
+		{403, `{"message":"blocked by waf"}`, ErrWafBlock},
+		{403, `<head><script>...</script></head><body>blocked</body>`, ErrWafBlock},
+		// 403 带业务信封的仍走既有分类（P0-1 约束：不劫持业务 403）。
+		{403, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
+		{403, `{"code":60001,"msg":"quota exceeded"}`, ErrHardCredit},
+		{403, `{"code":1,"msg":"unknown business error"}`, ErrClient},
+		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
+		{400, `bad request`, ErrClient},
+		{429, ``, ErrSoftRate},
+		// 上游英文 6004 原句（"usage exceeds frequency limit, …"）：非 429 状态码下
+		// 既无 "rate limit" 也无 "usage limit" 子串，靠 "frequency limit" 词条命中，
+		// 须归 ErrSoftRate（否则只换号不冷却，坏号留在池内反复被选中）。
+		{400, `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at 2026-09-18 09:31:32 UTC+8"}`, ErrSoftRate},
+		{200, `usage exceeds frequency limit`, ErrSoftRate},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d,%q)=%v want %v", c.status, c.body, got, c.want)
 		}
+	}
+}
+
+// TestIsModelBlocked 11102「该后端无此模型」判定：只认 code 精确等于 11102 或 msg 命中
+// 窄短语 "service info not found"，且仅在 400/404 下判。覆盖「11102 撞在 requestId 上」
+// 的坑——requestId 里的 11102 不得误判。
+func TestIsModelBlocked(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		// 顶层 code 字段。
+		{404, `{"code":11102,"msg":"model [x] service info not found"}`, true},
+		// error 子对象 code 字段（OpenAI 信封形态）。
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, true},
+		// msg 短语命中（无 code 字段）。
+		{400, `{"msg":"model service info not found"}`, true},
+		// 11102 撞在 requestId 上不算（防误避让可用模型）。
+		{404, `{"requestId":"11102","code":0,"msg":"ok"}`, false},
+		{400, `{"requestId":"11102","msg":"boom"}`, false},
+		// 429 带 11102 属限流语义，不算模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, false},
+		// 非 400/404 不算。
+		{500, `{"code":11102,"msg":"service info not found"}`, false},
+		// code 非 11102 且无短语 → 不算。
+		{404, `{"code":11103,"msg":"x"}`, false},
+		// 空 body 不算。
+		{404, ``, false},
+	}
+	for _, c := range cases {
+		if got := IsModelBlocked(c.status, c.body); got != c.want {
+			t.Errorf("IsModelBlocked(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestIsWafBlocked WAF 403 形态判定的直接回归（Classify 的 WAF 层）：
+// 只认 403 + 无业务信封；带信封/其他状态码一律 false。
+func TestIsWafBlocked(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{403, "", true},
+		{403, "<html>blocked</html>", true},
+		{403, `{"code":1}`, false},                // 有 "code": 字段
+		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
+		{402, "", false},                          // 非 403
+		{429, "", false},
+		{500, "<html>gateway</html>", false},
+	}
+	for _, c := range cases {
+		if got := IsWafBlocked(c.status, c.body); got != c.want {
+			t.Errorf("IsWafBlocked(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestParseRetryAfter Retry-After / retry-after-ms / x-ratelimit-reset 头解析
+// （有效/缺失/非法三形态 + 2h 封顶）。语义对齐 intl CLI parseRetryAfterMs /
+// parseRateLimitResetMs（头族与数字口径）。
+func TestParseRetryAfter(t *testing.T) {
+	t.Run("retry-after seconds", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "30")
+		if d := ParseRetryAfter(h); d != 30*time.Second {
+			t.Fatalf("ParseRetryAfter(30)=%v want 30s", d)
+		}
+	})
+	t.Run("retry-after-ms", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After-Ms", "1500")
+		if d := ParseRetryAfter(h); d != 1500*time.Millisecond {
+			t.Fatalf("ParseRetryAfter(1500ms)=%v want 1.5s", d)
+		}
+	})
+	t.Run("x-ratelimit-reset epoch seconds", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(90*time.Second).Unix()))
+		d := ParseRetryAfter(h)
+		if d < 80*time.Second || d > 100*time.Second {
+			t.Fatalf("ParseRetryAfter(epoch+90s)=%v want ~90s", d)
+		}
+	})
+	t.Run("x-ratelimit-reset epoch millis", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(45*time.Second).UnixMilli()))
+		d := ParseRetryAfter(h)
+		if d < 35*time.Second || d > 55*time.Second {
+			t.Fatalf("ParseRetryAfter(epochMilli+45s)=%v want ~45s", d)
+		}
+	})
+	t.Run("missing headers", func(t *testing.T) {
+		if d := ParseRetryAfter(http.Header{}); d != 0 {
+			t.Fatalf("missing headers must return 0, got %v", d)
+		}
+	})
+	t.Run("invalid values", func(t *testing.T) {
+		for _, v := range []string{"abc", "", "-5", "1.5", "0"} {
+			h := http.Header{}
+			h.Set("Retry-After", v)
+			if d := ParseRetryAfter(h); d != 0 {
+				t.Errorf("Retry-After=%q must be rejected, got %v", v, d)
+			}
+		}
+	})
+	t.Run("oversized sanity cap", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "999999") // > retryAfterSanity(2h)
+		if d := ParseRetryAfter(h); d != 0 {
+			t.Errorf("oversized Retry-After must fall back, got %v", d)
+		}
+	})
+	t.Run("expired reset epoch", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(-time.Minute).Unix()))
+		if d := ParseRetryAfter(h); d != 0 {
+			t.Errorf("expired reset must be rejected, got %v", d)
+		}
+	})
+	t.Run("priority retry-after first", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "10")
+		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(300*time.Second).Unix()))
+		if d := ParseRetryAfter(h); d != 10*time.Second {
+			t.Fatalf("Retry-After must take priority, got %v", d)
+		}
+	})
+}
+
+// TestChatStreamErrorCarriesRetryAfter 端到端：上游 429 带 Retry-After 头时，
+// ChatStreamContext 返回的 *Error 信封携带解析后的 RetryAfter（P1-2 挂载点验收）。
+func TestChatStreamErrorCarriesRetryAfter(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		resp := jsonResp(429, `{"code":1,"msg":"rate limit"}`)
+		resp.Header.Set("Retry-After", "77")
+		return resp, nil
+	})
+	_, _, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{}`), "", ChatMeta{})
+	var ue *Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("want *Error, got %v", err)
+	}
+	if ue.Kind != ErrSoftRate {
+		t.Fatalf("kind=%v want soft_rate", ue.Kind)
+	}
+	if ue.RetryAfter != 77*time.Second {
+		t.Fatalf("RetryAfter=%v want 77s", ue.RetryAfter)
+	}
+}
+
+// TestChatStreamErrorRetryAfterAbsent 头缺失时 RetryAfter 零值（回落调用方计算）。
+func TestChatStreamErrorRetryAfterAbsent(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(429, `{"code":1,"msg":"rate limit"}`), nil
+	})
+	_, _, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{}`), "", ChatMeta{})
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrSoftRate {
+		t.Fatalf("want *Error{soft_rate}, got %v", err)
+	}
+	if ue.RetryAfter != 0 {
+		t.Fatalf("RetryAfter=%v want 0 (absent header)", ue.RetryAfter)
+	}
+}
+
+// TestChatStreamWafBlockErrorCarriesKind 端到端：上游 403 空体（WAF 拦截形态）
+// 经 ChatStreamContext 返回 ErrWafBlock 分类信封（P0-1 分类一次成型）。
+func TestChatStreamWafBlockErrorCarriesKind(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(403, ``), nil
+	})
+	_, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{}`), "", ChatMeta{})
+	if status != 403 {
+		t.Errorf("status=%d want 403", status)
+	}
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrWafBlock {
+		t.Fatalf("403 empty body should return *Error{waf_block}, got %v", err)
 	}
 }
 
@@ -512,10 +720,17 @@ func TestChatStreamHardCreditError(t *testing.T) {
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
-	if err != nil {
-		t.Fatalf("hard credit should return body via status, not err: %v", err)
+	// 错误路径返回已分类的 *Error 信封（WAF 403 修复后的新契约：分类一次成型，
+	// 消除 upstream/handler 双次 Classify 的漂移面），同时 respBody 原样返回
+	// （错误透传语义不变，调用方仍可读原文）。
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrHardCredit {
+		t.Fatalf("hard credit should return classified *Error, got %v", err)
 	}
-	// caller classifies via returned body
+	if ue.Status != 402 {
+		t.Errorf("envelope status=%d want 402", ue.Status)
+	}
+	// caller can still classify via returned body（respBody 原样保留）
 	if Classify(status, string(respBody)) != ErrHardCredit {
 		t.Errorf("body=%q not classified hard credit", respBody)
 	}
