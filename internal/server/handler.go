@@ -567,7 +567,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// realm 归属解析：model 名可带显式 "[realm:]" 前缀（老客户端配置兼容）；
 	// 裸名按池内可用域归属——单域部署（只登国际版账号）下裸名直接走该域，
 	// 多域部署按 realm_precedence。bareModel 用于选号/粘性/出站 body 重写。
-	realm, bareModel := h.router.Resolve(peek.Model)
+	//
+	// realmExplicit 区分归属来源（issue #199c 跨域回落的开关）：显式前缀 = 用户强指定，
+	// 本域无可用号时**不跨域回落**（换域可能违反其意图）；裸名归属 = 网关默认倾向，
+	// 本域无可用号时回落另一域，避免混合池下「本域全限流即 503」而另一域明明可用。
+	realm, bareModel, realmExplicit := h.router.ResolveWithSource(peek.Model)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -713,6 +717,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
+				// 粘性号校验**不做跨域放宽**（issue #199c 只改普通轮转）：粘性号的 realm 不符
+				// 说明该会话被绑到了另一域的号（如绑定时走的是显式前缀请求），继续用它等于
+				// 无视本次请求的域归属；解绑后由下面的普通轮转按软优先/回落重新分配。
 				unbindSticky()
 				acct = nil
 			}
@@ -720,7 +727,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			// 裸名归属（realmExplicit=false）走软优先入口：本域无候选（含 6004 模型级
+			// 冷却在 healthyForModel 里过滤掉本域全部号的情形）时回落另一域再选一次
+			// ——混合池 1 global + 1 cn 且 realm_precedence=global 时，global 号对该模型
+			// 429/6004 后第二轮选号不再无候选 503，而是落到 cn 号。显式前缀是用户强指定，
+			// 用硬过滤入口，不跨域。
+			if realmExplicit {
+				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			} else {
+				acct = h.cfg.Pool.PickExcludingForRealmFallback(tried, bareModel, realm)
+			}
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable

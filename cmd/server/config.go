@@ -157,6 +157,9 @@ type Config struct {
 		// RealmPrecedence 裸模型名在「池内两域都有账号」时的默认归属域：
 		// "global"（缺省）/ "cn"。单域部署（只登国际版账号）下此项无影响——
 		// 裸名直接落唯一可用域。
+		// 这是**软优先**而非硬规则：本域选不出可用账号时请求回落另一域，避免
+		// 混合池下"本域全限流即 503"（跨域发生时有 "pool: realm fallback" 日志）。
+		// 显式 "cn:"/"global:" 前缀是用户强指定，一律不回落，本域不可用即 503。
 		RealmPrecedence string `json:"realm_precedence"`
 		// HiddenModels 对外隐藏的模型名（面板「模型与档位」与 /v1/models 同口径）。
 		// 键缺席 → 用内置默认：上游的路由策略别名 default-model / fast-model /

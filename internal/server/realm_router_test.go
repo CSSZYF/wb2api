@@ -89,6 +89,42 @@ func TestRealmRouterPrecedenceBothRealms(t *testing.T) {
 	}
 }
 
+// TestRealmRouterResolveWithSource 显式前缀标记（issue #199c）：跨域回落的开关据此
+// 区分「用户强指定」（显式前缀，不回落）与「网关默认倾向」（裸名归属，可回落）。
+func TestRealmRouterResolveWithSource(t *testing.T) {
+	withGlobalEnabled(t)
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
+	p.Add(&auth.Auth{UID: "c1", Domain: "www.codebuddy.cn"})
+	r := RealmRouter{GlobalEnabled: true, Precedence: "global", HasRealm: p.HasRealm}
+
+	cases := []struct {
+		model    string
+		realm    string
+		bare     string
+		explicit bool
+	}{
+		{"cn:glm-5.2", "cn", "glm-5.2", true},
+		{"global:gpt-5.4", "global", "gpt-5.4", true},
+		// 裸名：归属按 precedence，explicit=false（可跨域回落）。
+		{"gpt-5.4", "global", "gpt-5.4", false},
+		// 冒号前段非 cn/global → 整体裸名，explicit=false（不得被误判成"用户强指定"而禁掉回落）。
+		{"gpt-5.4:latest", "global", "gpt-5.4:latest", false},
+	}
+	for _, c := range cases {
+		realm, bare, explicit := r.ResolveWithSource(c.model)
+		if realm != c.realm || bare != c.bare || explicit != c.explicit {
+			t.Errorf("ResolveWithSource(%q)=(%q,%q,%v) want (%q,%q,%v)",
+				c.model, realm, bare, explicit, c.realm, c.bare, c.explicit)
+		}
+		// Resolve 保持旧行为（两返回值），与 WithSource 的前两项一致（调用方零改动）。
+		realm2, bare2 := r.Resolve(c.model)
+		if realm2 != realm || bare2 != bare {
+			t.Errorf("Resolve(%q)=(%q,%q) 与 ResolveWithSource 不一致", c.model, realm2, bare2)
+		}
+	}
+}
+
 // TestRealmAvailableGating 域可用性只看归属，且 global 受逃生门约束。
 func TestRealmAvailableGating(t *testing.T) {
 	withGlobalEnabled(t)

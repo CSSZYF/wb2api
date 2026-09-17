@@ -40,10 +40,22 @@ type RealmRouter struct {
 // Resolve 解析模型名为 (realm, bareModel)。bare 用于选号/粘性/出站 body 重写
 // （前缀是网关侧路由协议，上游只认裸名）。
 func (r RealmRouter) Resolve(model string) (realm, bare string) {
+	realm, bare, _ = r.ResolveWithSource(model)
+	return realm, bare
+}
+
+// ResolveWithSource 同 Resolve，并额外报告 realm 是否来自显式前缀（用户强指定）。
+//
+// 显式性与跨域回落的关系（issue #199c）：显式 "cn:"/"global:" 前缀是客户端**写明**
+// 的意图，本域全不可用时也不跨域——换域可能违反用户意图（例如 CN 前缀是国际号受限
+// 时的显式规避，回落 global 等于把他送回去）；裸名归属只是网关的默认倾向
+// （realm_precedence），本域不可用时回落另一域是"尽量别 503"的合理默认。
+// 故 handler 据此对两种来源传不同的选号入口（硬过滤 vs 软优先）。
+func (r RealmRouter) ResolveWithSource(model string) (realm, bare string, explicit bool) {
 	if realm, bare, ok := splitRealmPrefix(model); ok {
-		return realm, bare
+		return realm, bare, true
 	}
-	return r.BareRealm(), model
+	return r.BareRealm(), model, false
 }
 
 // BareRealm 返回裸模型名的归属域。

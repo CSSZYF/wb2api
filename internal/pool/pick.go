@@ -13,37 +13,102 @@ import (
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
 // 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
 func (p *Pool) Pick() *auth.Auth {
-	return p.pick(nil, "", "")
+	return p.pick(nil, "", "", false)
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 // 挑选策略：healthy 账号中按权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried, "", "")
+	return p.pick(tried, "", "", false)
 }
 
 // PickExcludingForModel 模型感知选号：等同 PickExcluding，但对「6004 模型级冷却中的
 // 账号」进行模型豁免——请求模型与其 trigger 模型不同时视为可用（issue #31）。
 // reqModel 为空时即普通 PickExcluding（不影响既有调用语义）。
 func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *auth.Auth {
-	return p.pick(tried, reqModel, "")
+	return p.pick(tried, reqModel, "", false)
 }
 
 // PickExcludingForRealm 模型感知 + 分池选号：候选集先按 Realm()==realm 过滤
 // （realm 空 = 不过滤，退化为 PickExcludingForModel），再按模型健康口径判定。
 // 供 handler 在 global/cn 双域下分流（global 模型请求只路由 global 账号）。
+//
+// **硬过滤**（realm 谓词不可绕过）：本域无候选直接返回 nil，不跨域。目录拉取/面板
+// 按域查询必须用本入口——global 账号打 CN 的 /console 家族会吃 500 网关错误页
+// （「拉取模型 500」的历史根因），跨域回落会重新引入该类错配。chat 裸名路由用
+// PickExcludingForRealmFallback（软优先）。
 func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm string) *auth.Auth {
-	return p.pick(tried, reqModel, realm)
+	return p.pick(tried, reqModel, realm, false)
+}
+
+// PickExcludingForRealmFallback 模型感知 + realm **软优先**选号：先按 Realm()==realm
+// 过滤选，本域选不出账号时才去掉 realm 谓词、回落另一域再选一次——单次调用内回落
+// 至多一次，不在两域间反复横跳（不破坏 realm_precedence 语义与多域隔离）。
+//
+// "本域选不出"的判定顺序（详见 pick 的四段说明）：本域 healthy 候选为空即回落
+// 另一域 healthy 候选；本域只剩冷却号而另一域有健康号时也回落健号（探测冷却号是
+// 最后手段）；仅当两域都无 healthy 候选才走全冷却兜底，且兜底同样先本域、后另一域。
+//
+// 回落轮只放宽 realm 谓词，其余谓词（tried / healthy / healthyForModel / inFlightFull）
+// 逐一保持：更宽松的域不改变请求级轮换与租约语义，只是候选域从「本域」扩到「全池」。
+// 每轮回落仍受调用方 tried 约束，故请求整体尝试次数上限不变（MaxRotate 次）。
+//
+// 动机（issue #199c）：混合池（1 global + 1 cn、realm_precedence=global）下，裸模型名
+// 归属 global；若 global 号对该模型全部限流/不可用，旧实现轮转的每一轮都只在 global
+// 域里找候选 → 无候选 503，而 cn 号完全可用却从未被尝试（显式 cn: 前缀同一请求 200）。
+// handler 仅对**裸名归属**启用回落（显式 "cn:"/"global:" 前缀是用户强指定，不回落）。
+func (p *Pool) PickExcludingForRealmFallback(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pick(tried, reqModel, realm, true)
 }
 
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
-// realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
-func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+// realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）；realmFallback=true 时
+// 本域选不出任何账号才去掉该谓词回落另一域重选一次（跨域回落，成功时打一条
+// "pool: realm fallback" 日志供运维确认跨域发生）。
+//
+// 四段顺序（前一段有果即返回，不跨段跳级；跨域只放宽 realm 谓词，其余谓词逐一保持）：
+//  1. 本域 healthy 候选（含 healthyForModel）；
+//  2. [回落] 另一域 healthy 候选——必须排在全冷却兜底**之前**：本域只剩冷却号而
+//     另一域有健康号时，「优先本域」的合理边界止于 healthy，探测冷却号是最后手段；
+//  3. 本域全冷却兜底（既有语义：全池冷却时探测最早到期号而非 503）；
+//  4. [回落] 另一域全冷却兜底——本域连冷却号都没有时的最后手段（仍优于 503）。
+func (p *Pool) pick(tried map[string]bool, reqModel, realm string, realmFallback bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	if a := p.pickHealthyLocked(tried, now, reqModel, realm); a != nil {
+		return a
+	}
+	if realm != "" && realmFallback {
+		if a := p.pickHealthyLocked(tried, now, reqModel, ""); a != nil {
+			return p.logRealmFallbackLocked(realm, a, reqModel)
+		}
+	}
+	if a := p.pickEarliestExpiryLocked(tried, now, realm); a != nil {
+		return a
+	}
+	if realm != "" && realmFallback {
+		if a := p.pickEarliestExpiryLocked(tried, now, ""); a != nil {
+			return p.logRealmFallbackLocked(realm, a, reqModel)
+		}
+	}
+	return nil
+}
+
+// logRealmFallbackLocked 打一条跨域回落日志并返回该账号（运维据此确认跨域发生）。
+// 调用方必须已持 p.mu 写锁（在临界区内取 a.Realm()，与选号口径同一时刻快照）。
+func (p *Pool) logRealmFallbackLocked(realm string, a *auth.Auth, reqModel string) *auth.Auth {
+	log.Printf("pool: realm fallback %s -> %s (model=%s)", realm, a.Realm(), reqModel)
+	return a
+}
+
+// pickHealthyLocked 在 healthy 候选集中选号（realm 谓词为硬过滤）；无候选返回 nil，
+// 交由 pick 决定是否跨域回落或走全冷却兜底。调用方必须已持 p.mu 写锁：跨域回落要在
+// 同一临界区内做多次候选扫描，中间不得释放锁——否则两次扫描之间池状态变化会让
+// 「回落」判定与候选集不一致。
+func (p *Pool) pickHealthyLocked(tried map[string]bool, now time.Time, reqModel, realm string) *auth.Auth {
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
@@ -64,9 +129,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
-		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm)
+		// 本段无 healthy 候选：返回 nil 由 pick 决定跨域回落或全冷却兜底
+		// （不得在此处直接兜底，否则跨域回落会被"本域冷却号"抢先，本域全冷却而
+		// 另一域健康时仍打在注定失败的冷却号上）。
+		return nil
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
