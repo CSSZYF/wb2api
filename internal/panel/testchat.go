@@ -15,6 +15,7 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -129,7 +130,10 @@ func (p *Panel) accountTestChat(w http.ResponseWriter, r *http.Request) {
 			return prefix + "：" + err.Error()
 		}
 	}
-	if err != nil {
+	// 上游拒绝时 ChatStreamContext 返回分类信封 *upstream.Error（同时 status/respBody
+	// 都有效）——先摘信封再判 err，避免把"上游明确拒绝"误报成"传输层失败 status=0"。
+	var uerr *upstream.Error
+	if err != nil && !errors.As(err, &uerr) {
 		// 传输层失败/超时：上游没给出可判读的响应，status 记 0。
 		log.Printf("panel: test_chat uid=%s model=%s 失败(transport) %dms: %v",
 			req.UID, req.Model, elapsed(), err)
@@ -141,7 +145,14 @@ func (p *Panel) accountTestChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if status >= 400 {
 		// 上游明确拒绝（401/403/429/5xx…）：原文透出，便于区分"号不能用"与"模型不可用"。
+		// 分类信封存在时附上 Kind 与 Retry-After（诊断信息量：为什么被拒、何时恢复）。
 		msg := fmt.Sprintf("上游 HTTP %d：%s", status, truncateRunes(string(respBody), testChatErrorLimit))
+		if uerr != nil {
+			msg = fmt.Sprintf("上游 HTTP %d [%s]：%s", status, uerr.Kind, truncateRunes(string(respBody), testChatErrorLimit))
+			if uerr.RetryAfter > 0 {
+				msg += fmt.Sprintf("（上游建议等待 %s）", uerr.RetryAfter)
+			}
+		}
 		log.Printf("panel: test_chat uid=%s model=%s 失败(upstream) status=%d %dms",
 			req.UID, req.Model, status, elapsed())
 		fail(status, msg)
