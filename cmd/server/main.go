@@ -38,7 +38,7 @@ import (
 // 之所以用 var 而非 const：const 无法被 -ldflags -X 覆盖，版本号就得手改源码，
 // 于是很容易留下 `+dirty` / `+realmfix` 这类构建期后缀与源码里写死的字符串对不上。
 // 单一来源 = git tag，产物版本号永远可复现、无后缀。
-var appVersion = "v1.9.7"
+var appVersion = "v1.9.8"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
