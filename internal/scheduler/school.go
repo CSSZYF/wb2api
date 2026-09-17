@@ -7,6 +7,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -22,8 +23,14 @@ const (
 )
 
 // RunSchoolNow 对所有可用账号执行开学季活动闭环（幂等：不在期/已领静默跳过）。
-// 由 RunCheckinNow 末尾调用（活动是每日刷新，搭每日签到的车最自然）。
+// 由签到排程（runCheckin）末尾调用；也可面板手动触发。无 ctx 的外部入口，
+// 内部走 runSchool 取背景 ctx（语义与引入前 time.Sleep 版一致）。
 func (s *Scheduler) RunSchoolNow() {
+	s.runSchool(context.Background())
+}
+
+// runSchool 开学季遍历，随 ctx 取消立即退出（账号间限速与轮询等待改用 sleepCtx）。
+func (s *Scheduler) runSchool(ctx context.Context) {
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -35,15 +42,17 @@ func (s *Scheduler) RunSchoolNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		s.schoolAccount(a)
-		time.Sleep(activityAccountDelay)
+		s.schoolAccount(ctx, a)
+		if !sleepCtx(ctx, activityAccountDelay) {
+			return // 优雅停机：不等限速睡满，剩余账号下轮再跑
+		}
 	}
 }
 
 // RunSchoolAccountNow 单账号开学季闭环（面板任务中心逐账号执行用）：
 // 四任务独立处理 + 抽完抽奖次数，与每日排程同语义。
 func (s *Scheduler) RunSchoolAccountNow(a *auth.Auth) {
-	s.schoolAccount(a)
+	s.schoolAccount(context.Background(), a)
 }
 
 // schoolAccount 单账号闭环：四个任务独立处理（已领/不在期静默跳过），最后抽完次数。
@@ -53,7 +62,7 @@ func (s *Scheduler) RunSchoolAccountNow(a *auth.Auth) {
 //   - chat_3_times（每日 +50c+1抽）：viewed + 3 条 chat_request_send 埋点
 //     （conversationId 任意，无需真实会话）。
 //   - expert_use（每日 +50c+1抽）：viewed + mp 事件链（专家召唤 ×3 + 对话）。
-func (s *Scheduler) schoolAccount(a *auth.Auth) {
+func (s *Scheduler) schoolAccount(ctx context.Context, a *auth.Auth) {
 	tasks, inPeriod, err := s.cfg.Upstream.SchoolTasks(a)
 	if err != nil {
 		log.Printf("school %s: tasks: %v", a.UID, err)
@@ -63,10 +72,10 @@ func (s *Scheduler) schoolAccount(a *auth.Auth) {
 		return // 活动已结束，静默
 	}
 	_ = tasks
-	s.schoolShareTask(a)
-	s.schoolDesktopTask(a)
-	s.schoolChatTimesTask(a)
-	s.schoolExpertTask(a)
+	s.schoolShareTask(ctx, a)
+	s.schoolDesktopTask(ctx, a)
+	s.schoolChatTimesTask(ctx, a)
+	s.schoolExpertTask(ctx, a)
 	// 抽奖：把余额全抽完（含本次活动新领的次数）。
 	chances, err := s.cfg.Upstream.SchoolChances(a)
 	if err != nil {
@@ -79,12 +88,14 @@ func (s *Scheduler) schoolAccount(a *auth.Auth) {
 			return
 		}
 		log.Printf("school %s: 🎲 %s", a.UID, prize)
-		time.Sleep(2 * time.Second)
+		if !sleepCtx(ctx, 2*time.Second) {
+			return // 取消即放弃本号剩余抽奖
+		}
 	}
 }
 
 // schoolShareTask 完成 share_invite：share-complete 上报 → 轮询 → 领奖。
-func (s *Scheduler) schoolShareTask(a *auth.Auth) {
+func (s *Scheduler) schoolShareTask(ctx context.Context, a *auth.Auth) {
 	tasks, _, err := s.cfg.Upstream.SchoolTasks(a)
 	if err != nil {
 		return
@@ -97,7 +108,7 @@ func (s *Scheduler) schoolShareTask(a *auth.Auth) {
 		log.Printf("school %s: share-complete: %v", a.UID, err)
 		return
 	}
-	if !s.schoolPollDone(a, "share_invite") {
+	if !s.schoolPollDone(ctx, a, "share_invite") {
 		log.Printf("school %s: share-complete 上报后未点亮（明日重试）", a.UID)
 		return
 	}
@@ -110,9 +121,12 @@ func (s *Scheduler) schoolShareTask(a *auth.Auth) {
 }
 
 // schoolPollDone 轮询任务是否达标（异步计分，最多 schoolPollLoops 次）。
-func (s *Scheduler) schoolPollDone(a *auth.Auth, code string) bool {
+// ctx 取消立即返回 false（放弃本项轮询，下轮再试）。
+func (s *Scheduler) schoolPollDone(ctx context.Context, a *auth.Auth, code string) bool {
 	for i := 0; i < schoolPollLoops; i++ {
-		time.Sleep(schoolPollGap)
+		if !sleepCtx(ctx, schoolPollGap) {
+			return false
+		}
 		tasks2, _, err := s.cfg.Upstream.SchoolTasks(a)
 		if err != nil {
 			continue
@@ -125,7 +139,7 @@ func (s *Scheduler) schoolPollDone(a *auth.Auth, code string) bool {
 }
 
 // schoolChatTimesTask 完成 chat_3_times：viewed → 3 条埋点 → 轮询 → 领奖。
-func (s *Scheduler) schoolChatTimesTask(a *auth.Auth) {
+func (s *Scheduler) schoolChatTimesTask(ctx context.Context, a *auth.Auth) {
 	tasks, _, err := s.cfg.Upstream.SchoolTasks(a)
 	if err != nil {
 		return
@@ -145,9 +159,11 @@ func (s *Scheduler) schoolChatTimesTask(a *auth.Auth) {
 			log.Printf("school %s: chat events: %v", a.UID, err)
 			return
 		}
-		time.Sleep(2 * time.Second)
+		if !sleepCtx(ctx, 2*time.Second) {
+			return // 取消即放弃本项剩余埋点
+		}
 	}
-	if !s.schoolPollDone(a, "chat_3_times") {
+	if !s.schoolPollDone(ctx, a, "chat_3_times") {
 		log.Printf("school %s: chat_3_times 未点亮（明日重试）", a.UID)
 		return
 	}
@@ -161,7 +177,7 @@ func (s *Scheduler) schoolChatTimesTask(a *auth.Auth) {
 
 // schoolExpertTask 完成 expert_use：viewed → 专家事件链 → 轮询 → 领奖。
 // 开学季专家（16-BackToSchool 分类）：论文写作导师。
-func (s *Scheduler) schoolExpertTask(a *auth.Auth) {
+func (s *Scheduler) schoolExpertTask(ctx context.Context, a *auth.Auth) {
 	tasks, _, err := s.cfg.Upstream.SchoolTasks(a)
 	if err != nil {
 		return
@@ -182,7 +198,7 @@ func (s *Scheduler) schoolExpertTask(a *auth.Auth) {
 		log.Printf("school %s: expert events: %v", a.UID, err)
 		return
 	}
-	if !s.schoolPollDone(a, "expert_use") {
+	if !s.schoolPollDone(ctx, a, "expert_use") {
 		log.Printf("school %s: expert_use 未点亮（明日重试）", a.UID)
 		return
 	}
@@ -195,7 +211,7 @@ func (s *Scheduler) schoolExpertTask(a *auth.Auth) {
 }
 
 // schoolDesktopTask 完成 desktop_chat_1_time：viewed 激活 → 真实 chat → 六事件链。
-func (s *Scheduler) schoolDesktopTask(a *auth.Auth) {
+func (s *Scheduler) schoolDesktopTask(ctx context.Context, a *auth.Auth) {
 	tasks, _, err := s.cfg.Upstream.SchoolTasks(a)
 	if err != nil {
 		return
@@ -222,7 +238,9 @@ func (s *Scheduler) schoolDesktopTask(a *auth.Auth) {
 	}
 	// 异步计分轮询后领奖（失败不阻塞 share 主流程）。
 	for i := 0; i < schoolPollLoops; i++ {
-		time.Sleep(schoolPollGap)
+		if !sleepCtx(ctx, schoolPollGap) {
+			return // 取消即放弃本项轮询
+		}
 		tasks2, _, err := s.cfg.Upstream.SchoolTasks(a)
 		if err != nil {
 			continue

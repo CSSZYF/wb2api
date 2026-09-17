@@ -67,7 +67,27 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// runningMu 巡检重入锁：五类任务的公开入口（定时批量派发与面板手动触发）互斥，
+	// TryLock 失败即放弃本次触发并记一行日志——同一时刻两趟全量巡检并发会对上游
+	// 重复轰炸（hub 版 wb_scheduler 的 _run_lock 同语义：「已有巡检正在执行」）。
+	// 定时批量（runBatch）在整批期间持锁，批内各任务走不带锁的 run* 内部函数，
+	// 故同槽多类任务并行派发不会自锁（否则后派发者必被自己跳过）。
+	runningMu sync.Mutex
 }
+
+// beginRun 尝试占用巡检重入锁；返回 false 表示已有巡检在执行（调用方直接返回）。
+// name 仅用于日志定位触发来源（scheduler/checkin/travel/activity/keepalive/blackcat）。
+func (s *Scheduler) beginRun(name string) bool {
+	if !s.runningMu.TryLock() {
+		log.Printf("%s: 已有巡检在执行，跳过本次触发", name)
+		return false
+	}
+	return true
+}
+
+// endRun 释放巡检重入锁（与 beginRun 成对，defer 调用）。
+func (s *Scheduler) endRun() { s.runningMu.Unlock() }
 
 // New 构建。
 func New(cfg Config) *Scheduler {
@@ -211,6 +231,29 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	return earliest, kinds
 }
 
+// wakeupGraceDelay 迟到唤醒补跑的派发前网络宽限：Windows Modern Standby exit 后
+// 网络栈/DNS 1-2s 才恢复（issue #152 实测 dial tcp lookup no such host 与
+// Kernel-Power 507 standby exit ≤1s 重合），宽限 5s 覆盖 90%+ 唤醒场景。
+// 只对迟到补跑生效（准点触发零延迟），零配置（分析报告裁定全套配置不成比例）。
+// 测试可缩短（与 travelAccountDelay「测试可置 0」同口径）。
+var wakeupGraceDelay = 5 * time.Second
+
+// wakeupLateThreshold 迟到判定阈值：now 晚于槽位计划时刻超过 1s 才算迟到补跑。
+// 毫秒级抖动（timer 正常触发的偏移量级）不算，避免准点触发被误宽限。
+const wakeupLateThreshold = 1 * time.Second
+
+// awaitWakeupGrace 迟到唤醒补跑派发前的网络宽限：槽位时刻已过点超过阈值
+// （机器刚从睡眠唤醒）时先等满 wakeupGraceDelay 让网络栈/DNS 就绪再派发。
+// 准点/阈值内抖动零延迟直接放行。ctx 取消立即返回 false（优雅停机不等宽限睡满，
+// 本批放弃，下轮 nextWake 照旧从"现在"起算）。返回是否继续派发。
+func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
+	if late := time.Since(planned); late <= wakeupLateThreshold {
+		return ctx.Err() == nil // 准点触发：零延迟放行
+	}
+	log.Printf("wakeup grace %s: late catch-up for slot %s", wakeupGraceDelay, planned.Format("15:04"))
+	return sleepCtx(ctx, wakeupGraceDelay)
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
@@ -234,30 +277,76 @@ func (s *Scheduler) Run(ctx context.Context) {
 			timer.Stop() // 排程已变：重算下一次唤醒
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
-			for _, k := range kinds {
-				switch k {
-				case taskCheckin:
-					s.RunCheckinNow()
-				case taskTravel:
-					s.RunTravelNow()
-				case taskActivity:
-					s.RunActivityNow()
-				case taskKeepalive:
-					s.RunKeepaliveNow()
-				case taskBlackcat:
-					s.RunBlackcatNow()
-				}
+			// 迟到唤醒（睡眠跨过槽位时刻，timer 在唤醒瞬间才到期）先等网络宽限：
+			// 唤醒瞬间 DNS 未就绪，零宽限派发等于把唯一一次补跑机会打在注定失败
+			// 的窗口里（issue #152）；准点触发零延迟不受影响。
+			if !awaitWakeupGrace(ctx, next) {
+				return // ctx 取消：放弃本批，优雅退出
 			}
+			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
+			// 54 号 × 5 条 ≈ 7-8 分钟睡眠）不再阻塞同槽其他任务族；返回前
+			// 等全部任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠
+			// 的风险与串行版相同——nextWake 只挑现在之后的时点）。
+			s.runBatch(ctx, kinds)
 		}
 	}
 }
 
-// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
+// runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+// 供 Run 主循环与测试使用；ctx 取消时由各任务内部的 sleepCtx 快速收尾。
+// 整批期间持巡检重入锁（beginRun）：批内各任务走不带锁的 run* 内部函数，
+// 同槽多类任务并行不会自锁；批外的手动触发（面板/测试）撞上即跳过。
+func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+	if !s.beginRun("scheduler") {
+		return
+	}
+	defer s.endRun()
+	var wg sync.WaitGroup
+	for _, k := range kinds {
+		wg.Add(1)
+		go func(k taskKind) {
+			defer wg.Done()
+			s.dispatch(ctx, k)
+		}(k)
+	}
+	wg.Wait()
+}
+
+// dispatch 按任务类型分发到对应执行函数。脚本类（school/cat）失败只记 WARN、
+// 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
+// ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号），纯脚本类任务不感知。
+func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
+	switch k {
+	case taskCheckin:
+		s.runCheckin(ctx)
+	case taskTravel:
+		s.runTravel(ctx)
+	case taskActivity:
+		s.runActivity(ctx)
+	case taskKeepalive:
+		s.runKeepalive(ctx)
+	case taskBlackcat:
+		s.runBlackcat(ctx)
+	}
+}
+
+// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻（无 ctx 的外部入口：
+// 面板手动触发、测试）。内部走 runCheckin，取背景 ctx。
+// 重入保护：已有巡检在执行时直接跳过（返回前不阻塞调用方）。
+func (s *Scheduler) RunCheckinNow() {
+	if !s.beginRun("checkin") {
+		return
+	}
+	defer s.endRun()
+	s.runCheckin(context.Background())
+}
+
+// runCheckin 签到遍历 + 连登管家 + 开学季，随 ctx 取消立即退出。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
-func (s *Scheduler) RunCheckinNow() {
+func (s *Scheduler) runCheckin(ctx context.Context) {
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -294,15 +383,26 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 	}
 	s.RunStreakBonusNow()
-	s.RunSchoolNow() // 开学季活动（活动期 9/13-9/24，结束自动跳过）
+	s.runSchool(ctx) // 开学季活动（活动期 9/13-9/24，结束自动跳过）
 }
 
-// RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
+// RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报（无 ctx 的外部入口：
+// 面板手动触发、测试）。内部走 runActivity，取背景 ctx（不可取消，语义与引入前
+// time.Sleep 版一致）。重入保护：已有巡检在执行时直接跳过。
+func (s *Scheduler) RunActivityNow() {
+	if !s.beginRun("activity") {
+		return
+	}
+	defer s.endRun()
+	s.runActivity(context.Background())
+}
+
+// runActivity 活跃上报遍历，随 ctx 取消立即退出。
 // 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
 // 一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务。
 // 上报成功后续跑 streak 自检（checkActivityStreak）：回读连登天数，发现
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
-func (s *Scheduler) RunActivityNow() {
+func (s *Scheduler) runActivity(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
@@ -316,7 +416,9 @@ func (s *Scheduler) RunActivityNow() {
 			continue // D4 门控：global 无任务中心/活跃体系，不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(activityAccountDelay)
+			if !sleepCtx(ctx, activityAccountDelay) {
+				return // 优雅停机：不等限速睡满，剩余账号下轮再报
+			}
 		}
 		first = false
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
@@ -349,12 +451,27 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	return false
 }
 
-// RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
+// RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用（无 ctx 的
+// 外部入口：面板手动触发、测试）。内部走 runKeepalive，取背景 ctx。
+// 重入保护：已有巡检在执行时直接跳过。
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	if !s.beginRun("keepalive") {
+		return
+	}
+	defer s.endRun()
+	s.runKeepalive(context.Background())
+}
+
+// runKeepalive token 保活遍历。账号间无 sleep（不参与 sleepCtx 可取消化），
+// ctx 取消时在账号边界收尾：剩余账号下轮再刷，避免停机时继续打上游。
+func (s *Scheduler) runKeepalive(ctx context.Context) {
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			continue
 		}

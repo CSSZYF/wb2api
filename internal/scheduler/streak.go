@@ -16,7 +16,9 @@ import (
 )
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
-// 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
+// 由签到排程（runCheckin）末尾调用；也可面板手动触发。
+// 本函数无 sleep（不参与 sleepCtx 可取消化），故不接 ctx：停机时让它跑完，
+// 与签到同口径（兑换/抽奖按天幂等，跑完不亏）。
 func (s *Scheduler) RunStreakBonusNow() {
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
