@@ -8,7 +8,7 @@
 #   docker build --build-arg VERSION=1.9.2-panel -t wb2api:1.9.2-panel .
 # 本机无 docker 时由 .github/workflows/docker.yml 在 CI 里构建并推 GHCR。
 
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
