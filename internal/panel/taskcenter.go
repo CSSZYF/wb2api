@@ -363,7 +363,8 @@ func (p *Panel) queueSet(q *queueState, uid string, fn func(*queueItem)) {
 	}
 }
 
-// acceptPendingTasks 批量接受该账号未接受的任务，返回接受的个数（失败返回 0 不阻塞）。
+// acceptPendingTasks 批量接受该账号未接受的任务，返回**确认登记**的个数（失败返回 0 不阻塞）。
+// 走 acceptVerified：上游可能 200+OK 但未落账，验证通过才计数。
 func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
@@ -378,12 +379,12 @@ func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
 	if len(codes) == 0 {
 		return 0
 	}
-	if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
-		log.Printf("panel: 队列 accept uid=%s: %v（不阻塞）", a.UID, err)
-		return 0
+	accepted, failed := p.acceptVerified(a, codes)
+	if len(failed) > 0 {
+		log.Printf("panel: 队列 accept uid=%s 未登记 %d 个（不阻塞）: %v", a.UID, len(failed), failed)
 	}
-	log.Printf("panel: 队列 accept uid=%s: 已接受 %d 个任务", a.UID, len(codes))
-	return len(codes)
+	log.Printf("panel: 队列 accept uid=%s: 已接受 %d 个任务", a.UID, len(accepted))
+	return len(accepted)
 }
 
 // runGrowthQueued 执行单个成长任务（动作 + 回读 + 自动领奖；与
@@ -528,4 +529,55 @@ func (p *Panel) schoolRunAll(w http.ResponseWriter, r *http.Request) {
 	go p.cfg.Scheduler.RunSchoolNow()
 	log.Printf("panel: 开学季全账号闭环已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
+// 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
+func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
+	accts := p.cfg.Pool.List()
+	type row struct {
+		UID      string                   `json:"uid"`
+		Nickname string                   `json:"nickname"`
+		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
+		Err      string                   `json:"error,omitempty"`
+	}
+	out := make([]row, len(accts))
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	for i, st := range accts {
+		if st.Disabled {
+			continue // 未占位，行末统一压掉
+		}
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, a *auth.Auth) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			it := row{UID: a.UID, Nickname: a.Nickname}
+			switch {
+			case a.IsGlobal():
+				it.Err = "global realm（无开学季活动）"
+			default:
+				vs, err := p.cfg.Upstream.SchoolVouchers(a)
+				if err != nil {
+					it.Err = err.Error()
+				} else {
+					it.Vouchers = vs
+				}
+			}
+			out[i] = it
+		}(i, a)
+	}
+	wg.Wait()
+	res := make([]row, 0, len(out))
+	for _, it := range out {
+		if it.UID != "" {
+			res = append(res, it)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": res})
 }

@@ -56,3 +56,61 @@ func TestIndexHTMLNoInlineScript(t *testing.T) {
 		rest = rest[end:]
 	}
 }
+
+// TestFrontendVoucherModalWiring 券码弹窗的四处接线必须同时存在：
+//
+//	index.html：vcVeil 弹窗骨架（vcBody/vcNote/btnVcClose/btnVcRefresh）+ .vc-* 样式
+//	            + 开学季区块的「查询券码」按钮
+//	app.js：copyText（clipboard→execCommand 降级）、vcCard 渲染、loadSchoolVouchers、
+//	        四个 DOM 绑定
+//
+// 为什么需要：app.js/index.html 是 go:embed 的静态资源，Go 编译器与 Go 测试都不
+// 校验其内容——少一个 id 或一个绑定，点击按钮就是无反应的静默失败（页面不白屏，
+// 测试也全绿）。此用例把"接线完整性"前移。
+func TestFrontendVoucherModalWiring(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	html := rec.Body.String()
+
+	for _, want := range []string{
+		`id="vcVeil"`, `id="vcBody"`, `id="vcNote"`,
+		`id="btnVcClose"`, `id="btnVcRefresh"`, `id="btnSchoolVouchers"`,
+		`.vc-acct {`, `.vc .ft code {`, `.vc.expired {`, // 票券式卡片样式
+		`class="hint">官方返回的最大输出仅为参考`, // 模型能力标题 hint
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("index.html 缺少 %s（券码弹窗/标题 hint 接线不完整）", want)
+		}
+	}
+
+	rec = httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/app.js", nil))
+	js := rec.Body.String()
+	for _, want := range []string{
+		"function copyText(", "execCommand('copy')", // 远程 http 面板降级路径
+		"function vcCard(", "async function loadSchoolVouchers(",
+		"$('btnSchoolVouchers').onclick", "$('btnVcClose').onclick", "$('btnVcRefresh').onclick",
+		"qrMatrix(", "qrSVG(", "button[data-qr]", // 二维码（内嵌编码器，无外链依赖）
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js 缺少 %s（券码查询接线不完整）", want)
+		}
+	}
+}
+
+// TestFrontendVoucherModalNoExternalRefs 券码弹窗不得引入外部资源：
+// CSP 只允许 self（script-src 'self' / connect-src 'self' / img-src 'self' data:），
+// 任何外链 QR 服务或 CDN 都会被浏览器拦掉（且面板是离线单文件部署）。
+func TestFrontendVoucherModalNoExternalRefs(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/app.js", nil))
+	js := rec.Body.String()
+
+	for _, bad := range []string{"api.qrserver", "chart.googleapis", "cdn.jsdelivr", "unpkg.com", "https://cdn"} {
+		if strings.Contains(js, bad) {
+			t.Errorf("app.js 引用了外部资源 %q（CSP script-src 'self' 会拦截）", bad)
+		}
+	}
+}
