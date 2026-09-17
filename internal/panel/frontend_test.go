@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
 // TestAppJSSyntax app.js 必须能通过 JS 解析器语法校验。
@@ -58,6 +63,148 @@ func TestAppJSTestChatWiring(t *testing.T) {
 	pn.ServeHTTP(rec, req)
 	if rec.Code == http.StatusNotFound {
 		t.Error("panel.go 未注册 POST /panel/api/account/test_chat")
+	}
+}
+
+// TestAppJSAccountsModelLimitWiring 账号表必须展示模型级冷却台账（issue #199d）：
+// 6004 模型级限流 / 11102 该后端无此模型时，账号本身仍算「可用」并能服务其他模型，
+// 于是面板状态列显示「可用」而该模型请求 503——用户只能翻日志才知道是谁被限。
+// app.js 的 renderAccounts 必须引用 rate_limited_models，且渲染函数与状态列的接线齐全。
+//
+// 为什么需要：app.js 是 go:embed 的静态资源，Go 编译器不检查其内容——删掉一行插值，
+// 面板就回到「完全看不出谁被模型级冷却」，而所有 Go 测试仍会全绿（同 TestAppJSSyntax）。
+func TestAppJSAccountsModelLimitWiring(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	for _, must := range []string{
+		"rate_limited_models", // 后端字段被引用（此前 0 命中 = 问题根因）
+		"function modelLimitTag(",
+		"function modelResetText(",
+		"modelLimitTag(s.rate_limited_models", // 状态列插入点
+		"reset_at", "until",                   // 恢复时刻双来源（reset_at 优先，零值退回 until）
+		"11102", // reason 前缀区分「该后端无此模型」与 6004 限流
+	} {
+		if !strings.Contains(s, must) {
+			t.Errorf("app.js 缺少模型级冷却接线：%s", must)
+		}
+	}
+	// reset_at 的 Go 零值仍是 "0001-01-01T00:00:00Z"（time.Time 是结构体，omitempty
+	// 不生效），JS 必须按前缀判零，否则界面上会出现「0001-01-01 恢复」这类垃圾时刻。
+	// 断言收在 modelResetText 函数体内——ago() 早有同样的 "0001-" 判零，全文件搜索
+	// 无法区分，删掉本函数里的判零也会照样通过。
+	body := jsFuncBody(s, "function modelResetText(")
+	if body == "" {
+		t.Fatal("app.js 缺少函数 modelResetText")
+	}
+	if !strings.Contains(body, "0001-") {
+		t.Error(`modelResetText 未处理 time.Time 零值 reset_at（应含 "0001-" 前缀判零，同 ago()）`)
+	}
+	if !strings.Contains(body, "reset_at") || !strings.Contains(body, "until") {
+		t.Error("modelResetText 未同时读 reset_at 与 until（零值回退链）")
+	}
+}
+
+// jsFuncBody 返回 src 中名为 sig（形如 "function foo("）的函数体文本，用于把源码断言
+// 收窄到单个函数——否则全文件搜索会被别处的同名片段放行。朴素花括号配对（本仓 app.js
+// 无模板字符串嵌套花括号的写法，够用）；找不到函数名返回空串。
+func jsFuncBody(src, sig string) string {
+	i := strings.Index(src, sig)
+	if i < 0 {
+		return ""
+	}
+	j := strings.Index(src[i:], "{")
+	if j < 0 {
+		return ""
+	}
+	depth, start := 0, i+j
+	for k := start; k < len(src); k++ {
+		switch src[k] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[start : k+1]
+			}
+		}
+	}
+	return ""
+}
+
+// TestPanelOverviewExposesModelLimitLedger 面板 overview 必须把模型级冷却台账透出给前端
+// （app.js 读的就是这些键）：6004 条目带 reset_at（上游权威恢复墙钟），11102 条目
+// reset_at 为零值而 until 为退避 TTL——前端正是据此退回 until 显示恢复时间。
+// 无模型级冷却的账号不得出现该字段（零回归：不凭空多出标签）。
+func TestPanelOverviewExposesModelLimitLedger(t *testing.T) {
+	type ledgerRow struct {
+		Model   string `json:"model"`
+		Until   string `json:"until"`
+		ResetAt string `json:"reset_at"`
+		Reason  string `json:"reason"`
+	}
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", ExpiresAt: 9999999999})
+	resetAt := time.Now().Add(30 * time.Minute).Truncate(time.Second)
+	p.CooldownSoftForModel("u1", time.Minute, resetAt, "glm-5.3", "6004 model rate limit")
+	p.BlockModelBackoff("u1", "hy3-preview", "11102 model not available") // ResetAt 零值
+
+	pn := New(Config{Version: "test", APIKey: "test-key", Pool: p})
+	req := httptest.NewRequest("GET", "/panel/api/overview", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	pn.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var got struct {
+		Accounts []struct {
+			UID               string      `json:"uid"`
+			RateLimitedModels []ledgerRow `json:"rate_limited_models"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("overview JSON 解析失败：%v", err)
+	}
+	byUID := map[string][]ledgerRow{}
+	for _, a := range got.Accounts {
+		byUID[a.UID] = a.RateLimitedModels
+	}
+	// u2 无模型级冷却 → 字段缺席（omitempty）；u1 有两条（6004 + 11102）。
+	if len(byUID["u2"]) != 0 {
+		t.Errorf("无模型级冷却的账号不应带台账：%+v", byUID["u2"])
+	}
+	if len(byUID["u1"]) != 2 {
+		t.Fatalf("u1 台账=%+v want 2 行（6004 + 11102）", byUID["u1"])
+	}
+	rows := map[string]ledgerRow{}
+	for _, r := range byUID["u1"] {
+		rows[r.Model] = r
+		if r.Until == "" || strings.HasPrefix(r.Until, "0001-") {
+			t.Errorf("%s: until 必须可用（前端零值判据）：%+v", r.Model, r)
+		}
+	}
+	// 6004：reset_at 是上游权威恢复时刻（未被 soft_rate_max 截断），前端优先用它。
+	if r, ok := rows["glm-5.3"]; !ok {
+		t.Error("台账缺 6004 条目 glm-5.3")
+	} else if r.ResetAt == "" || strings.HasPrefix(r.ResetAt, "0001-") {
+		t.Errorf("6004 条目应带 reset_at 权威恢复时刻：%+v", r)
+	}
+	// 11102：无重置文案 → reset_at 零值（Go 会序列化成 "0001-01-01T00:00:00Z"，
+	// omitempty 对 time.Time 结构体不生效），前端须退回 until；reason 前缀可判别。
+	if r, ok := rows["hy3-preview"]; !ok {
+		t.Error("台账缺 11102 条目 hy3-preview")
+	} else {
+		if !strings.HasPrefix(r.ResetAt, "0001-") {
+			t.Errorf("11102 条目 reset_at 应为零值（前端靠它走 until 回退）：%+v", r)
+		}
+		if !strings.HasPrefix(r.Reason, "11102") {
+			t.Errorf("11102 条目 reason 前缀应可判别：%+v", r)
+		}
 	}
 }
 
