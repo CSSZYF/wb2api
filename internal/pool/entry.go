@@ -144,7 +144,9 @@ type entry struct {
 	// 只在 CooldownSoftRate / CooldownSoftForModel（无解析时间分支）**进入一次新冷却**
 	// 时递增——冷却中的兜底探测不推进（旧实现每次探测都翻倍，是"全池被推到 2h 封顶"
 	// 的元凶）。有上游权威重置时间时绝不计数（对齐墙钟即最终时长，无退避）。
-	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
+	// 重置点只有三处（都是账号被证明恢复的时刻）：NoteSuccess、人工 Revive、
+	// 以及硬冷却解冻（ReenableIfCredits 对 CoolHard 放行——硬冷却不参与 streak，
+	// 此处清的只是历史软冷却累积；软冷却账号不再被余额刷新/签到解冻，见 issue #199）。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
 	// modelCooldowns 6004 模型级 limit 的**独立**冷却表：model → 该模型的冷却截止/重置。
@@ -160,6 +162,25 @@ type entry struct {
 	sessionDeadFails int
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+}
+
+// hardCooldownSet 报告账号身上是否有「硬冷却被施加过且尚未被清理」的痕迹
+// （coolKind==CoolHard 且 until 非零）。
+//
+// 为什么不能只判 coolKind == CoolHard：CoolHard 是 CoolKind 的**零值**，未设过
+// coolKind 的账号天然等于 CoolHard。典型反例是仅 6004 模型级冷却的号——
+// CooldownSoftForModel 有解析时间分支只写 modelCooldowns、不写 coolKind/until，
+// 于是它看起来「coolKind==CoolHard」。若只按零值判定，余额刷新会把这类账号误当
+// 硬冷却「解冻」，连带 clearCoolingLocked 清掉 modelCooldowns，模型级豁免被刷新
+// 抹掉（issue #31 语义回归）。叠加 until 非零后，判定精确等于「确有硬冷却被
+// Cooldown/CooldownUntilTomorrow4AM 施加过」：软冷却（CoolSoft）与模型级冷却
+// （until 为零）都被排除。
+//
+// 不要求 until 尚未到期：自然到期后的硬冷却残留（coolKind=CoolHard + 已过期的
+// until + 残留 reason）本就该被余额刷新清理（余额恢复是硬冷却的恢复条件），
+// 放宽到「已施加过」可保持 CoolHard 路径与收窄前的既有行为完全一致。
+func (e *entry) hardCooldownSet() bool {
+	return e.coolKind == CoolHard && !e.until.IsZero()
 }
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。

@@ -787,6 +787,57 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	}
 }
 
+// TestChat6004EnglishResetCoolsToParsedTime 端到端回归 issue #199（Bug A）：国际版上游
+// 返回**英文** 429/6004 文案（`your usage will reset at <时间> UTC+8, alternatively…`）
+// 时，必须与中文形态同口径——冷却 until 精确等于解析墙钟（而非退回 600s 基数退避），
+// 且走模型级豁免（同模型仍冷却、切模型可选）。
+// 修复前：纯中文正则 MatchString=false → ParseRateReset 失败 → 落「无重置时间」分支
+// （账号级退避 + 模型豁免丢失），选号会重新选中同模型再次撞 429。
+func TestChat6004EnglishResetCoolsToParsedTime(t *testing.T) {
+	reset := time.Now().Add(5 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			// 上游英文原文形态（含 " UTC+8," 逗号与 alternatively 说明）。
+			return 429, `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at ` +
+				ts + ` UTC+8, alternatively, you can switch to the other models to continue using it.","requestId":"req-1"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+	// 英文文案同样走模型级独立冷却（不写账号级 until）。
+	st, _ := p.Status("bad")
+	if st.Cooling {
+		t.Fatalf("英文 6004 带重置时间不应设账号级冷却（应走模型级豁免）: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("want single model ledger row glm-5.3: %+v", st.RateLimitedModels)
+	}
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v (diff %v)——英文文案未被解析为重置墙钟", st.RateLimitedModels[0].Until, reset, d)
+	}
+	// 模型豁免：同模型仍冷却、切模型可选（与中文形态行为一致）。
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	if same := p.PickExcludingForModel(nil, "glm-5.3"); same == nil || same.UID != "good" {
+		t.Fatalf("same-model pick should skip bad (still cooling), got %+v", same)
+	}
+	if diff := p.PickExcludingForModel(nil, "hy3-x"); diff == nil || diff.UID != "bad" {
+		t.Fatalf("different-model pick should bypass bad soft cooling, got %+v", diff)
+	}
+}
+
 // TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
 // （现状不变）。
 func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {

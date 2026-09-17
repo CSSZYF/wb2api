@@ -142,6 +142,9 @@ func TestIsModelRateLimit(t *testing.T) {
 		// 其他 code（非模型级限流）→ 不算。
 		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
 		{`{"code":1,"msg":"429 rate limit"}`, false},
+		// 国际版英文 body：code 仍是数字 6004，判定与文案语言无关（不得因改英文漏判，
+		// 漏判会把模型级限流按账号级冷却，切模型也无法豁免）。
+		{`{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at 2026-09-18 09:31:32 UTC+8, alternatively, you can switch to the other models to continue using it.","requestId":"abc"}`, true},
 	}
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
@@ -151,8 +154,11 @@ func TestIsModelRateLimit(t *testing.T) {
 }
 
 // TestParseRateReset 统一解析任意限流响应（6004 **和** 非 6004，如 11140 rate-limiting）
-// msg 里的「将在 … 重置」时间（UTC+8）。旧语义（非 6004 带时间 → false）是有意推翻的：
+// msg 里的重置时间（UTC+8）。旧语义（非 6004 带时间 → false）是有意推翻的：
 // 11140 的 rate-limiting 变体带重置时间时同样应被精确对齐到上游重置墙钟。
+//
+// 双形态（CN 中文 / 国际版英文）都要能解析：英文文案漏解析 → 6004 走「无重置时间」
+// 退避分支（600s 基数 + 账号级冷却），模型级豁免丢失、冷却时长也不对齐上游。
 func TestParseRateReset(t *testing.T) {
 	future := time.Now().Add(35 * time.Minute)
 	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
@@ -167,6 +173,13 @@ func TestParseRateReset(t *testing.T) {
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
+		// 国际版英文形态（上游实测原文）：时间后有 " UTC+8," 逗号 + alternatively 说明文本。
+		{"英文形态 带 UTC+8 后缀与尾随逗号", `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at ` + ts + ` UTC+8, alternatively, you can switch to the other models to continue using it.","requestId":"x"}`, true},
+		// 英文形态无 UTC+8 后缀（时间后直接逗号或句号结尾）。
+		{"英文形态 无 UTC+8 后缀(逗号分隔)", `{"code":6004,"msg":"your usage will reset at ` + ts + `, please wait."}`, true},
+		{"英文形态 无 UTC+8 后缀(句号结尾)", `{"code":6004,"msg":"your usage will reset at ` + ts + `."}`, true},
+		// 非法英文：正则命中但时间串不可解析 → false（绝不臆造时间，退回有界退避）。
+		{"英文形态 非法时间", `{"code":6004,"msg":"your usage will reset at tomorrow"}`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -187,6 +200,28 @@ func TestParseRateReset(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestParseRateResetEnglishRealBody 回归真实英文 body（一字不改的上游原文）：
+// 修复前纯中文正则 MatchString=false → 6004 落到「无重置时间」退避分支（600s 基数
+// + 账号级冷却），模型级豁免丢失。这里锁定：解析出的墙钟精确等于文案中的时间
+// （2026-09-18 09:31:32 UTC+8），且 IsModelRateLimit 同时命中（走模型级冷却）。
+func TestParseRateResetEnglishRealBody(t *testing.T) {
+	body := `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at 2026-09-18 09:31:32 UTC+8, alternatively, you can switch to the other models to continue using it.","requestId":"req-1"}`
+	got, ok := ParseRateReset(body)
+	if !ok {
+		t.Fatalf("英文文案必须解析出重置时间（修复前纯中文正则漏判）: body=%s", body)
+	}
+	want := time.Date(2026, 9, 18, 9, 31, 32, 0, softRateResetLoc)
+	if !got.Equal(want) {
+		t.Errorf("parsed=%v want %v", got, want)
+	}
+	if _, off := got.Zone(); off != 8*60*60 {
+		t.Errorf("zone offset=%d want +08:00（固定 UTC+8，与容器时区无关）", off)
+	}
+	if !IsModelRateLimit(body) {
+		t.Error("英文 body 的 code 6004 必须命中 IsModelRateLimit（否则走账号级冷却）")
 	}
 }
 

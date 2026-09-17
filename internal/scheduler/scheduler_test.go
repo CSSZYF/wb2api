@@ -378,7 +378,8 @@ func TestCheckinErrorDoesNotCrash(t *testing.T) {
 }
 
 // TestRunBalanceRefreshNowUpdatesCreditsAndRevives 只查余额（不签到）即可更新 credits
-// 并解冻余额恢复的冷却账号——面板手动刷新与后台周期任务共用该语义。
+// 并解冻余额恢复的**硬冷却**账号——面板手动刷新与后台周期任务（StartBalanceRefresh，
+// 默认每 5 分钟）共用该语义。issue #199 收窄后仅 CoolHard 走解冻路径（见下一条用例）。
 func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	f := &fakeUpstream{resourceRemain: 777}
 	srv := f.server()
@@ -404,5 +405,54 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	// 禁用账号不参与：其 credits 保持 0（未被 UserResource 覆盖解冻）。
 	if st2, _ := p.Status("u2"); !st2.Disabled {
 		t.Errorf("u2 must stay disabled")
+	}
+}
+
+// TestRunBalanceRefreshNowKeepsSoftCooling issue #199 回归：余额刷新**不得**解冻软冷却
+// 账号。本用例覆盖后台 5 分钟周期路径（StartBalanceRefresh → RunBalanceRefreshNow）
+// 与面板「刷新」按钮（balanceAll → 同一函数）共用的语义：旧实现 remain > 0 无条件
+// 解冻 → 全池软冷却/6004 账号每 5 分钟被自动解冻 → 选号重新选中 → 又撞 429 循环。
+// 收窄后 credits 照常更新（观测量新鲜），冷却状态原样保留。
+func TestRunBalanceRefreshNowKeepsSoftCooling(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 888}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "soft", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "model", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	// 账号级软冷却（429 无重置时间 → 有界退避）。
+	p.CooldownSoftRate("soft", time.Hour, time.Time{}, "429 rate limit")
+	// 仅 6004 模型级冷却（coolKind 未设 = 零值 CoolHard，正是零值陷阱的回归点）。
+	p.CooldownSoftForModel("model", time.Minute, time.Now().Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+	s.RunBalanceRefreshNow()
+
+	stSoft, _ := p.Status("soft")
+	if stSoft.Credits != 888 {
+		t.Errorf("soft credits=%d want 888（余额照常更新）", stSoft.Credits)
+	}
+	if !stSoft.Cooling || stSoft.CoolKind != "soft_rate" {
+		t.Errorf("软冷却不得被余额刷新解冻（issue #199）: %+v", stSoft)
+	}
+	stModel, _ := p.Status("model")
+	if stModel.Credits != 888 {
+		t.Errorf("model credits=%d want 888（余额照常更新）", stModel.Credits)
+	}
+	if len(stModel.RateLimitedModels) != 1 || stModel.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Errorf("6004 模型级冷却台账应保留: %+v", stModel.RateLimitedModels)
+	}
+	if stModel.Cooling {
+		t.Errorf("模型级冷却不写账号级 until，不应 Cooling: %+v", stModel)
+	}
+	// 模型豁免仍生效：同模型不可用、切模型可用（用 AvailableUIDsForModel 直接断言
+	// 健康口径，避免受全冷却兜底选号影响）。
+	if got := p.AvailableUIDsForModel("glm-5.3"); len(got) != 0 {
+		t.Errorf("同模型可用集应排除仍被 6004 冷却的 model 号，got %v", got)
+	}
+	if got := p.AvailableUIDsForModel("hy3-x"); len(got) != 1 || got[0] != "model" {
+		t.Errorf("切模型应豁免选中 model 号，got %v", got)
 	}
 }

@@ -848,7 +848,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 携带的模型名（触发 6004 时记录以便后续切模型豁免）。
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
-// 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
+// 成功（NoteSuccess）清 fails/熔断；余额恢复解冻（ReenableIfCredits→reviveCoolingLocked）
+// 仅对硬冷却放行（issue #199 收窄：软冷却/模型级冷却不被余额刷新/签到解冻），且只清冷却、不动熔断。
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string) {
 	switch kind {
 	case upstream.ErrHardCredit:

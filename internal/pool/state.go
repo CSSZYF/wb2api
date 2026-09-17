@@ -92,17 +92,31 @@ func (p *Pool) Revive(uid string) bool {
 	return true
 }
 
-// reviveCoolingLocked 只清冷却（until/coolKind/reason/softStreak）并更新 credits，不动熔断器
-// （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
-// billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
-// softStreak 属**冷却域**（与 until/coolKind 同域），故随冷却一并清零——与"解冻只清冷却
-// 不清熔断"的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是历史软冷却累积。
-// 调用方必须已持有 p.mu。
+// ReenableIfCredits 余额刷新/签到后的**条件解冻**：仅当 remain > 0、账号非禁用且
+// 当前处于**有效硬冷却**（CoolHard：余额耗尽，等签到/次日 04:00 恢复）时清冷却域并
+// 更新 credits；其余情形只更新 credits/creditsTotal，**不动任何冷却状态**。
+//
+// 收窄原因（issue #199）：旧实现 remain > 0 即无条件 reviveCoolingLocked，导致软限流
+// （CoolSoft 429 / 6004 模型级）中的账号被余额刷新、签到一并解冻 → 选号重新选中 →
+// 又撞 429 的循环。影响面尤其大的是**后台余额刷新周期任务**（默认每 5 分钟一次，
+// 与面板"刷新"按钮共用 RunBalanceRefreshNow）：旧实现等于全池软冷却账号每 5 分钟被
+// 自动解冻一次。软冷却的恢复时刻由上游权威重置墙钟或有界退避决定，余额恢复
+// **不能证明**限流已解除；硬冷却的恢复条件恰是「余额恢复」（签到到账），这才是
+// 自动解冻的正当理由。
+//
+// 判定用 hardCooldownSet（coolKind==CoolHard **且** until 非零）：CoolHard 是 CoolKind
+// 零值，只看零值会把「仅 6004 模型级冷却」的账号（coolKind 未设、until 为零）误判为
+// 硬冷却，连带清掉其 modelCooldowns。
+//
+// 人工解冻不受本收窄影响：面板「解冻」按钮走 Revive（无条件恢复，清禁用/冷却域/
+// 熔断运行态），是唯一能人工清软冷却的入口。
+// 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
+// reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。
 func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		if remain > 0 && !e.disabled {
+		if remain > 0 && !e.disabled && e.hardCooldownSet() {
 			p.reviveCoolingLocked(e, remain, total)
 		} else {
 			e.credits = remain

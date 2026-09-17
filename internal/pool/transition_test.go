@@ -128,36 +128,81 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 	}
 }
 
-// TestTransitionReviveClearsCoolingKeepsBreaker reviveCoolingLocked（签到解冻）语义：
-// 清冷却域（until/coolKind/reason/softStreak/modelCooldowns）+ 更新 credits，不动熔断。
-// 既有单维度测试已各自锁定 reason/softStreak/modelCooldowns，本用例一次性断言完整
-// 字段集，锁定迁移原语对冷却域/熔断域的处置永远一致。
-func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
+// TestTransitionReviveClearsCoolingAndBreaker 人工强制解冻（Revive）语义：
+// 清冷却域（until/coolKind/reason/softStreak/modelCooldowns）+ 清熔断运行态（运维口径
+// 无条件恢复）。既有单维度测试已各自锁定 reason/softStreak/modelCooldowns，本用例
+// 一次性断言完整字段集，锁定迁移原语对冷却域/熔断域的处置永远一致。
+//
+// 注意与 ReenableIfCredits 的区别（issue #199 收窄）：后者是余额刷新/签到的自动解冻，
+// 只对有效硬冷却放行、且不动熔断；本用例锁定的是人工「解冻」按钮走的 Revive。
+func TestTransitionReviveClearsCoolingAndBreaker(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	// 冷却域：软冷却 + 6004 模型级冷却（softStreak 累计）。
 	p.Cooldown("u1", CoolSoft, 600*time.Second, "429")
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
-	// 熔断域：独立信号，签到不解冻。
+	// 熔断域：人工解冻一并清除（与 ReenableIfCredits 的「不清熔断」不同）。
 	p.SetBreaker(1, time.Hour, time.Hour)
 	p.NoteError("u1")
 
-	p.ReenableIfCredits("u1", 700, 0)
-
-	st, _ := p.Status("u1")
-	if st.Credits != 700 {
-		t.Errorf("revive 后 credits=%d want 700", st.Credits)
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true（账号存在）")
 	}
+
 	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
 	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
-		t.Errorf("revive 应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+		t.Errorf("人工解冻应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
 			until, kind, reason, streak, mc)
 	}
-	if bt, ok := p.breakerUntil("u1"); !ok || bt.IsZero() {
-		t.Fatal("revive 不得清熔断（chat 通道健康未证明）")
+	if bt, ok := p.breakerUntil("u1"); !ok || !bt.IsZero() {
+		t.Fatal("人工解冻应清熔断运行态（运维口径无条件恢复）")
 	}
-	// 熔断域保留 → 账号不进 normal 候选（仅全冷却兜底仍可能选中，与熔断兜底语义一致）。
-	if p.internalHealthy("u1") {
-		t.Fatal("revive 后熔断期内不应 healthy（熔断域未被签到覆盖）")
+	if !p.internalHealthy("u1") {
+		t.Fatal("人工解冻后账号应回到可选状态")
+	}
+}
+
+// TestTransitionReenableOnlyHardCooling issue #199 语义收窄的迁移边界：
+// 余额刷新/签到（ReenableIfCredits）对**硬冷却**清冷却域、对**软冷却**只更新 credits；
+// 两者都不动熔断域（熔断只由到期/NoteSuccess 恢复）。
+func TestTransitionReenableOnlyHardCooling(t *testing.T) {
+	// 硬冷却：解冻（余额恢复正是硬冷却的恢复条件）。
+	pHard := New("")
+	pHard.Add(&auth.Auth{UID: "u1"})
+	pHard.CooldownUntilTomorrow4AM("u1", "余额不足")
+	pHard.SetBreaker(1, time.Hour, time.Hour)
+	pHard.NoteError("u1")
+	pHard.ReenableIfCredits("u1", 700, 0)
+	until, kind, reason, streak, mc := coolingDomain(t, pHard, "u1")
+	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
+		t.Errorf("硬冷却应被余额恢复解冻：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+			until, kind, reason, streak, mc)
+	}
+	if st, _ := pHard.Status("u1"); st.Credits != 700 {
+		t.Errorf("credits=%d want 700", st.Credits)
+	}
+	if bt, ok := pHard.breakerUntil("u1"); !ok || bt.IsZero() {
+		t.Fatal("余额刷新不得清熔断（chat 通道健康未证明）")
+	}
+	if pHard.internalHealthy("u1") {
+		t.Fatal("熔断期内不应 healthy（熔断域未被余额刷新覆盖）")
+	}
+
+	// 软冷却：只更新 credits，冷却域原样保留。
+	pSoft := New("")
+	pSoft.Add(&auth.Auth{UID: "u1"})
+	pSoft.CooldownSoftRate("u1", time.Hour, time.Time{}, "429 rate limit")
+	pSoft.SetBreaker(1, time.Hour, time.Hour)
+	pSoft.NoteError("u1")
+	pSoft.ReenableIfCredits("u1", 700, 0)
+	st, _ := pSoft.Status("u1")
+	if st.Credits != 700 {
+		t.Errorf("软冷却账号 credits=%d want 700（余额照常更新）", st.Credits)
+	}
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Errorf("软冷却不得被余额刷新解冻（issue #199）：%+v", st)
+	}
+	if bt, ok := pSoft.breakerUntil("u1"); !ok || bt.IsZero() {
+		t.Fatal("余额刷新不得清熔断")
 	}
 }

@@ -12,15 +12,16 @@
 //	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked 清
 //	breakerUntil       ← recordBreakerFailureLocked（NoteError 唯一喂入）；NoteSuccess 清
-//	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/reviveCoolingLocked 清
+//	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/Revive/reviveCoolingLocked（仅硬冷却）清
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
 //
 // 关键正交性（疑点 4 修正）：
 //   - 冷却域（until/coolKind/softStreak/modelCooldowns）与熔断器（fails/retryCount/
 //     breakerUntil）正交：冷却管「近期被限流/余额耗尽」，熔断管「反复 5xx 失败」。
 //     disableLocked 只清冷却域、不动熔断——禁用是授权/session 终态，不应覆盖熔断观测。
-//   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked 与
-//     reviveCoolingLocked（签到解冻）共用，二者对冷却域的处置因此永远一致。
+//   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked、Revive 与
+//     reviveCoolingLocked（余额恢复解冻，issue #199 收窄后仅硬冷却）共用，
+//     对冷却域的处置因此永远一致。
 package pool
 
 import "time"
@@ -53,12 +54,18 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 }
 
 // reviveCoolingLocked 只清冷却域（until/coolKind/reason/softStreak/modelCooldowns）
-// 并更新 credits/creditsTotal，不动熔断器（fails/retryCount/breakerUntil）。签到解冻走这里：
-// 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
-// 信号）不应被签到覆盖。
-// softStreak 属冷却域（与 until/coolKind 同域），随冷却一并清零——与「解冻只清冷却
-// 不清熔断」的既有语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是
-// 历史软冷却累积。调用方必须已持有 p.mu。
+// 并更新 credits/creditsTotal，不动熔断器（fails/retryCount/breakerUntil）。
+//
+// 调用方只有 ReenableIfCredits（余额刷新/签到），且**仅对硬冷却（CoolHard）**放行
+// （issue #199 收窄）：硬冷却的恢复条件正是「余额恢复」，签到到账即解冻；
+// 软冷却（CoolSoft/6004 模型级）的恢复时刻由上游重置墙钟或有界退避决定，余额恢复
+// 不构成解冻依据——旧实现无条件解冻会让软冷却账号被刷新解冻 → 再撞 429 循环。
+// 人工强制解冻走 Revive（无条件恢复，不受本收窄影响）。
+//
+// 熔断器不动的原因：余额恢复只证明 billing 通道健康，不证明 chat 通道健康，熔断
+// （连续 5xx 信号）不应被签到覆盖。softStreak 属冷却域（与 until/coolKind 同域），
+// 随冷却一并清零——与「解冻只清冷却不清熔断」的既有 C5 语义一致；硬冷却（CoolHard）
+// 本就不参与 streak，这里清的是历史软冷却累积。调用方必须已持有 p.mu。
 func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
 	e.credits = credits
 	e.creditsTotal = total

@@ -240,42 +240,93 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetRe = `将在 (.+?) 重置`
+// softRateResetReCN 中文文案（CN 主站）匹配「将在 … 重置」，捕获中间的时间串。
+var softRateResetReCN = regexp.MustCompile(`将在 (.+?) 重置`)
+
+// softRateResetReEN 英文文案（国际版实测）匹配「will reset at <时间>」，捕获时间串。
+// 上游原文：`... your usage will reset at 2026-09-18 09:31:32 UTC+8, alternatively,
+// you can switch to the other models to continue using it.`——时间后可能紧跟
+// ` UTC+8` 后缀与逗号，故捕获到逗号/句号/分号（中英文标点）前，剩余后缀由
+// normalizeSoftRateResetTime 统一剥掉（两种文案共用同一套 time.Parse 口径）。
+// 大小写不敏感（(?i)）：上游大小写形态未完全固定，匹配本身已足够具体。
+var softRateResetReEN = regexp.MustCompile(`(?i)will reset at ([^,.;，。；]+)`)
+
+// softRateResetRes 两种文案形态的包级预编译正则（依次尝试，任一命中即解析）。
+// 中文优先：CN 主站口径不变，英文形态是国际版的补充，两者不会同时命中同一 body。
+var softRateResetRes = []*regexp.Regexp{softRateResetReCN, softRateResetReEN}
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
 
+// softRateTimeLen 上游时间串的固定长度（layout 的格式串与输出等长：19 字符）。
+const softRateTimeLen = len(softRateTimeLayout)
+
+// softRateUTCSuffix 上游时间串后可能出现的时区后缀（固定 UTC+8；剥掉后统一按
+// softRateResetLoc 解释，不依赖容器时区）。
+const softRateUTCSuffix = "UTC+8"
+
+// modelRateLimitRe 包级预编译（选号/冷却热路径，不在函数体内 MustCompile）。
+// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
+var modelRateLimitRe = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+
 // IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
+// 只认 code 字段（数字/字符串双形态），与文案语言无关：英文 body 里 code 仍是
+// 数字 6004，同样命中。
 func IsModelRateLimit(body string) bool {
-	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	re := regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	return re.MatchString(body)
+	return modelRateLimitRe.MatchString(body)
 }
 
-// ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// normalizeSoftRateResetTime 规整正则捕获到的时间串：剥掉尾随标点与 ` UTC+8` 后缀。
+//   - 尾随标点：英文文案时间后常紧跟 ","（"… UTC+8, alternatively …"）或句号；
+//   - 时区后缀：大小写不敏感剥离（上游实测 "UTC+8"），剥离后按 softRateResetLoc 解释；
+//   - 超出时间串长度的残余（英文文案无标点分隔时整段说明被捕获）：仅当截断到时间
+//     长度后能解析成功才截断——避免把合法长串误截成半截时间。
+func normalizeSoftRateResetTime(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimRight(s, ",.;，。；")
+	s = strings.TrimSpace(s)
+	if len(s) >= len(softRateUTCSuffix) && strings.EqualFold(s[len(s)-len(softRateUTCSuffix):], softRateUTCSuffix) {
+		s = strings.TrimSpace(s[:len(s)-len(softRateUTCSuffix)])
+	}
+	if len(s) > softRateTimeLen {
+		if _, err := time.ParseInLocation(softRateTimeLayout, s[:softRateTimeLen], softRateResetLoc); err == nil {
+			s = s[:softRateTimeLen]
+		}
+	}
+	return s
+}
+
+// ParseRateReset 从任何限流响应 body 里统一解析上游明说的重置时间（UTC+8 墙钟）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
 //
+// 双形态支持（同一口径，依次尝试）：
+//   - 中文（CN 主站）：`将在 <时间> 重置`；
+//   - 英文（国际版实测）：`will reset at <时间>`，时间后可能带 ` UTC+8` 后缀与
+//     尾随逗号/句号，另有 "alternatively, you can switch to the other models…"
+//     等后续说明文本——后缀与标点由 normalizeSoftRateResetTime 统一剥掉。
+//
 // 与旧 ParseSoftRateReset 的关键差异：不再被 IsModelRateLimit（6004）门禁。只要是
-// 带「将在 … 重置」的限流文案——6004 模型级、11140 "The model provider is
+// 带重置时间文案的限流——6004 模型级、11140 "The model provider is
 // rate-limiting requests." 等任意形态——都提取同一上游权威重置墙钟。是否走模型级
 // 豁免、时点对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
 // IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
-// 的限流也照常由调用方退回有界退避（绝不臆造时间）。
+// 的限流也照常由调用方退回有界退避（绝不臆造时间）——解析失败一律返回 false，
+// 不猜、不兜底造时间。
 func ParseRateReset(body string) (time.Time, bool) {
-	re := regexp.MustCompile(softRateResetRe)
-	m := re.FindStringSubmatch(body)
-	if len(m) < 2 {
-		return time.Time{}, false
+	for _, re := range softRateResetRes {
+		m := re.FindStringSubmatch(body)
+		if len(m) < 2 {
+			continue
+		}
+		ts := normalizeSoftRateResetTime(m[1])
+		t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
+		if err != nil {
+			continue // 命中正则但时间非法（如 "will reset at tomorrow"）→ 试下一形态
+		}
+		return t, true
 	}
-	ts := strings.TrimSpace(m[1])
-	ts = strings.TrimSuffix(ts, " UTC+8") // 去掉后缀，固定按 softRateResetLoc 解释
-	t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
+	return time.Time{}, false
 }
 
 // ParseSoftRateReset 旧函数名的兼容别名：等价于 ParseRateReset（统一入口）。

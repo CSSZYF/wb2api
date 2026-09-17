@@ -1,5 +1,6 @@
 // Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive 四类独立排程。
-// 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
+// 签到成功后重新查余额；余额恢复的**硬冷却**（余额耗尽类）账号自动解冻（issue #199
+// 收窄后软冷却/模型级冷却不被余额恢复解冻，按上游重置墙钟或有界退避自行到期）。
 package scheduler
 
 import (
@@ -380,8 +381,11 @@ func (s *Scheduler) RunKeepaliveNow() {
 }
 
 // RunBalanceRefreshNow 并发对所有非禁用账号查询余额并更新池内 credits。
-// 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
-// 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
+// 解冻语义**收窄**（issue #199）：仅余额耗尽的硬冷却（CoolHard）账号余额恢复即解冻；
+// 软冷却（CoolSoft 429 / 6004 模型级）**不被余额刷新解冻**——余额恢复不证明限流已
+// 解除，旧实现无条件解冻会让软冷却账号每轮刷新（后台默认 5 分钟一次）被解冻 →
+// 选号重新选中 → 又撞 429。软冷却按上游重置墙钟/有界退避自行到期，或人工「解冻」。
+// 不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
@@ -401,10 +405,15 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				log.Printf("balance %s: %v", uid, err)
 				return
 			}
+			// 与 RunCheckinNow 同一形态（两分支语义统一）：解冻判定一律走
+			// ReenableIfCredits（内部按收窄规则判定：仅有效硬冷却 CoolHard 解冻，
+			// 软冷却/模型级冷却只更新 credits），带分桶时再叠加 SetCreditsDetailed
+			// 记录快过架子集。旧实现把两件事塞进 if/else 二选一，导致「有快过期积分
+			// 的硬冷却账号」永不解冻（SetCreditsDetailed 不含解冻语义）——分支语义
+			// 分裂，同一账号是否解冻取决于上游是否返回 expiring 分桶。
+			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			if expiring > 0 {
 				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
-			} else {
-				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			}
 		}(a, st.UID)
 	}

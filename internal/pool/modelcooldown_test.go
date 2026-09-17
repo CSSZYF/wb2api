@@ -192,8 +192,11 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsClearedByRevive 签到解冻（reviveCoolingLocked）→ 模型级 6004 冷却清零。
-func TestModelCooldownsClearedByRevive(t *testing.T) {
+// TestModelCooldownsKeptByReenable issue #199 语义收窄：余额刷新/签到（ReenableIfCredits）
+// **不再**清模型级 6004 冷却——仅 6004 冷却的账号 coolKind 未设（零值 = CoolHard），
+// 旧实现按 remain > 0 无条件解冻会把它误当硬冷却清掉 modelCooldowns，模型级豁免被
+// 刷新抹掉。收窄后模型级冷却原样保留，直到到期或人工 Revive。
+func TestModelCooldownsKeptByReenable(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
@@ -201,8 +204,16 @@ func TestModelCooldownsClearedByRevive(t *testing.T) {
 	p.mu.RLock()
 	n := len(p.byUID["u1"].modelCooldowns)
 	p.mu.RUnlock()
+	if n != 1 {
+		t.Errorf("ReenableIfCredits 后 modelCooldowns=%d want 1（模型级冷却不被余额刷新清，issue #199）", n)
+	}
+	// 人工强制解冻（Revive）才清模型级冷却。
+	p.Revive("u1")
+	p.mu.RLock()
+	n = len(p.byUID["u1"].modelCooldowns)
+	p.mu.RUnlock()
 	if n != 0 {
-		t.Errorf("revive 后 modelCooldowns=%d want 0", n)
+		t.Errorf("Revive 后 modelCooldowns=%d want 0（人工解冻清一切）", n)
 	}
 }
 

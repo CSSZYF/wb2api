@@ -351,6 +351,8 @@ func TestDisablePersists(t *testing.T) {
 	}
 }
 
+// TestReenableIfCredits 硬冷却（CoolHard）账号余额恢复即解冻（issue #199 收窄后
+// 仍保留的唯一自动解冻路径：硬冷却的恢复条件正是余额恢复）。
 func TestReenableIfCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -359,6 +361,64 @@ func TestReenableIfCredits(t *testing.T) {
 	got := p.Pick()
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("should reenable, pick=%+v", got)
+	}
+}
+
+// TestReenableIfCreditsKeepsSoftCooldown issue #199 语义收窄：软冷却（CoolSoft）
+// 账号经余额刷新/签到（ReenableIfCredits）**不得**被解冻——余额恢复不证明限流解除，
+// 旧实现无条件解冻会让软冷却账号被刷新解冻 → 选号重新选中 → 又撞 429 的循环。
+// credits 照常更新（观测量新鲜），冷却域（until/coolKind/modelCooldowns/softStreak）
+// 原样保留。
+func TestReenableIfCreditsKeepsSoftCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 账号级软冷却 + 6004 模型级冷却（含 softStreak 累计）。
+	p.CooldownSoftRate("u1", time.Hour, time.Time{}, "429 rate limit")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+
+	p.ReenableIfCredits("u1", 500, 0)
+
+	st, _ := p.Status("u1")
+	if st.Credits != 500 {
+		t.Errorf("credits=%d want 500（余额照常更新，只收窄解冻）", st.Credits)
+	}
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("软冷却不得被余额刷新解冻: %+v", st)
+	}
+	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
+	if until.IsZero() || kind != CoolSoft || reason == "" || streak == 0 || mc != 1 {
+		t.Errorf("冷却域应原样保留：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+			until, kind, reason, streak, mc)
+	}
+	// 行为断言：该号在状态机口径下仍不可用（注意不能用 Pick()==nil——全冷却兜底
+	// pickEarliestExpiryLocked 允许软冷却账号参与，这正是软冷却账号在池内仍会被
+	// 兜底探测选中的既有语义）。
+	if p.internalHealthy("u1") {
+		t.Error("软冷却中的账号不应 healthy（未被余额刷新解冻）")
+	}
+}
+
+// TestReenableIfCreditsKeepsModelOnlyCooldown 仅 6004 模型级冷却（账号级不 cooling）
+// 的账号：余额刷新后该模型的独立冷却必须保留（切模型豁免语义不被刷新破坏）。
+func TestReenableIfCreditsKeepsModelOnlyCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+
+	p.ReenableIfCredits("u1", 500, 0)
+
+	p.mu.RLock()
+	n := len(p.byUID["u1"].modelCooldowns)
+	p.mu.RUnlock()
+	if n != 1 {
+		t.Fatalf("modelCooldowns=%d want 1（模型级软冷却不被余额刷新清）", n)
+	}
+	// 同模型仍被冷却，切模型仍豁免（与 issue #31 的模型独立性一致）。
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got != nil {
+		t.Errorf("同模型请求不应选中被 6004 冷却的账号，got %+v", got)
+	}
+	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "u1" {
+		t.Errorf("切模型应豁免选中，got %+v", got)
 	}
 }
 
@@ -380,6 +440,36 @@ func TestReenableDoesNotTouchDisabled(t *testing.T) {
 	p.ReenableIfCredits("u1", 500, 0)
 	if p.Pick() != nil {
 		t.Fatal("disabled must not auto-reenable")
+	}
+}
+
+// TestReviveForcesSoftCooldownClear 人工强制解冻（面板「解冻」按钮 → Revive）不受
+// issue #199 收窄影响：人工判断该号可用时一键清掉软冷却/模型级冷却/熔断（运维口径
+// 无条件恢复）。这是软冷却的**唯一**人工出口（自动解冻只对硬冷却放行）。
+func TestReviveForcesSoftCooldownClear(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftRate("u1", time.Hour, time.Time{}, "429 rate limit")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // 触发熔断
+
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true（账号存在）")
+	}
+	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
+	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
+		t.Errorf("人工解冻应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+			until, kind, reason, streak, mc)
+	}
+	if bt, _ := p.breakerUntil("u1"); !bt.IsZero() {
+		t.Errorf("人工解冻应清熔断运行态：breakerUntil=%v", bt)
+	}
+	if !p.internalHealthy("u1") {
+		t.Error("人工解冻后账号应回到可选状态")
+	}
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "u1" {
+		t.Errorf("人工解冻后同模型请求也应可选，got %+v", got)
 	}
 }
 
@@ -854,9 +944,10 @@ func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
 	wantCoolSec(t, p, "u1", 600, 3)
 }
 
-func TestCooldownSoftStreakResetByReenable(t *testing.T) {
-	// 签到解冻（reviveCoolingLocked）清 cooling 域 → softStreak 一并归零；
-	// 熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
+// TestCooldownSoftStreakKeptByReenable issue #199 语义收窄：软冷却账号经余额刷新/
+// 签到（ReenableIfCredits）不解冻，故 softStreak 也**不再**归零（冷却域原样保留，
+// 退避指数不被刷新抹掉）。softStreak 的既有重置点仍是 NoteSuccess 与人工 Revive。
+func TestCooldownSoftStreakKeptByReenable(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
@@ -866,16 +957,21 @@ func TestCooldownSoftStreakResetByReenable(t *testing.T) {
 
 	p.ReenableIfCredits("u1", 500, 0)
 	st, _ := p.Status("u1")
-	if st.SoftStreak != 0 {
-		t.Errorf("reenable should reset soft_streak, got %d", st.SoftStreak)
+	if st.SoftStreak != 2 {
+		t.Errorf("软冷却不被余额刷新解冻 → soft_streak 应保留 2, got %d", st.SoftStreak)
 	}
-	if st.Cooling {
-		t.Errorf("reenable should clear cooling: %+v", st)
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Errorf("软冷却应原样保留（issue #199）: %+v", st)
 	}
 	if failsAfter := p.breakerFails("u1"); failsAfter != failsBefore {
 		t.Errorf("reenable must not touch breaker: fails %d → %d", failsBefore, failsAfter)
 	}
 
+	// 人工强制解冻（Revive）才清软冷却域 → softStreak 归零、退避回到基数。
+	p.Revive("u1")
+	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
+		t.Errorf("人工解冻应清 soft_streak, got %d", st.SoftStreak)
+	}
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 600, 3)
 }

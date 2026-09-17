@@ -225,6 +225,8 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
+// ReenableIfCredits 余额刷新/签到后的条件解冻：仅 remain > 0 且账号处于**硬冷却**
+// （CoolHard）时清冷却域；软冷却（CoolSoft/6004 模型级）不被余额恢复解冻（issue #199）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
 // reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。
+// 人工强制解冻走 Revive（无条件恢复），不经本函数。

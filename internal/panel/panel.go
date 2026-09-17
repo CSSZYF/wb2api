@@ -409,7 +409,8 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 }
 
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
-// 与 scheduler.RunCheckinNow 的单号语义一致。
+// 与 scheduler.RunCheckinNow 的单号语义一致。解冻口径同 issue #199：仅硬冷却
+// （余额耗尽）账号余额恢复即解冻，软冷却/6004 模型级冷却不被签到解冻。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -526,7 +527,8 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
-// balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
+// balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（解冻语义与后台周期
+// 刷新一致：仅硬冷却账号余额恢复即解冻，软冷却/6004 模型级冷却不被解冻，见 issue #199），
 // 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
 // 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
