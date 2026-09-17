@@ -23,7 +23,7 @@ func (s *Scheduler) RunStreakBonusNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
 		if a.IsGlobal() {

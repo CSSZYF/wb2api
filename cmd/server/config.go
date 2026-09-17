@@ -138,6 +138,7 @@ type Config struct {
 
 	Pool struct {
 		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
 		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
 		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
 		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
@@ -229,6 +230,9 @@ func Default() *Config {
 	c.Features.ZeroWidthSanitize = false
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
+	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403
+	// 修复 P1-1）；0/负数 normalize 回落本默认。
+	c.Pool.MaxInFlightGlobal = 2
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
@@ -438,6 +442,12 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
+	}
+	// global 在途分档：0/负数视为未设置回落默认 2（WAF 403 修复 P1-1）。
+	// 与 max_in_flight 的 0=不限语义不同——分档键的 0 没有合理语义（「global 不限」
+	// 用超大值表达即可），回退分档默认最稳。
+	if c.Pool.MaxInFlightGlobal <= 0 {
+		c.Pool.MaxInFlightGlobal = 2
 	}
 	if c.Pool.IdleWeightPerHour <= 0 {
 		c.Pool.IdleWeightPerHour = 0.5

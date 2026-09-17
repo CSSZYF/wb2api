@@ -987,7 +987,7 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 		return nil, diag, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, diag, err
@@ -1134,6 +1134,9 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 		}
 	}
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
+	// realm 在取 effortsMu 之前先快照：Realm() 现为加锁读（持 a.mu），避免在
+	// effortsMu 临界区内再取另一把锁（两锁独立但少一次嵌套更清晰）。
+	realmBucket := realmKey(a.Realm())
 	c.effortsMu.Lock()
 	if c.efforts == nil {
 		c.efforts = make(map[string]map[string][]string)
@@ -1141,16 +1144,17 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 	if c.defaultEfforts == nil {
 		c.defaultEfforts = make(map[string]map[string]string)
 	}
-	c.efforts[realmKey(a.Realm())] = cache
-	c.defaultEfforts[realmKey(a.Realm())] = defCache
+	c.efforts[realmBucket] = cache
+	c.defaultEfforts[realmBucket] = defCache
 	c.effortsMu.Unlock()
 	return out, diag, nil
 }
 
 // v3ConfigDomain /v3/config 的 X-Domain：优先账号落盘 domain，否则 chatBase host。
+// Domain 经访问器加锁快照（keepalive 刷新可在 a.mu 内改写它）。
 func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	if a != nil {
-		if d := strings.TrimSpace(a.Domain); d != "" {
+		if d := strings.TrimSpace(a.DomainValue()); d != "" {
 			d = strings.TrimPrefix(d, "https://")
 			d = strings.TrimPrefix(d, "http://")
 			return strings.TrimSuffix(d, "/")
@@ -1171,7 +1175,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	if a != nil && a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
