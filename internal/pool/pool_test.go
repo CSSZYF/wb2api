@@ -547,6 +547,422 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 池状态持久化三连（v1.9.10）：breaker/retryCount、creditsExpiring、sessionDeadFails
+// 入 stateAccount；恢复侧统一惰性过滤过期项（与 modelCooldowns 同设计模式）。
+// ---------------------------------------------------------------------------
+
+// breakerRetryCount 曝露 entry.retryCount 供测试断言（包内私有 helper）。
+func (p *Pool) breakerRetryCount(uid string) (int, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return 0, false
+	}
+	return e.retryCount, true
+}
+
+// creditsExpiringOf 曝露 entry.creditsExpiring 供测试断言（包内私有 helper）。
+func (p *Pool) creditsExpiringOf(uid string) (int64, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return 0, false
+	}
+	return e.creditsExpiring, true
+}
+
+// TestBreakerPersistRoundTrip 熔断器 breakerUntil + retryCount 已持久化：
+// 落盘 → 重启 → 恢复。修复熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号，
+// retryCount 保留"越熔越长"的退避累积。
+func TestBreakerPersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	// 触发两次熔断：retryCount=2，breakerUntil=+2h（1h*2^1，未触顶）。
+	p.SetBreaker(1, time.Hour, 6*time.Hour)
+	p.NoteError("u1") // 第 1 次熔断：retryCount=1，breakerUntil=+1h（fails 清零）
+	p.NoteError("u1") // 第 2 次熔断：retryCount=2，breakerUntil=+2h
+	p.Flush()
+
+	btBefore, _ := p.breakerUntil("u1")
+	rcBefore, _ := p.breakerRetryCount("u1")
+	if btBefore.IsZero() || rcBefore != 2 {
+		t.Fatalf("precondition: breakerUntil=%v retryCount=%d, want 非零/2", btBefore, rcBefore)
+	}
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"breaker_until"`, `"retry_count"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("state.json missing %s:\n%s", want, raw)
+		}
+	}
+	// fails 是短期计数：不持久化（重启归零，需重新累计到阈值）。
+	if strings.Contains(string(raw), `"breaker_fails"`) {
+		t.Errorf("fails 不应落盘（短期计数）:\n%s", raw)
+	}
+
+	// 重启：breakerUntil + retryCount 应保留，账号仍不可选。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	btAfter, _ := p2.breakerUntil("u1")
+	rcAfter, _ := p2.breakerRetryCount("u1")
+	if btAfter.IsZero() {
+		t.Fatal("重启后 breakerUntil 丢失（熔断期未持久化）")
+	}
+	if d := btAfter.Sub(btBefore); d < -time.Second || d > time.Second {
+		t.Errorf("恢复后 breakerUntil=%v want ~%v (diff %v)", btAfter, btBefore, d)
+	}
+	if rcAfter != rcBefore {
+		t.Errorf("恢复后 retryCount=%d want %d（退避指数未持久化）", rcAfter, rcBefore)
+	}
+	if p2.internalHealthy("u1") {
+		t.Fatal("重启后熔断中的账号应仍不可选（breakerUntil 未过期）")
+	}
+	if fails := p2.breakerFails("u1"); fails != 0 {
+		t.Errorf("重启后 fails=%d want 0（短期计数不持久化）", fails)
+	}
+}
+
+// TestBreakerPersistExpiryFilter 落盘与恢复都做过期过滤：breakerUntil 过期/零值时
+// 不写 breaker_until + retry_count（过期退避无意义），恢复时归零（不保留无用退避指数）。
+func TestBreakerPersistExpiryFilter(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	// 手写一个已过期的 breakerUntil + retryCount=3。
+	p.mu.Lock()
+	e := p.byUID["u1"]
+	e.breakerUntil = time.Now().Add(-time.Hour)
+	e.retryCount = 3
+	p.dirty.Store(true)
+	p.mu.Unlock()
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "breaker_until") {
+		t.Errorf("已过期的 breakerUntil 不应落盘:\n%s", raw)
+	}
+	if strings.Contains(string(raw), "retry_count") {
+		t.Errorf("breakerUntil 过期时 retryCount 不应落盘:\n%s", raw)
+	}
+
+	// 重启：过期 → 归零。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if bt, _ := p2.breakerUntil("u1"); !bt.IsZero() {
+		t.Errorf("过期的 breakerUntil 恢复后=%v want 零值", bt)
+	}
+	if rc, _ := p2.breakerRetryCount("u1"); rc != 0 {
+		t.Errorf("breakerUntil 过期时 retryCount 应归零, got %d", rc)
+	}
+}
+
+// TestCreditsExpiringPersistRoundTrip creditsExpiring 已持久化：落盘 → 重启 → 恢复。
+// 修复第四因子（weightOf ×8）重启失忆：重启后到下次签到之间不应丢失快过期积分偏好。
+func TestCreditsExpiringPersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsDetailed("u1", 1000, 0, 500) // credits=1000, creditsExpiring=500
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"credits_expiring"`) {
+		t.Errorf("state.json missing credits_expiring:\n%s", raw)
+	}
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	expiring, ok := p2.creditsExpiringOf("u1")
+	if !ok {
+		t.Fatal("重启后账号缺失")
+	}
+	if expiring != 500 {
+		t.Errorf("恢复后 creditsExpiring=%d want 500", expiring)
+	}
+	// 选号第四因子用恢复的值：weightOf 应含 expiring 项。
+	p2.mu.RLock()
+	e := p2.byUID["u1"]
+	wWith := p2.weightOf(e, 1000, time.Now())
+	saved := e.creditsExpiring
+	e.creditsExpiring = 0
+	wWithout := p2.weightOf(e, 1000, time.Now())
+	e.creditsExpiring = saved
+	p2.mu.RUnlock()
+	if wWith <= wWithout {
+		t.Errorf("恢复的 creditsExpiring 应让权重更大: wWith=%.3f wWithout=%.3f", wWith, wWithout)
+	}
+}
+
+// TestCreditsExpiringPersistOmitZero creditsExpiring=0 时落盘 omitempty 不写。
+func TestCreditsExpiringPersistOmitZero(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsDetailed("u1", 1000, 0, 0) // creditsExpiring=0
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "credits_expiring") {
+		t.Errorf("creditsExpiring=0 时不应落盘:\n%s", raw)
+	}
+}
+
+// TestCreditsExpiringPersistClamped 恢复时钳到 [0, credits]：state.json 是可被手工编辑/
+// 旧版本写坏的输入，越界值会经 weightOf 的占比项（×8）放大成选号偏置（防脏数据 ×8 放大）。
+func TestCreditsExpiringPersistClamped(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	// 手写脏数据：credits=100 但 credits_expiring=9999（越界）+ 另一个负值账号。
+	dirty := `{"accounts":{
+		"over":{"credits":100,"credits_expiring":9999},
+		"neg":{"credits":100,"credits_expiring":-50},
+		"ok":{"credits":100,"credits_expiring":80}
+	}}`
+	if err := os.WriteFile(fp, []byte(dirty), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	for _, uid := range []string{"over", "neg", "ok"} {
+		p.Add(&auth.Auth{UID: uid})
+	}
+	if got, _ := p.creditsExpiringOf("over"); got != 100 {
+		t.Errorf("越界 creditsExpiring=%d want 100（钳到 credits）", got)
+	}
+	if got, _ := p.creditsExpiringOf("neg"); got != 0 {
+		t.Errorf("负值 creditsExpiring=%d want 0（钳到 0）", got)
+	}
+	if got, _ := p.creditsExpiringOf("ok"); got != 80 {
+		t.Errorf("合法 creditsExpiring=%d want 80（不误伤）", got)
+	}
+	// 权重侧验证：钳制后的"越界号"与显式设成上限（=credits）的参照号权重应完全一致
+	// （若越界值漏钳，占比项会从 1.0 被撑到 99.99 → 权重相差近百）。
+	p.Add(&auth.Auth{UID: "ref"})
+	p.SetCreditsDetailed("ref", 100, 0, 100)
+	p.mu.RLock()
+	wOver := p.weightOf(p.byUID["over"], 100, time.Now())
+	wRef := p.weightOf(p.byUID["ref"], 100, time.Now())
+	p.mu.RUnlock()
+	if wOver != wRef {
+		t.Errorf("钳制后权重 %.3f 应等于上限参照 %.3f（越界值被 ×8 放大）", wOver, wRef)
+	}
+}
+
+// TestSessionDeadFailsPersistRoundTrip 连续 12153 计数已持久化：落盘 → 重启 → 恢复。
+// 修复重启归零重学：上游持续 session dead 时不用再吃 2 次失败才禁用。
+func TestSessionDeadFailsPersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1") // sessionDeadFails=2（未达阈值 3）
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "session_dead_fails") {
+		t.Errorf("state.json missing session_dead_fails:\n%s", raw)
+	}
+
+	// 重启：连续计数应恢复；下次 12153 从恢复值继续累计，第 3 次即达阈值禁用。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if !p2.NoteSessionDead("u1") {
+		t.Fatal("恢复计数=2 后第 3 次 12153 应禁用（从恢复值继续累计）")
+	}
+	if st, _ := p2.Status("u1"); !st.Disabled {
+		t.Fatal("恢复后达阈应 disabled")
+	}
+}
+
+// TestSessionDeadFailsPersistOmitZero sessionDeadFails=0 时落盘 omitempty 不写。
+func TestSessionDeadFailsPersistOmitZero(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	// 制造一次 dirty（成功入账）让 Flush 真正写盘，sessionDeadFails 保持 0。
+	p.NoteSuccess("u1")
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "session_dead_fails") {
+		t.Errorf("sessionDeadFails=0 时不应落盘:\n%s", raw)
+	}
+}
+
+// TestSessionDeadFailsClearPersists 计数清零（refresh/chat 成功）同样落盘：
+// 重启后不残留旧计数（NoteSessionDead/ClearSessionDead 两入口补标 dirty）。
+func TestSessionDeadFailsClearPersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	p.ClearSessionDead("u1") // 模拟 refresh 成功：清计数
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if p2.NoteSessionDead("u1") || p2.NoteSessionDead("u1") {
+		t.Fatal("清零后前 2 次不应禁用")
+	}
+	if !p2.NoteSessionDead("u1") {
+		t.Fatal("清零后第 3 次应禁用（重启后不残留旧计数）")
+	}
+}
+
+// TestSessionDeadFailsDirtyOnIncrement 未达阈值的计数变更也要标 dirty：
+// 旧实现只在达阈禁用（disableLocked）时置 dirty，计数 1→2 的变更永不触发落盘。
+func TestSessionDeadFailsDirtyOnIncrement(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.dirty.Store(false) // 清掉 Add 可能的脏位，只看计数入口
+	p.NoteSessionDead("u1")
+	if !p.dirty.Load() {
+		t.Error("NoteSessionDead 累计计数应标 dirty（否则计数变更不会落盘）")
+	}
+	p.dirty.Store(false)
+	p.ClearSessionDead("u1")
+	if !p.dirty.Load() {
+		t.Error("ClearSessionDead 清零应标 dirty（否则重启后残留旧计数）")
+	}
+	// 计数已为 0 时清零是空操作，不应无谓置脏。
+	p.dirty.Store(false)
+	p.ClearSessionDead("u1")
+	if p.dirty.Load() {
+		t.Error("sessionDeadFails 已为 0 时 ClearSessionDead 不应置 dirty")
+	}
+}
+
+// TestLegacyStateFileLoadsNewFieldsAsZero 旧 state.json（无 v1.9.10 新字段）兼容加载：
+// 5 个新字段全部零值，不报错、不影响既有字段；随后正常运行可重新写入。
+func TestLegacyStateFileLoadsNewFieldsAsZero(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	legacy := `{"accounts":{"u1":{"credits":123,"until":"2099-01-01T04:00:00+08:00","cool_kind":1,"reason":"余额不足","soft_streak":2}}}`
+	if err := os.WriteFile(fp, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	if got, _ := p.creditsExpiringOf("u1"); got != 0 {
+		t.Errorf("旧文件 creditsExpiring=%d want 0", got)
+	}
+	if rc, _ := p.breakerRetryCount("u1"); rc != 0 {
+		t.Errorf("旧文件 retryCount=%d want 0", rc)
+	}
+	if bt, _ := p.breakerUntil("u1"); !bt.IsZero() {
+		t.Errorf("旧文件 breakerUntil=%v want 零值", bt)
+	}
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	modelN := len(e.modelCooldowns)
+	sessionFails := e.sessionDeadFails
+	p.mu.RUnlock()
+	if modelN != 0 {
+		t.Errorf("旧文件 modelCooldowns=%d want 0", modelN)
+	}
+	if sessionFails != 0 {
+		t.Errorf("旧文件 sessionDeadFails=%d want 0", sessionFails)
+	}
+	// 既有字段照常加载（兼容不回退）。
+	st, _ := p.Status("u1")
+	if st.Credits != 123 || !st.Cooling || st.Reason != "余额不足" || st.SoftStreak != 2 {
+		t.Errorf("旧文件既有字段误加载: %+v", st)
+	}
+	// 旧值不阻碍后续写入：新字段可正常落盘并被下一轮恢复。
+	p.SetCreditsDetailed("u1", 123, 0, 50)
+	p.NoteSessionDead("u1")
+	p.Flush()
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if got, _ := p2.creditsExpiringOf("u1"); got != 50 {
+		t.Errorf("兼容加载后写入的 creditsExpiring=%d want 50", got)
+	}
+}
+
+// TestStatusOfClearsExpiredReason until 过期后 status 的 reason/cool_kind 应清空
+// （与落盘清理 cooledReasonLocked 同口径）：此前 statusOf 直接透出 e.reason，
+// 过期 reason 会残留到下一次落盘清理（最多 5s 落盘窗口）才消失，两口径不一致。
+func TestStatusOfClearsExpiredReason(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 手写一个已过期的 until + reason（模拟冷却刚到期、尚未被任何清理路径改写）。
+	p.mu.Lock()
+	e := p.byUID["u1"]
+	e.until = time.Now().Add(-time.Minute)
+	e.coolKind = CoolSoft
+	e.reason = "429 rate limit"
+	p.mu.Unlock()
+
+	st, _ := p.Status("u1")
+	if st.Reason != "" {
+		t.Errorf("until 过期后 status reason=%q want \"\"（应惰性清空）", st.Reason)
+	}
+	if st.Cooling {
+		t.Error("until 过期后 Cooling 应 false")
+	}
+	if st.CoolKind != "" {
+		t.Errorf("until 过期后 CoolKind=%q want \"\"（应清空）", st.CoolKind)
+	}
+}
+
+// TestStatusOfKeepsReasonWhenCooling until 在未来时 reason/cool_kind 正常透出（零回归）。
+func TestStatusOfKeepsReasonWhenCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+
+	st, _ := p.Status("u1")
+	if st.Reason != "429 rate limit" {
+		t.Errorf("冷却中 status reason=%q want %q", st.Reason, "429 rate limit")
+	}
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Errorf("冷却中 Cooling/CoolKind 应正常透出: %+v", st)
+	}
+}
+
+// TestStatusOfKeepsDisabledReason disabled 账号的 reason 是禁用原因，不清空（零回归）。
+func TestStatusOfKeepsDisabledReason(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Disable("u1", "12153 session dead")
+
+	st, _ := p.Status("u1")
+	if st.Reason != "12153 session dead" || st.DisabledReason != "12153 session dead" {
+		t.Errorf("disabled 账号 reason 应保留: Reason=%q DisabledReason=%q", st.Reason, st.DisabledReason)
+	}
+	if !st.Disabled {
+		t.Error("disabled 账号 Disabled 应 true")
+	}
+}
+
 func TestLoadLegacyErrCountMigratesToErrTotal(t *testing.T) {
 	// 迁移测试：旧 state.json 只含 err_count（连续错误）→ 加载后 err_total 正确。
 	dir := t.TempDir()
@@ -1103,11 +1519,16 @@ func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
 	}
 }
 
-// TestSoftRateModelNotPersistedToState 模型级独立冷却（modelCooldowns）是运行态：
-// 落盘不引入该字段，重启清零（退化为仅账号级 until 冷却的现状）。
-// 新语义：6004 带重置时间只写 modelCooldowns、不写 until → 重载后账号不冷却、
-// 台账为空。
-func TestSoftRateModelNotPersistedToState(t *testing.T) {
+// TestSoftRateModelPersistedToState 模型级独立冷却（modelCooldowns）现已持久化。
+//
+// **语义反转**（v1.9.10 起）：本用例原为 TestSoftRateModelNotPersistedToState——反向
+// 锁定「运行态、落盘不写 model_cooldowns、重启清零」的旧语义（含
+// "state.json should not persist model_cooldowns" 断言）。6004 精确对齐上游重置墙钟后
+// 单模型冷却可长达数小时，跨重启是常态，重启失忆会把账号重新送回 6004 限流模型上。
+// 故反转为断言落盘写出 + 重载恢复台账（限额台账随持久化跨重启可见）。
+// 不变的一条：6004-with-reset 只写 modelCooldowns、**不写**账号级 until，
+// 重载后账号整体不 cooling（模型豁免语义与持久化正交）。
+func TestSoftRateModelPersistedToState(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
@@ -1119,8 +1540,8 @@ func TestSoftRateModelNotPersistedToState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "model_cooldowns") {
-		t.Errorf("state.json should not persist model_cooldowns (runtime-only):\n%s", raw)
+	if !strings.Contains(string(raw), "model_cooldowns") {
+		t.Errorf("state.json should persist model_cooldowns:\n%s", raw)
 	}
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
@@ -1131,8 +1552,8 @@ func TestSoftRateModelNotPersistedToState(t *testing.T) {
 	if st.Cooling {
 		t.Fatalf("6004-with-reset 不写账号级 until，重载后不应 cooling: %+v", st)
 	}
-	if len(st.RateLimitedModels) != 0 {
-		t.Errorf("modelCooldowns should reset on reload, got %+v", st.RateLimitedModels)
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Errorf("modelCooldowns 应随持久化恢复（台账跨重启可见），got %+v", st.RateLimitedModels)
 	}
 }
 
@@ -1701,6 +2122,58 @@ func TestSaveMirrorsSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(raw, `"credits":42`) {
 		t.Fatalf("snapshot should carry account state: %s", raw)
+	}
+}
+
+// TestSnapshotCarriesPersistedNewFields Redis 快照与本地 state.json 同源（stateFile），
+// 三连新增的持久化字段应一并镜像，且恢复路径（applyAccountsLocked）同样做过期过滤。
+func TestSnapshotCarriesPersistedNewFields(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	ms := &memStore{}
+	p.SetStore(ms)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsDetailed("u1", 1000, 0, 400)
+	p.SetBreaker(1, time.Hour, 6*time.Hour)
+	p.NoteError("u1") // 熔断：breakerUntil 非零 + retryCount=1
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	p.NoteSessionDead("u1") // sessionDeadFails=1
+	p.Flush()
+
+	ms.mu.Lock()
+	raw := string(ms.saved)
+	ms.mu.Unlock()
+	for _, want := range []string{"credits_expiring", "breaker_until", "retry_count", "model_cooldowns", "session_dead_fails"} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("Redis 快照 missing %s:\n%s", want, raw)
+		}
+	}
+
+	// 走快照恢复路径（本地不可用 → 采用快照），过滤逻辑与本地 load 一致。
+	ms2 := &memStore{loadOK: true, loadData: []byte(raw)}
+	p2 := New(filepath.Join(dir, "missing", "state.json"))
+	p2.SetStore(ms2)
+	p2.RestoreFromSnapshot()
+	p2.Add(&auth.Auth{UID: "u1"})
+	if got, _ := p2.creditsExpiringOf("u1"); got != 400 {
+		t.Errorf("快照恢复 creditsExpiring=%d want 400", got)
+	}
+	if rc, _ := p2.breakerRetryCount("u1"); rc != 1 {
+		t.Errorf("快照恢复 retryCount=%d want 1", rc)
+	}
+	if bt, _ := p2.breakerUntil("u1"); bt.IsZero() {
+		t.Error("快照恢复 breakerUntil 丢失")
+	}
+	p2.mu.RLock()
+	modelN := len(p2.byUID["u1"].modelCooldowns)
+	sessionFails := p2.byUID["u1"].sessionDeadFails
+	p2.mu.RUnlock()
+	if modelN != 1 {
+		t.Errorf("快照恢复 modelCooldowns=%d want 1", modelN)
+	}
+	if sessionFails != 1 {
+		t.Errorf("快照恢复 sessionDeadFails=%d want 1", sessionFails)
 	}
 }
 

@@ -492,28 +492,103 @@ func TestHealthyForModelPriorityViaPick(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsNotPersisted modelCooldowns 运行态、不持久化（重启清零）。
-func TestModelCooldownsNotPersisted(t *testing.T) {
+// TestModelCooldownsPersistRoundTrip modelCooldowns 现已持久化：落盘 → 重启 → 恢复。
+//
+// **语义反转**（v1.9.10 起）：本用例原为 TestModelCooldownsNotPersisted——反向锁定
+// 「运行态、不持久化、重启清零」的旧语义。6004 改成精确对齐上游重置墙钟后，单模型
+// 冷却可长达数小时，跨重启是常态；不持久化等于每次重启都让 healthyForModel 失忆、
+// 重新踩一遍所有 6004 雷区（选号撞限流号耗尽 MaxRotate → 429 rate_limit_exceeded）。
+// 故改为断言持久化 + 往返字段一致：重启不再失忆。
+func TestModelCooldownsPersistRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	fp := dir + "/state.json"
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
+	// 带解析时间 6004 → 写入 modelCooldowns[glm-5.3]，Until 在未来。
+	reset := time.Now().Add(5 * time.Minute)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 model rate limit")
 	p.Flush()
+
+	// 重启：重新从同一份 state.json 加载，modelCooldowns 应恢复。
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.mu.RLock()
+	mc, ok := p2.byUID["u1"].modelCooldowns["glm-5.3"]
+	p2.mu.RUnlock()
+	if !ok {
+		t.Fatal("重启后 modelCooldowns[glm-5.3] 缺失（持久化未恢复）")
+	}
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("恢复后 model until=%v want ~reset=%v (diff %v)", mc.Until, reset, d)
+	}
+	if !mc.ResetAt.Equal(reset) {
+		t.Errorf("恢复后 model reset_at=%v want %v", mc.ResetAt, reset)
+	}
+	if mc.Reason != "6004 model rate limit" {
+		t.Errorf("恢复后 model reason=%q want %q", mc.Reason, "6004 model rate limit")
+	}
+	// 重启后该模型仍被拦（不因重启失忆），其他模型照常可选（模型豁免保留）。
+	p2.mu.RLock()
+	e := p2.byUID["u1"]
+	stillCooled := e.healthyForModel(time.Now(), "glm-5.3")
+	otherHealthy := e.healthyForModel(time.Now(), "hy3-x")
+	p2.mu.RUnlock()
+	if stillCooled {
+		t.Error("重启恢复后 healthyForModel(glm-5.3) 应 false（模型级冷却未失忆）")
+	}
+	if !otherHealthy {
+		t.Error("重启恢复后 healthyForModel(hy3-x) 应 true（切模型豁免保留）")
+	}
+}
+
+// TestModelCooldownsPersistExpiryFilter 落盘与恢复都做过期过滤：只有 Until 在未来的
+// 条目写出/恢复，过期与零值条目被惰性丢弃（与 pick 路径的 pruneExpiredModelCooldowns
+// 同口径），避免 state.json 残留已过期的模型级冷却、重启后把陈旧条目重新装回内存。
+func TestModelCooldownsPersistExpiryFilter(t *testing.T) {
+	dir := t.TempDir()
+	fp := dir + "/state.json"
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.mu.Lock()
+	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+		"future": {Until: time.Now().Add(time.Hour), ResetAt: time.Now().Add(2 * time.Hour), Reason: "6004 future"},
+		"past":   {Until: time.Now().Add(-time.Hour), ResetAt: time.Now().Add(-time.Hour), Reason: "6004 past"},
+		"zero":   {Until: time.Time{}, ResetAt: time.Time{}, Reason: "6004 zero"},
+	}
+	p.dirty.Store(true)
+	p.mu.Unlock()
+	p.Flush()
+
+	// 落盘侧过滤：过期/零值条目不应写出。
 	raw, err := os.ReadFile(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "model_cooldowns") || strings.Contains(string(raw), "modelCooldowns") {
-		t.Errorf("state.json 不应持久化 modelCooldowns:\n%s", raw)
+	if !strings.Contains(string(raw), "model_cooldowns") {
+		t.Errorf("state.json should persist model_cooldowns:\n%s", raw)
 	}
+	if strings.Contains(string(raw), "6004 past") || strings.Contains(string(raw), "6004 zero") {
+		t.Errorf("已过期/零值条目不应落盘（惰性清理）:\n%s", raw)
+	}
+
+	// 恢复侧过滤：past/zero 应被丢弃，只恢复 future。
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
 	p2.mu.RLock()
-	n := len(p2.byUID["u1"].modelCooldowns)
+	mcs := p2.byUID["u1"].modelCooldowns
+	n := len(mcs)
+	_, futureOK := mcs["future"]
+	_, pastOK := mcs["past"]
+	_, zeroOK := mcs["zero"]
 	p2.mu.RUnlock()
-	if n != 0 {
-		t.Errorf("重载后 modelCooldowns=%d want 0（重启清零）", n)
+	if n != 1 || !futureOK {
+		t.Fatalf("恢复后 modelCooldowns=%+v want 仅 future 1 条", mcs)
+	}
+	if pastOK {
+		t.Error("过期条目 past 不应恢复")
+	}
+	if zeroOK {
+		t.Error("零值 Until 条目 zero 不应恢复")
 	}
 }
 

@@ -35,6 +35,7 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 	}
 	e.sessionDeadFails++
 	if e.sessionDeadFails < sessionDeadThreshold {
+		p.dirty.Store(true)
 		return false
 	}
 	e.sessionDeadFails = 0
@@ -47,8 +48,9 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 func (p *Pool) ClearSessionDead(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.byUID[uid]; ok && e.sessionDeadFails != 0 {
 		e.sessionDeadFails = 0
+		p.dirty.Store(true)
 	}
 }
 
@@ -389,6 +391,9 @@ func (p *Pool) List() []Status {
 }
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
+	// reason 过期清理：非 disabled 账号若 until 已过期/零值，reason 清空（与落盘
+	// 清理 cooledReasonLocked 同口径）。disabled 账号的 reason 是禁用原因，保留。
+	_, reason := cooledReasonLocked(e, now)
 	st := Status{
 		UID: uid,
 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
@@ -401,7 +406,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:            e.reason,
+		Reason:            reason,
 		Disabled:          e.disabled,
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,

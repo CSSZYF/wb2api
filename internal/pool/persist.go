@@ -132,6 +132,7 @@ func (p *Pool) load() {
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+	now := time.Now()
 	for uid, s := range accounts {
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
@@ -139,21 +140,58 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if int64(s.ErrCount) > errTotal {
 			errTotal = int64(s.ErrCount)
 		}
-		p.byUID[uid] = &entry{
-			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:      s.Credits,
-			creditsTotal: s.CreditsTotal,
-			disabled:     s.Disabled,
-			reason:       s.Reason,
-			until:        s.Until,
-			coolKind:     s.CoolKind,
-			successCount: s.SuccessCount,
-			errTotal:     errTotal,
-			lastErr:      s.LastErr,
-			lastSuccess:  s.LastSuccess,
-			tokenUsage:   s.TokenUsage,
-			softStreak:   s.SoftStreak,
+		// 快过期积分钳到 [0, credits]：与 SetCreditsDetailed 同口径。state.json 是
+		// 可被手工编辑/旧版本写坏的输入，越界值会经 weightOf 的占比项（×8）放大成
+		// 选号偏置，恢复即钳死。
+		creditsExpiring := s.CreditsExpiring
+		if creditsExpiring < 0 {
+			creditsExpiring = 0
 		}
+		if creditsExpiring > s.Credits {
+			creditsExpiring = s.Credits
+		}
+		e := &entry{
+			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:          s.Credits,
+			creditsTotal:     s.CreditsTotal,
+			creditsExpiring:  creditsExpiring,
+			disabled:         s.Disabled,
+			reason:           s.Reason,
+			until:            s.Until,
+			coolKind:         s.CoolKind,
+			successCount:     s.SuccessCount,
+			errTotal:         errTotal,
+			lastErr:          s.LastErr,
+			lastSuccess:      s.LastSuccess,
+			tokenUsage:       s.TokenUsage,
+			softStreak:       s.SoftStreak,
+			sessionDeadFails: s.SessionDeadFails,
+		}
+		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
+		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
+		if s.BreakerUntil != nil && !s.BreakerUntil.IsZero() && now.Before(*s.BreakerUntil) {
+			e.breakerUntil = *s.BreakerUntil
+			e.retryCount = s.RetryCount
+		}
+		// 恢复 modelCooldowns，惰性过滤已过期条目（Until 在未来才恢复）。
+		// 防止重启后残留已过期的模型级冷却条目（与 pick 路径的 pruneExpiredModelCooldowns 同口径）。
+		if len(s.ModelCooldowns) > 0 {
+			e.modelCooldowns = make(map[string]modelCooldown, len(s.ModelCooldowns))
+			for m, smc := range s.ModelCooldowns {
+				if smc.Until.IsZero() || !now.Before(smc.Until) {
+					continue // 过期/零值丢弃
+				}
+				e.modelCooldowns[m] = modelCooldown{
+					Until:   smc.Until,
+					ResetAt: smc.ResetAt,
+					Reason:  smc.Reason,
+				}
+			}
+			if len(e.modelCooldowns) == 0 {
+				e.modelCooldowns = nil
+			}
+		}
+		p.byUID[uid] = e
 	}
 }
 
@@ -221,23 +259,75 @@ func (p *Pool) notePersistFail(err error) {
 	p.persistFails++
 }
 
+// cooledReasonLocked 对非 disabled 账号，若 until 已过期/零值，清空 coolKind/reason
+// （惰性清理僵尸 reason）。disabled 账号的 reason 是禁用原因，照常保留。落盘（stateOverviewLocked）
+// 与 status（statusOf）共用本判断，避免两条路径口径不一致导致 reason 残留（最多 5s 落盘窗口）。
+func cooledReasonLocked(e *entry, now time.Time) (coolKind CoolKind, reason string) {
+	if e.disabled || (!e.until.IsZero() && now.Before(e.until)) {
+		return e.coolKind, e.reason
+	}
+	return 0, ""
+}
+
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
+	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
+		// 模型级冷却落盘（复用既有落盘循环，不新增遍历）。只写 Until 在未来的条目，
+		// 与恢复时过期过滤同口径——落盘即清理，避免 state.json 残留已过期条目。
+		var mcs map[string]stateModelCooldown
+		if len(e.modelCooldowns) > 0 {
+			mcs = make(map[string]stateModelCooldown, len(e.modelCooldowns))
+			for m, mc := range e.modelCooldowns {
+				if mc.Until.IsZero() || !now.Before(mc.Until) {
+					continue // 已过期：不落盘（惰性清理）
+				}
+				mcs[m] = stateModelCooldown{
+					Until:   mc.Until,
+					ResetAt: mc.ResetAt,
+					Reason:  mc.Reason,
+				}
+			}
+			if len(mcs) == 0 {
+				mcs = nil
+			}
+		}
+		// 熔断器 breakerUntil + retryCount 落盘（惰性过滤：仅未过期才写出）。
+		// breakerUntil 已过期/零值时不写 breaker_until + retry_count——过期时退避
+		// 已无意义，保留 retryCount 是无用退避指数。与恢复侧过期过滤同口径。
+		// BreakerUntil 用指针：未过期时取地址写出，过期/零值留 nil（omitempty 省略）。
+		var breakerUntil *time.Time
+		var retryCount int
+		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+			bu := e.breakerUntil
+			breakerUntil = &bu
+			retryCount = e.retryCount
+		}
+		// 惰性清理僵尸 reason：until 为零值或已过期时不写出 cool_kind/reason，
+		// 避免 state.json 残留「until=0001 零值 + reason=6004 model rate limit」
+		// 的不一致快照（模型级冷却不该污染账号级 coolKind/reason 域）。disabled
+		// 账号的 reason 是禁用原因，不在冷却语义内，照常保留。
+		// 与 statusOf（state.go）共用 cooledReasonLocked，保证落盘与查询同口径。
+		coolKind, reason := cooledReasonLocked(e, now)
 		sf.Accounts[uid] = stateAccount{
-			Credits:      e.credits,
-			CreditsTotal: e.creditsTotal,
-			Disabled:     e.disabled,
-			Reason:       e.reason,
-			Until:        e.until,
-			CoolKind:     e.coolKind,
-			SuccessCount: e.successCount,
-			ErrTotal:     e.errTotal,
-			LastSuccess:  e.lastSuccess,
-			LastErr:      e.lastErr,
-			TokenUsage:   e.tokenUsage,
-			SoftStreak:   e.softStreak,
+			Credits:          e.credits,
+			CreditsTotal:     e.creditsTotal,
+			Disabled:         e.disabled,
+			Reason:           reason,
+			Until:            e.until,
+			CoolKind:         coolKind,
+			SuccessCount:     e.successCount,
+			ErrTotal:         e.errTotal,
+			LastSuccess:      e.lastSuccess,
+			LastErr:          e.lastErr,
+			TokenUsage:       e.tokenUsage,
+			SoftStreak:       e.softStreak,
+			SessionDeadFails: e.sessionDeadFails,
+			BreakerUntil:     breakerUntil,
+			RetryCount:       retryCount,
+			CreditsExpiring:  e.creditsExpiring,
+			ModelCooldowns:   mcs,
 		}
 	}
 	return sf
