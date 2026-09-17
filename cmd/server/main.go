@@ -284,6 +284,7 @@ func main() {
 		HiddenModels:     hiddenModels,
 		PinnedModels:     pinnedModels,
 		MaxBodyBytes:     int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		MaxRotate:        cfg.Server.MaxRotate,              // 单请求最多换号次数（池内账号多时可调大）
 	})
 	chatHandler = h
 
@@ -343,6 +344,7 @@ func panelListenPath(listen string) string {
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
 //   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
+//   - server.max_rotate → handler.SetMaxRotate（同上一行口径：池内账号多时调大换号次数即时生效）
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 //   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
@@ -407,6 +409,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
 	if srv != nil {
 		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
+		srv.SetMaxRotate(newCfg.Server.MaxRotate) // 池内账号多时调大换号次数，保存后即时生效
 	}
 
 	return restartRequiredFields(newCfg), nil

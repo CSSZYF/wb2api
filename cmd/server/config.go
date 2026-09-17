@@ -29,6 +29,12 @@ type Config struct {
 		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
 		// 0/负数视为非法 → normalize 回落默认并记录。
 		MaxBodyMB int `json:"max_body_mb"`
+
+		// MaxRotate 单请求最多换号次数（默认 3）。
+		// 池内账号多时（如 4-8 个）默认 3 次试不满所有号，调大可让单请求覆盖更多账号。
+		// 0/负数 normalize 回落默认 3（与 max_body_mb 的 fail fast 不同：此键的 0
+		// 没有"不限"之类的合理语义，无从误导用户，回落默认更友好）。
+		MaxRotate int `json:"max_rotate"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -202,6 +208,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
+	c.Server.MaxRotate = 3 // 单请求最多换号次数默认 3（与 handler 侧兜底口径一致）
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -414,6 +421,12 @@ func (c *Config) normalize() error {
 	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
 	if c.Server.MaxBodyMB <= 0 {
 		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
+	}
+	// max_rotate 非正回落默认 3（处理风格参照 pool.max_in_flight_global）：0/负数
+	// 在这里没有「不限」之类的合理语义（「不限换号」可用超大值表达），报错只会让
+	// 手写配置的部署起不来；回落默认既保住零行为变更，又不必用户猜合法区间。
+	if c.Server.MaxRotate <= 0 {
+		c.Server.MaxRotate = 3
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

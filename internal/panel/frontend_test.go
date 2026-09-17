@@ -36,6 +36,30 @@ func TestAppJSSyntax(t *testing.T) {
 	}
 }
 
+// TestAppJSMaxRotateWiring server.max_rotate 的面板接线必须齐全：CFG_MAP 映射
+// （否则表单值与后端对不上，输入框读不到也存不进去）+ 数字输入项存在。
+// app.js/index.html 是 go:embed 静态资源，Go 编译器不校验其内容——少一处映射，
+// 用户改了「单请求最多换号次数」保存后后端收不到该键，静默不生效（与
+// TestAppJSTestChatWiring 同因，把接线完整性前移）。
+func TestAppJSMaxRotateWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(js), `max_rotate: ['server', 'max_rotate']`) {
+		t.Error("app.js 缺 max_rotate 的 CFG_MAP 映射（表单值无法读写 server.max_rotate）")
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`name="max_rotate"`, `name="max_body_mb"`} {
+		if !strings.Contains(string(html), want) {
+			t.Errorf("index.html 缺配置表单项 %s", want)
+		}
+	}
+}
+
 // TestAppJSTestChatWiring 单账号对话测试的前端接线必须齐全：
 // 行内按钮（data-a="testchat"）→ 端点路径 → 弹窗 DOM。三者任一被误删，
 // 面板上就是一个点了没反应的按钮，而所有 Go 测试仍会全绿（与 TestAppJSSyntax 同因）。

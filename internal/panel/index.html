@@ -750,10 +750,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">需重启</span></label>
             </div>
             <div class="hr"></div>
-            <div class="grid2">
+            <div class="grid3">
               <label class="fld"><span class="lb">请求体上限（MB）</span>
                 <input name="max_body_mb" type="number" min="1" placeholder="8">
                 <span class="hint">多图会话可调大；保存后即时生效</span></label>
+              <label class="fld"><span class="lb">单请求最多换号次数</span>
+                <input name="max_rotate" type="number" min="1" placeholder="3">
+                <span class="hint">池内账号多时可调大以试满更多号；保存后即时生效</span></label>
               <label class="fld"><span class="lb">出站 User-Agent</span>
                 <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
                 <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
