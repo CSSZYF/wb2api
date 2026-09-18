@@ -78,7 +78,7 @@ func TestSaveConfigAppliesMaxRotateHot(t *testing.T) {
 
 	// 调小到 1：不重启、不重建 handler。未接线时仍按装配期的 2 跑（断言即失败）。
 	if _, err := saveConfig([]byte(`{"server":{"max_body_mb":8,"max_rotate":1}}`),
-		cfgPath, live, p, up, sch, h); err != nil {
+		cfgPath, live, p, up, sch, h, nil); err != nil {
 		t.Fatalf("saveConfig: %v", err)
 	}
 	if n := rotateAttempts(); n != 1 {
@@ -98,7 +98,7 @@ func TestSaveConfigAppliesMaxRotateHot(t *testing.T) {
 	}
 	// 调大到 2（反方向：证明不是碰巧读到了静态值 2）。
 	if _, err := saveConfig([]byte(`{"server":{"max_body_mb":8,"max_rotate":2}}`),
-		cfgPath, live, p, up, sch, h); err != nil {
+		cfgPath, live, p, up, sch, h, nil); err != nil {
 		t.Fatalf("saveConfig(2): %v", err)
 	}
 	if n := rotateAttempts(); n != 2 {
