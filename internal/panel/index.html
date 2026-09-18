@@ -495,6 +495,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
+          <button class="xs" id="btnCooldownProbe" title="立即试探已到期的软冷却（如 6004 模型级限流）：上游提前恢复即自动解冻；失败不罚号">冷却探活</button>
         </header>
         <div class="tbl-wrap">
         <table class="acc">
@@ -722,6 +723,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">扫描间隔（秒）</span>
                 <input name="auth_watch_seconds" type="number" min="1" placeholder="30">
                 <span class="hint">手工上传/删除 auths 目录里的凭证文件免重启生效</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <div class="switch"><span class="lb">后台冷却探活</span>
+                <input type="checkbox" name="cooldown_probe_enabled"></div>
+              <label class="fld"><span class="lb">探活间隔（分钟）</span>
+                <input name="cooldown_probe_minutes" type="number" min="1" placeholder="10">
+                <span class="hint">试探「已到期」的软冷却（如 6004 模型级限流），上游提前恢复即自动解冻；失败不罚号，硬冷却不探</span></label>
             </div>
           </div>
         </div>

@@ -183,6 +183,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
+	p.mux.HandleFunc("POST /panel/api/cooldown_probe/run", p.withAuth(p.cooldownProbeRun))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
@@ -542,6 +543,31 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Scheduler.RunBalanceRefreshNow()
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
+}
+
+// cooldownProbeRun 手动触发一轮后台冷却探活（POST /panel/api/cooldown_probe/run）。
+//
+// 与后台周期探活走同一入口（scheduler.RunCooldownProbeNow）：同一套目标选择
+// （只探已到期的软冷却、硬冷却不探）、同一套「成功即解冻 / 失败零惩罚」语义。
+// 用户场景：撞 6004 后想立刻知道上游是否已提前恢复，不必干等下一个 ticker 周期。
+//
+// 同步返回（不像 checkin_all 那样异步 + toast 看日志）：探活目标数通常是个位数、
+// 每个请求有 60s 上限，同步等待换来「点完就知道结论」的确定性；面板紧接着拉
+// overview 即是最新状态。重入锁被占（已有巡检在跑）时返回 skipped=true 而非报错
+// ——那不是失败，是本轮没跑。
+func (p *Panel) cooldownProbeRun(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	res := p.cfg.Scheduler.RunCooldownProbeNow()
+	if res.Skipped {
+		log.Printf("panel: 手动冷却探活跳过（已有巡检在执行）")
+	} else {
+		log.Printf("panel: 手动冷却探活完成：探 %d，解冻模型级 %d 条 / 账号级 %d 个（仍拒绝 %d，失败 %d）",
+			res.Probed, res.Cleared, res.Accounts, res.StillCooling, res.Failed)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": res, "accounts": p.cfg.Pool.List()})
 }
 
 // ---------------------------------------------------------------------------

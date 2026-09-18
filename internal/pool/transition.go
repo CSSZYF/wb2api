@@ -38,6 +38,27 @@ func (e *entry) clearCoolingLocked() {
 	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
 }
 
+// clearAccountCooldownLocked 清**账号级**冷却字段（until/coolKind/reason/softStreak），
+// **保留 modelCooldowns**（其他模型仍有效的冷却条目原样留着）。
+//
+// 与 clearCoolingLocked 的分工：那个是「冷却域整体归零」（禁用/复活/硬冷却解冻时用，
+// 模型级豁免随之消失是对的——账号整体退出选号或整体恢复）；本函数服务「单模型的
+// 成功证据只解除账号级冷却、不动其他模型负缓存」的场景——后台冷却探活
+// （probe.go CooldownProbeSuccess）的账号级维度。账号级软冷却到期本身不构成
+// 「其他被限流模型已恢复」的证据，故 modelCooldowns 必须原样保留。
+//
+// softStreak 一并清零：它与 until/coolKind 同属冷却域（见 entry.softStreak 注释），
+// 且本次清账的触发条件正是「账号刚被上游实测证明可用」——与 NoteSuccess /
+// reviveCoolingLocked 的恢复语义一致（恢复即清零，退避回基数）。
+// 熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
+// 调用方必须已持有 p.mu 写锁，并负责置 dirty。
+func (e *entry) clearAccountCooldownLocked() {
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	e.softStreak = 0
+}
+
 // clearModelCooldownLocked 清单个 (账号, 模型) 的模型级冷却记录，返回是否确有条目被删。
 // 只动 modelCooldowns[model] 一个键：其他模型的冷却、账号级冷却域（until/coolKind/
 // softStreak/reason）与熔断器（fails/retryCount/breakerUntil）全部原样——单模型被

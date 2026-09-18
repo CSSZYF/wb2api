@@ -319,6 +319,22 @@ $('btnActivityAll').onclick = async () => {
   try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
 };
+// 冷却探活：同步等待结果（探活目标通常个位数、每个 60s 上限），点完即知结论。
+// 结果文案区分四种：无到期目标 / 有目标但上游仍拒绝 / 有解冻 / 被重入锁跳过。
+$('btnCooldownProbe').onclick = async () => {
+  const b = $('btnCooldownProbe');
+  b.disabled = true; b.textContent = '探活中…';
+  try {
+    const r = await api('cooldown_probe/run', { method: 'POST' });
+    const res = r.result || {};
+    if (res.skipped) toast('已有巡检在执行，本次跳过（稍后重试）', 'err');
+    else if (!res.probed) toast('没有到期的冷却需要探活', 'ok');
+    else if (res.cleared || res.accounts) toast('探活完成：解冻模型级 ' + (res.cleared || 0) + ' 条 / 账号级 ' + (res.accounts || 0) + ' 个', 'ok');
+    else toast('探活完成：' + res.probed + ' 个目标上游仍未恢复（冷却照常，无额外惩罚）', 'ok');
+    await loadOverview(true);
+  } catch (e) { toast('探活失败：' + e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '冷却探活'; }
+};
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 /* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
@@ -443,6 +459,7 @@ const CFG_MAP = {
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   auth_watch_enabled: ['schedule', 'auth_watch_enabled'], auth_watch_seconds: ['schedule', 'auth_watch_seconds'],
+  cooldown_probe_enabled: ['schedule', 'cooldown_probe_enabled'], cooldown_probe_minutes: ['schedule', 'cooldown_probe_minutes'],
   max_body_mb: ['server', 'max_body_mb'], max_rotate: ['server', 'max_rotate'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
