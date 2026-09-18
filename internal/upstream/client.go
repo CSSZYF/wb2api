@@ -904,7 +904,8 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.sanitizeFingerprints/zeroWidthSanitize
 // 控制，均经 atomic 读取——本函数在请求 goroutine 内被调，与面板保存配置并发）。
-// realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
+// realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染），
+// 并决定是否做 CN 专属的 reasoning content-part 转换（见 reasoning_parts.go）。
 //
 // WB2A_DEBUG_REASONING 非空时，改写前后各打一行"思考字段"诊断（in/out）：
 // 用于回答"我调了 off/low/medium/high 感觉一样"到底是客户端没发、还是网关改写了、
@@ -915,7 +916,9 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	logReasoning("in ", body, efforts, defaults)
 	// 两个开关各读一次并就地使用：读点与写点（Set*）成对走 atomic，消除数据竞争。
 	// 不缓存到局部再跨阶段复用——避免把"一次读到的旧值"错当成当前配置。
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprintsOn(), c.ZeroWidthSanitizeOn(), efforts, defaults)
+	// realm 一并传入：CN 域在管线内做 reasoning part → reasoning_content 转换，
+	// global 域原样透传（上游接受该 part 类型，改它反而引入风险）。
+	body = PrepareBodyOptRealm(body, realm, c.SanitizeFingerprintsOn(), c.ZeroWidthSanitizeOn(), efforts, defaults)
 	logReasoning("out", body, efforts, defaults)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。

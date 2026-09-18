@@ -30,7 +30,22 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 // zeroWidth 控制零宽脱敏（见 zerowidth.go）——与 sanitize 是**两个独立开关**：
 // sanitize 默认开（改写/删除已知指纹），零宽默认关（插入不可见字符，改动更隐蔽，
 // 由使用者在面板上显式开启）。
+//
+// 本入口不带 realm，按包内约定（realmKey）视为 cn——它是 CN 现状路径的旧封装，
+// 行为与改动前一致；需要区分 cn/global 的调用方（出站主路径 client.prepareBody）
+// 用 PrepareBodyOptRealm 显式传 realm。
 func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize, zeroWidth bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	return PrepareBodyOptRealm(src, "", sanitize, zeroWidth, efforts, defaultEfforts)
+}
+
+// PrepareBodyOptRealm 同 PrepareBodyOptWithEffortsAndDefault，但显式指定 realm：
+// CN 域（realmKey(realm)=="cn"，空串按包内约定同 cn）额外做 reasoning content-part
+// 转换（见 reasoning_parts.go），global 域原样透传。
+//
+// 为什么用新变体而不是给原函数加参数：原函数有 20+ 处调用点（大量测试直接构造
+// 请求体），加参数等于全量改签名、把「realm 感知」扩散到与域无关的用例里；
+// 新变体只改出站主路径一个调用点，其余调用点零改动。
+func PrepareBodyOptRealm(src []byte, realm string, sanitize, zeroWidth bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -58,6 +73,25 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize, zeroWidth bool, e
 		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
 		obj["messages"] = msgs
+	}
+	// CN 域 reasoning content-part 转换（见 reasoning_parts.go）：ZCode 3.11.2 把思考
+	// 内容作为 content 数组里的 {"type":"reasoning"} part 发出，CN 上游不认该 part 类型
+	// （HTTP 400 code=11101 "unsupported content type at index 0: reasoning"），
+	// global 域接受该格式故原样透传。只做「part → 顶层字符串字段」的结构搬移，text 一字不动。
+	//
+	// 位置理由（顺序敏感，三处）：
+	//  1. 必须早于 backfillReasoningContent：backfill 第一遍只检测顶层 msg["reasoning"] /
+	//     msg["reasoning_content"]，数组里的 reasoning part 它看不见——先提升，backfill
+	//     才能按既有语义（任一 assistant 有痕迹 → 全部 assistant 补 reasoning_content）
+	//     把整段历史补齐。
+	//  2. 与 injectThinking 无耦合（一个按 realm、一个按模型名），放在它前面只是顺路；
+	//     提升出的 reasoning_content 不参与 thinking/effort 注入判定（那些只看顶层
+	//     thinking/reasoning_effort 字段）。
+	//  3. 必须早于 sanitize：提升后的 reasoning_content 走 sanitizeMessages 的
+	//     reasoning_content 分支净化，覆盖面与提升前 sanitizeContent 对 reasoning part
+	//     的 text 字段净化一致（sanitizeContent 只认 part 的 text 键、不看 type）。
+	if realmKey(realm) == "cn" {
+		promoteReasoningParts(obj)
 	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
