@@ -2,6 +2,7 @@ package session
 
 import (
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -284,6 +285,128 @@ func TestGCCleansExpired(t *testing.T) {
 	}
 	if r.Count() != 0 {
 		t.Errorf("count after gc=%d want 0", r.Count())
+	}
+}
+
+// TestSetTTLShortenExpiresExisting 面板热改 TTL（缩短）后，既有绑定按**新值**判定过期：
+// 同一份 entry（lastActive 未动）在 SetTTL 前有效、SetTTL 后立即失效并被重新分配。
+// 判据用「双段分配」的空闲号优先：c1 原绑 a1，过期后 a1 仍是"唯一被占用的号"，
+// 故 idle=[a2] 强制改绑 a2——若读取点仍读 cfg.TTL（启动初值 1h），这里必返回 a1。
+func TestSetTTLShortenExpiresExisting(t *testing.T) {
+	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Hour)
+	u1, ok := r.Resolve("c1")
+	if !ok {
+		t.Fatal("initial resolve should succeed")
+	}
+	// 把 lastActive 往回拨 30m：1h TTL 下未过期（应命中快路径、仍绑 u1）。
+	backdateEntry(t, r, "c1", 30*time.Minute)
+	if u2, ok := r.Resolve("c1"); !ok || u2 != u1 {
+		t.Fatalf("binding should stay valid under 1h TTL: got %q want %q (ok=%v)", u2, u1, ok)
+	}
+	backdateEntry(t, r, "c1", 30*time.Minute) // 上一步 Resolve 会滚动 lastActive，重新拨回
+	r.SetTTL(time.Minute)
+	if got := r.TTL(); got != time.Minute {
+		t.Fatalf("TTL()=%v want 1m", got)
+	}
+	u3, ok := r.Resolve("c1")
+	if !ok {
+		t.Fatal("resolve should succeed after TTL change")
+	}
+	if u3 == u1 {
+		t.Fatalf("binding must be re-evaluated under new TTL: still %q (expired entry not detected)", u3)
+	}
+}
+
+// TestSetTTLLengthenKeepsBinding 反向：TTL 放大后原本已过期的绑定恢复有效（不重分配）。
+func TestSetTTLLengthenKeepsBinding(t *testing.T) {
+	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Minute)
+	u1, _ := r.Resolve("c1")
+	backdateEntry(t, r, "c1", 30*time.Minute) // 1m TTL 下已过期
+	r.SetTTL(time.Hour)
+	u2, ok := r.Resolve("c1")
+	if !ok || u2 != u1 {
+		t.Fatalf("binding should be revived by longer TTL: got %q want %q (ok=%v)", u2, u1, ok)
+	}
+}
+
+// TestSetTTLNonPositiveFallsBackDefault 面板把 ttl 清空/填 0 时回落默认 30m，
+// 而不是把所有绑定瞬间判为过期（粘性全丢）。
+func TestSetTTLNonPositiveFallsBackDefault(t *testing.T) {
+	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Minute)
+	u1, _ := r.Resolve("c1")
+	backdateEntry(t, r, "c1", 5*time.Minute)
+	r.SetTTL(0)
+	if got := r.TTL(); got != 30*time.Minute {
+		t.Fatalf("TTL()=%v want default 30m", got)
+	}
+	// 5m 老绑定在 30m 默认 TTL 下仍有效 → 快路径原样返回 u1（若被误判过期会改绑 a2）。
+	if u2, ok := r.Resolve("c1"); !ok || u2 != u1 {
+		t.Fatalf("5m-old binding must survive 30m default TTL: got %q want %q (ok=%v)", u2, u1, ok)
+	}
+}
+
+// TestSetTTLConcurrentWithResolve 并发 SetTTL + Resolve + gcOnce 无数据竞争
+// （-race 下验证原子 TTL 与 entries 锁无耦合；GC goroutine 不启动，只手动触发）。
+func TestSetTTLConcurrentWithResolve(t *testing.T) {
+	r := routerWith(newCountingStore(), []string{"a1", "a2", "a3"}, time.Minute)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	// 写侧：不停改 TTL（覆盖正常值与非法值回落分支）
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			switch i % 4 {
+			case 0:
+				r.SetTTL(time.Minute)
+			case 1:
+				r.SetTTL(2 * time.Hour)
+			case 2:
+				r.SetTTL(0)
+			default:
+				r.SetTTL(-time.Second)
+			}
+		}
+	}()
+	// 读侧：并发 Resolve（快路径 + 慢路径）与 GC（与写侧 TTL 变化同时发生）
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			key := "c" + strconv.Itoa(n)
+			for j := 0; j < 200; j++ {
+				if _, ok := r.Resolve(key); !ok {
+					t.Errorf("resolve %s failed", key)
+					return
+				}
+				if j%50 == 0 {
+					r.gcOnce(time.Now())
+				}
+			}
+		}(i)
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+// backdateEntry 把某绑定的 lastActive 往回拨 d（测试专用；与运行时写路径同锁语义）。
+func backdateEntry(t *testing.T, r *Router, key string, d time.Duration) {
+	t.Helper()
+	r.mu.Lock()
+	e, ok := r.entries[key]
+	if ok {
+		e.lastActive = e.lastActive.Add(-d)
+		r.entries[key] = e
+	}
+	r.mu.Unlock()
+	if !ok {
+		t.Fatalf("entry %s not found for backdating", key)
 	}
 }
 

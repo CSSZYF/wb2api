@@ -949,3 +949,26 @@ func TestZeroWidthSanitizeDefaultOffAndEnvOverride(t *testing.T) {
 		t.Error("零宽开关不应影响 sanitize_blacklist_fingerprints（默认仍应为 true）")
 	}
 }
+
+// TestRestartRequiredFieldsSessionTTLHotApplied 面板「需重启」清单的边界：
+// session_sticky.ttl 已改为热生效（Router.SetTTL）→ 不得再出现在清单里，
+// 否则面板会提示用户"改了要重启"，而实际已即时生效（误导性提示）。
+// gc_interval 反向：GC ticker 不热重建 → 必须仍在清单里。
+func TestRestartRequiredFieldsSessionTTLHotApplied(t *testing.T) {
+	got := restartRequiredFields(Default())
+	var hasTTL, hasGC bool
+	for _, f := range got {
+		switch f {
+		case "session_sticky.ttl":
+			hasTTL = true
+		case "session_sticky.gc_interval":
+			hasGC = true
+		}
+	}
+	if hasTTL {
+		t.Errorf("session_sticky.ttl 已热生效，不应在需重启清单里: %v", got)
+	}
+	if !hasGC {
+		t.Errorf("session_sticky.gc_interval 仍应需重启，清单里缺失: %v", got)
+	}
+}

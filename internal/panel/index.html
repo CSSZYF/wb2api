@@ -289,8 +289,23 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 fieldset { border: none; margin-bottom: 6px; }
 legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom: 10px; }
 .hr { height: 1px; background: var(--line-soft); margin: 4px 0 16px; }
-.switch { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; }
+/* 开关行用三栏栅格（label 固定宽 / checkbox 固定宽居中 / hint 自适应）：
+   历史实现是 flex + space-between，label 靠左而 checkbox 被 hint 文本长度推着走
+   （带长 hint 的行 checkbox 明显右移），多行堆叠时勾选框参差不齐。固定列宽后
+   所有开关行的勾选框在垂直方向严格对齐，hint 长短只影响自己的列。
+   最宽 label「国际版（global）路由」约 139px，取 190px 留出余量。 */
+.switch { display: grid; grid-template-columns: 190px 40px 1fr; align-items: center; gap: 8px; padding: 9px 0; }
 .switch .lb { font-size: 13.5px; }
+.switch input[type=checkbox] { justify-self: center; margin: 0; }
+.switch .hint { font-size: 11.5px; color: var(--ink-3); }
+/* 窄屏降级：label 列收窄，hint 折到第二行（仍是栅格 → 勾选框列不动，
+   对齐性质在窄屏下也保持）。190px 固定列在 400px 视口里只剩 ~90px 给 hint，
+   长 hint 会被挤成竖排单字，故显式降级。必须放在 .switch 规则之后：
+   媒体查询不改变选择器特异性，同特异性下后写的规则生效。 */
+@media (max-width: 560px) {
+  .switch { grid-template-columns: 1fr 40px; }
+  .switch .hint { grid-column: 1 / -1; }
+}
 .savebar {
   display: flex; align-items: center; gap: 12px; padding: 13px 17px;
   border-top: 1px solid var(--line-soft); background: var(--surface-2);
@@ -710,27 +725,38 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">单账号最大在途</span>
                 <input name="max_in_flight" type="number" min="0" placeholder="3">
                 <span class="hint">0 = 不限制</span></label>
+              <label class="fld"><span class="lb">国际版单号最大在途</span>
+                <input name="max_in_flight_global" type="number" min="0" placeholder="2">
+                <span class="hint">global 域在途上限（WAF 风控更紧）；0 = 回落默认 2；保存后立即生效</span></label>
               <label class="fld"><span class="lb">连续失败熔断阈值</span>
                 <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
-              <label class="fld"><span class="lb">软限流冷却基数</span>
-                <input name="soft_rate" placeholder="600s"></label>
             </div>
             <div class="grid3">
+              <label class="fld"><span class="lb">软限流冷却基数</span>
+                <input name="soft_rate" placeholder="600s"></label>
               <label class="fld"><span class="lb">软冷却退避上限</span>
                 <input name="soft_rate_max" placeholder="2h"></label>
               <label class="fld"><span class="lb">熔断基础时长</span>
                 <input name="breaker_cooldown" placeholder="30m"></label>
-              <label class="fld"><span class="lb">熔断退避上限</span>
-                <input name="breaker_cooldown_max" placeholder="6h"></label>
             </div>
             <div class="grid3">
+              <label class="fld"><span class="lb">熔断退避上限</span>
+                <input name="breaker_cooldown_max" placeholder="6h"></label>
               <label class="fld"><span class="lb">闲置补偿 / 小时</span>
                 <input name="idle_weight_per_hour" type="number" step="0.1" placeholder="0.5"></label>
               <label class="fld"><span class="lb">闲置补偿上限</span>
                 <input name="idle_weight_max" type="number" step="0.1" placeholder="5"></label>
+            </div>
+            <div class="grid3">
               <label class="fld"><span class="lb">会话粘性 TTL</span>
                 <input name="ttl" placeholder="30m">
-                <span class="hint">改动需重启进程</span></label>
+                <span class="hint">保存后立即生效（新判定按新 TTL）</span></label>
+              <label class="fld"><span class="lb">会话 GC 周期</span>
+                <input name="gc_interval" placeholder="5m">
+                <span class="hint">改动需重启进程（GC 定时器不热重建）</span></label>
+              <label class="fld"><span class="lb">快过期积分窗口</span>
+                <input name="expiring_soon" placeholder="168h">
+                <span class="hint">窗口内到期的积分优先消耗；填 0 = 禁用分桶（留空 = 保持原值）；保存后立即生效</span></label>
             </div>
           </div>
         </div>
@@ -761,6 +787,34 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
                 <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
             </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">客户端版本段</span>
+                <input name="client_version" placeholder="留空 = 内置默认 5.5.4">
+                <span class="hint">出站 UA 的 WorkBuddy/&lt;ver&gt; 与 X-IDE-Version；需重启</span></label>
+              <label class="fld"><span class="lb">CLI 版本段</span>
+                <input name="cli_version" placeholder="留空 = 内置默认 2.137.1">
+                <span class="hint">出站 UA 的 CLI/&lt;ver&gt; 段；需重启</span></label>
+              <label class="fld"><span class="lb">归属客户端名</span>
+                <input name="client_name" placeholder="留空 = X-Product=SaaS">
+                <span class="hint">非空时注入 X-IDE-* 归属头；需重启</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">设备风控 Token</span>
+                <input name="device_token" placeholder="留空 = 不注入 X-Device-Token">
+                <span class="hint">全局兜底（每号 auth 文件的 device_token 优先）；留空 = 保持原值；需重启</span></label>
+              <label class="fld"><span class="lb">设备 Token 文件</span>
+                <input name="device_token_file" placeholder="留空 = 不读文件">
+                <span class="hint">桌面端落盘 token 的路径兜底；需重启</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">裸模型名默认域</span>
+                <select name="realm_precedence">
+                  <option value="global">global — 裸名默认落国际版（缺省）</option>
+                  <option value="cn">cn — 裸名默认落国内版</option>
+                </select>
+                <span class="hint">两域都有账号时裸模型名的归属域，影响路由决策；改动需重启进程</span></label>
+            </div>
             <div class="hr"></div>
             <div class="grid2">
               <label class="fld"><span class="lb">系统提示词模式</span>
@@ -780,8 +834,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">零宽字符脱敏</span>
               <input type="checkbox" name="zerowidth_sanitize">
               <span class="hint">在 system 消息的指纹词内插入 U+200B，可见文本不变、只破坏逐字匹配（默认关）</span></div>
+            <div class="switch"><span class="lb">透传客户端 IP</span>
+              <input type="checkbox" name="passthrough_ip">
+              <span class="hint">向上游注入 X-Forwarded-For / X-Real-IP；默认关（反代安全边界）；需重启</span></div>
+            <div class="switch"><span class="lb">对外模型名去域前缀</span>
+              <input type="checkbox" name="strip_realm_prefix">
+              <span class="hint">勾选（缺省）= /v1/models 输出裸名；取消 = 保留 cn: / global: 前缀；需重启</span></div>
+            <div class="switch"><span class="lb">国际版（global）路由</span>
+              <input type="checkbox" name="global_enabled">
+              <span class="hint">关 = 纯 CN 锁定逃生门（realm=global 账号也不走国际版）；改后需重启</span></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
-              <input type="checkbox" name="session_sticky_enabled"></div>
+              <input type="checkbox" name="session_sticky_enabled">
+              <span class="hint">默认开；改动需重启进程</span></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
         </div>
