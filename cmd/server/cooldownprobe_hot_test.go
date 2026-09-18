@@ -115,3 +115,56 @@ func TestCooldownProbeEndToEndClearsExpiredCooldown(t *testing.T) {
 		t.Errorf("探活成功后该模型应可选，got %+v", got)
 	}
 }
+
+// TestSaveConfigAppliesDegradeHot 面板保存 pool.degrade_* 必须即时生效（issue #114）。
+//
+// 锁的是 main.go 的热应用接线（p.SetDegrade）：缺了它，配置照样落盘、校验照样通过、
+// 面板照样提示"已保存"，但连败阈值仍是启动时的旧值——正是 issue #17 对 max_body_mb
+// 描述过的「静默不生效」失效模式。本用例走 saveConfig 全链路（校验→落盘→热应用），
+// 而非只测 pool 的 setter。
+//
+// 用「阈值 1 + 一次 NoteFailures 即降权」作为可观测判据：接线缺失时默认阈值 5 不触发。
+func TestSaveConfigAppliesDegradeHot(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"pool":{"degrade_threshold":5,"degrade_cooldown":"10m"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := pool.New("")
+	up := &upstream.Client{}
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up})
+	live := livecfg.New(livecfg.Snapshot{})
+	p.Add(&auth.Auth{UID: "u1"})
+
+	// 保存阈值 1 + 时长 3m：热应用后一次连败即降权，且时长按新值。
+	if _, err := saveConfig([]byte(`{"pool":{"degrade_threshold":1,"degrade_cooldown":"3m","degrade_cooldown_max":"2h"}}`),
+		cfgPath, live, p, up, sch, nil, nil); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+	p.NoteFailures("u1")
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.CoolKind != "degrade" {
+		t.Fatalf("保存 degrade_threshold=1 后一次连败即应降权（热应用未接线？）: %+v", st)
+	}
+	if st.CoolRemaining > int64((3*time.Minute).Seconds()) || st.CoolRemaining < int64((2*time.Minute).Seconds()) {
+		t.Errorf("降权时长应约为热改后的 3m, got %ds", st.CoolRemaining)
+	}
+	if uids := p.AvailableUIDs(); len(uids) != 0 {
+		t.Errorf("降权后账号应出池, got %v", uids)
+	}
+
+	// 再保存一个极大阈值（= 关闭）：重启语义下不再降权（新账号验证新阈值生效）。
+	if _, err := saveConfig([]byte(`{"pool":{"degrade_threshold":1000000}}`),
+		cfgPath, live, p, up, sch, nil, nil); err != nil {
+		t.Fatalf("saveConfig(off): %v", err)
+	}
+	p.Add(&auth.Auth{UID: "u2"})
+	for n := 0; n < 50; n++ {
+		p.NoteFailures("u2")
+	}
+	st2, _ := p.Status("u2")
+	if st2.Cooling {
+		t.Errorf("阈值改为极大后连败不应降权（热应用未生效？）: %+v", st2)
+	}
+}

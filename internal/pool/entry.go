@@ -1,4 +1,4 @@
-// Package pool 账号池：单一状态机（健康/冷却/熔断）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
+// Package pool 账号池：单一状态机（健康/冷却/熔断/连败降权）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
 package pool
 
 import (
@@ -24,6 +24,11 @@ func (k CoolKind) String() string {
 	}
 	return "unknown"
 }
+
+// degradeReason 连败降权（issue #114）写 reason 的固定文案：与冷却域的
+// reason（"429 rate limit" / "waf 403 block" / "余额不足"）共用一个字段，
+// 运维在 /status 一处即可看到「为什么被降权/冷却」，不新增台账字段。
+const degradeReason = "consecutive failures"
 
 // TokenUsage 账号聊天请求的累计 token 用量摘要（不包含任何原始凭证）。
 type TokenUsage struct {
@@ -72,14 +77,19 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
-	LastSuccessTime time.Time  `json:"last_success,omitempty"`
-	LastErrTime     time.Time  `json:"last_err,omitempty"`
-	TokenUsage      TokenUsage `json:"token_usage,omitempty"`
+	Realm           string    `json:"realm,omitempty"`
+	Disabled        bool      `json:"disabled"`
+	DisabledReason  string    `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
+	// ConsecutiveFails 连续失败计数（连败降权用，见 entry.consecutiveFails）。
+	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
+	// 误以为"没记录"，实际是零值被 omitempty 省略）。
+	ConsecutiveFails int        `json:"consecutive_fails"`
+	DegradeUntil     time.Time  `json:"degrade_until,omitempty"` // 连败降权截止（非零且未过 = 降权中）
+	TokenUsage       TokenUsage `json:"token_usage,omitempty"`
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
@@ -178,6 +188,26 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
+	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
+	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态
+	// 是 Disable，这里的终态是临时出池（degradeUntil）。清零点：NoteSuccess。
+	// 持久化（stateAccount.ConsecutiveFails + DegradeUntil）：restart 归零会让
+	// 「上游持续故障 + 频繁重启」的组合重新学满阈值；degradeUntil 持久化让降权期
+	// 重启不失忆（与 breakerUntil 同口径）。
+	//
+	// 与既有计数器正交（勿"顺手"合并）：
+	//   - fails（熔断）由 NoteError 唯一喂入、达阈熔断时清零，且被硬冷却/统一复活
+	//     连带污染（见 fails 注释），无法表达"连续 N 次不罚号的失败"；
+	//   - softStreak 是冷却域的软限流退避指数（只在进入新软冷却时递增），
+	//     ErrClient/传输层失败根本不进冷却路径；
+	//   - 本计数器只由 NoteFailures 递增、NoteSuccess 清零，不读也不写上面两者。
+	consecutiveFails int
+	// degradeUntil 连败降权截止：非零且未到期时该账号不参与 normal 选号（临时
+	// 出池）。与冷却/熔断**取更长者不叠加**（healthy 判定是并列或门，任一未到期
+	// 即不可选，生效的一定是最远者），到期自动回池，无需显式复位。落盘仅未过期
+	// 条目（同 breakerUntil 惰性过滤口径）。
+	degradeUntil time.Time
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 }
@@ -201,7 +231,9 @@ func (e *entry) hardCooldownSet() bool {
 	return e.coolKind == CoolHard && !e.until.IsZero()
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
+// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
+// 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
+// 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
 		return false
@@ -212,17 +244,27 @@ func (e *entry) healthy(now time.Time) bool {
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
 		return false
 	}
+	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+		return false
+	}
 	return true
 }
 
 // modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
-// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
+// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断、未降权。
 // 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
+//
+// 连败降权（degradeUntil）纳入本形态判定：降权是「临时整体出池」，账号对**所有**
+// 模型都不可选（healthy 或门直接 false），不是"仅某模型不可用"的豁免形态。不排除
+// 会让 /healthz 在「全池仅剩一个降权号 + 它恰好有模型级冷却」时报 servable，而 chat
+// 选号实际无候选——正是本谓词要消灭的探活/选号口径裂缝。形态判定与 breakerUntil
+// 同风格（只看字段是否被设过）；降权自然到期后由 healthy(now) 覆盖该账号的可服务性
+// （degradeUntil 过期即 healthy=true），不产生假阴性。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && e.breakerUntil.IsZero()
+		!e.disabled && e.breakerUntil.IsZero() && e.degradeUntil.IsZero()
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -273,8 +315,9 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 	}
 }
 
-// expiry 返回账号当前仍在生效的最近冷却/熔断截止时间（两个截止取较早者）；不在冷却期返回零值。
-// 供全冷却兜底选取"最早到期"账号用。
+// expiry 返回账号当前仍在生效的最近冷却/熔断/降权截止时间（三个截止取最早者）；不在冷却期返回零值。
+// 供全冷却兜底选取"最早到期"账号用。连败降权计入兜底口径：降权号参与兜底（其失败
+// 形态是「不知道原因」，到期放行半开试探正是兜底语义——CoolHard 才被排除）。
 func (e *entry) expiry(now time.Time) time.Time {
 	var t time.Time
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -285,16 +328,24 @@ func (e *entry) expiry(now time.Time) time.Time {
 			t = e.breakerUntil
 		}
 	}
+	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
+		if t.IsZero() || e.degradeUntil.Before(t) {
+			t = e.degradeUntil
+		}
+	}
 	return t
 }
 
-// fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却；breaker：熔断期）。
+// fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却/连败降权；breaker：熔断期）。
 // 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryLocked 排除）。判定口径：
-// 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft。
+// 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft
+// （连败降权与软冷却同归 soft：都按各自截止到期放行，兜底处置无差异）。
 func (e *entry) fallbackKind(now time.Time) string {
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
 		if e.until.IsZero() || !now.Before(e.until) || e.breakerUntil.Before(e.until) {
-			return "breaker"
+			if e.degradeUntil.IsZero() || !now.Before(e.degradeUntil) || e.breakerUntil.Before(e.degradeUntil) {
+				return "breaker"
+			}
 		}
 	}
 	return "soft"
@@ -323,6 +374,12 @@ type stateAccount struct {
 	// 「重启后连续计数继续累计」——上游持续 session dead 时重启归零会重学 2 次失败。
 	// 零值省略（omitempty）。
 	SessionDeadFails int `json:"session_dead_fails,omitempty"`
+	// ConsecutiveFails 连续失败计数（连败降权进度，见 entry.consecutiveFails）。
+	// 零值也显式写出（运维口径，同 session_dead_fails 的兄弟字段 err_total）。
+	ConsecutiveFails int `json:"consecutive_fails"`
+	// DegradeUntil 连败降权截止（issue #114）。仅未过期才持久化（落盘/恢复均惰性
+	// 过滤），避免降权期重启失忆；过期/零值不写。指针语义同 BreakerUntil。
+	DegradeUntil *time.Time `json:"degrade_until,omitempty"`
 
 	// BreakerUntil 熔断截止（指数退避）。仅未过期才持久化（落盘/恢复均惰性过滤），
 	// 避免熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号。过期/零值不写。
@@ -385,6 +442,23 @@ const (
 // 会误杀健康账号（P0-1：13 个 disabled 号全是误判）。3 次连续才判死：容忍偶发抖动，
 // 又不会让真正的死 session 留在池里反复被选中。
 const sessionDeadThreshold = 3
+
+// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）
+// 的默认参数，与熔断器参数族同风格（SetDegrade 注入，默认值在此）。
+//   - defaultDegradeThreshold=5：比熔断阈值 3 宽——熔断管 5xx（ErrServer，确定性
+//     上游故障），连败兜底管的是 ErrClient/传输层这类「不知道原因」的失败，判据
+//     更弱，阈值须更保守以免误伤（偶发失败被成功清零的逻辑下，5 连败已是很强的异常信号）。
+//   - defaultDegradeCooldown=10m：出池时长。取软冷却封顶（2h）与熔断基数（30m）
+//     之间：长于单次软冷却（60s 级），短于熔断基数——连败的证据强度低于熔断，
+//     惩罚不应重于熔断。
+//   - defaultDegradeCooldownMax=2h：降权时长的**上限钳制**（非指数退避封顶——
+//     连败降权为固定时长，见 degrade.go 注释「不做指数升级」），对齐
+//     defaultSoftRateMax 的量级。仅当显式配置的 degrade_cooldown 大于该值时钳制。
+const (
+	defaultDegradeThreshold   = 5
+	defaultDegradeCooldown    = 10 * time.Minute
+	defaultDegradeCooldownMax = 2 * time.Hour
+)
 
 // sessionDeadReason 12153 判定为 session 死亡时的持久化 reason。
 const sessionDeadReason = "12153 session dead"

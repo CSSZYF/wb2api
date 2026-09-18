@@ -203,11 +203,17 @@ type Config struct {
 	} `json:"upstash"`
 
 	Pool struct {
-		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
-		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
-		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
-		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
+		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
+		// 并存取更长者不叠加，成功即回池。默认 5 次 / 10m（时长固定，不做指数退避）。
+		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
@@ -251,6 +257,8 @@ type Config struct {
 	SoftRateMaxDur         time.Duration `json:"-"`
 	BreakerCooldownDur     time.Duration `json:"-"`
 	BreakerCooldownMaxD    time.Duration `json:"-"`
+	DegradeCooldownDur     time.Duration `json:"-"`
+	DegradeCooldownMaxD    time.Duration `json:"-"`
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
@@ -331,6 +339,13 @@ func Default() *Config {
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
+	// 连败降权（issue #114）默认开启：阈值 5（宽于熔断 3——ErrClient/传输层的判据
+	// 比 5xx 弱，须更保守）、固定 10m（长于单次软冷却、短于熔断基数 30m）。
+	// 「关闭」由把阈值设成很大（如 1000000）表达，不另设 enabled 开关——
+	// 与熔断阈值族同风格（无 breaker_enabled，靠阈值表达）。
+	c.Pool.DegradeThreshold = 5
+	c.Pool.DegradeCooldown = "10m"
+	c.Pool.DegradeCooldownMax = "2h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
@@ -530,6 +545,18 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	// 连败降权（issue #114）：三个键的 env 覆盖，与 JSON 同口径（名字对齐 JSON 键）。
+	if v := os.Getenv("WB2A_DEGRADE_THRESHOLD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Pool.DegradeThreshold = n
+		}
+	}
+	if v := os.Getenv("WB2A_DEGRADE_COOLDOWN"); v != "" {
+		c.Pool.DegradeCooldown = v
+	}
+	if v := os.Getenv("WB2A_DEGRADE_COOLDOWN_MAX"); v != "" {
+		c.Pool.DegradeCooldownMax = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -567,6 +594,20 @@ func (c *Config) normalize() error {
 	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
 	}
+	// 连败降权（issue #114）：时长两键空值先回落默认再解析（空串无法 ParseDuration），
+	// 非法值 fail fast——与 breaker 族同风格（见上方 soft_rate_max 的空值回落）。
+	if c.Pool.DegradeCooldown == "" {
+		c.Pool.DegradeCooldown = "10m"
+	}
+	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown: %w", err)
+	}
+	if c.Pool.DegradeCooldownMax == "" {
+		c.Pool.DegradeCooldownMax = "2h"
+	}
+	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+	}
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)
 	}
@@ -581,6 +622,11 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
+	}
+	// 连败降权阈值：<=0 回落默认 5（与 breaker_threshold 同风格；0 无「关闭」语义，
+	// 关闭请设一个极大值——见 Default() 注释）。
+	if c.Pool.DegradeThreshold <= 0 {
+		c.Pool.DegradeThreshold = 5
 	}
 	// global 在途分档：0/负数视为未设置回落默认 2（WAF 403 修复 P1-1）。
 	// 与 max_in_flight 的 0=不限语义不同——分档键的 0 没有合理语义（「global 不限」

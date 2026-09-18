@@ -199,7 +199,11 @@ function renderAccounts(list) {
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     else if (cool > 0) {
       cls = 'cool';
-      const kind = bl > (s.cool_remaining_sec || 0) ? '熔断' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却');
+      // 三态优先序：熔断（最远截止是 breaker_until）→ 连败降权（cool_kind=degrade，
+      // 后端在无生效冷却时下发的合成 kind）→ 硬冷却/软冷却。
+      const kind = bl > (s.cool_remaining_sec || 0) ? '熔断'
+        : s.cool_kind === 'degrade' ? '连败降权'
+        : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却');
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
@@ -464,6 +468,8 @@ const CFG_MAP = {
   read_timeout_seconds: ['server', 'read_timeout_seconds'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
+  degrade_threshold: ['pool', 'degrade_threshold'],
+  degrade_cooldown: ['pool', 'degrade_cooldown'], degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],

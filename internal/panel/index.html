@@ -746,7 +746,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="max_in_flight_global" type="number" min="0" placeholder="2">
                 <span class="hint">global 域在途上限（WAF 风控更紧）；0 = 回落默认 2；保存后立即生效</span></label>
               <label class="fld"><span class="lb">连续失败熔断阈值</span>
-                <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
+                <input name="breaker_threshold" type="number" min="1" placeholder="3">
+                <span class="hint">5xx 连续失败 N 次熔断（指数退避）</span></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">连败降权阈值</span>
+                <input name="degrade_threshold" type="number" min="1" placeholder="5">
+                <span class="hint">未知 4xx / 网络抖动这类「只换号不罚」的失败连败 N 次临时出池（与熔断/冷却正交，成功即回池）；填极大值 = 关闭</span></label>
+              <label class="fld"><span class="lb">降权时长</span>
+                <input name="degrade_cooldown" placeholder="10m">
+                <span class="hint">固定时长（不做指数退避）；保存后立即生效</span></label>
+              <label class="fld"><span class="lb">降权时长上限</span>
+                <input name="degrade_cooldown_max" placeholder="2h">
+                <span class="hint">仅当「降权时长」超过该值时钳制</span></label>
             </div>
             <div class="grid3">
               <label class="fld"><span class="lb">软限流冷却基数</span>

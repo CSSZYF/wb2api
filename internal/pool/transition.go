@@ -1,8 +1,8 @@
 // 账号状态机迁移的唯一权威实现。
 //
-// entry 的「可选择性」由四个正交维度决定：禁用(disabled)、账号级冷却(until/coolKind)、
-// 模型级冷却(modelCooldowns)、熔断(breakerUntil)。维度之间以「迁移原语」收拢，
-// 禁止在其他文件散写这些字段——所有入口（applyErrorPolicy / refresh / keepalive /
+// entry 的「可选择性」由五个正交维度决定：禁用(disabled)、账号级冷却(until/coolKind)、
+// 模型级冷却(modelCooldowns)、熔断(breakerUntil)、连败降权(degradeUntil)。
+// 维度之间以「迁移原语」收拢，禁止在其他文件散写这些字段——所有入口（applyErrorPolicy / refresh / keepalive /
 // 签到 / 选号）对状态的改动都必须经本文件的原语或经 Cooldown/NoteError/NoteSuccess 等
 // 封装（它们在持锁下调用本文件原语）。
 //
@@ -15,11 +15,17 @@
 //	breakerUntil       ← recordBreakerFailureLocked（NoteError 唯一喂入）；NoteSuccess 清
 //	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/Revive/reviveCoolingLocked（仅硬冷却）清
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
+//	consecutiveFails   ← NoteFailures（degrade.go，唯一喂入）；NoteSuccess/Revive 清
+//	degradeUntil       ← NoteFailures 达阈（固定时长，不做指数）；NoteSuccess/Revive 清
 //
 // 关键正交性（疑点 4 修正）：
 //   - 冷却域（until/coolKind/softStreak/modelCooldowns）与熔断器（fails/retryCount/
 //     breakerUntil）正交：冷却管「近期被限流/余额耗尽」，熔断管「反复 5xx 失败」。
 //     disableLocked 只清冷却域、不动熔断——禁用是授权/session 终态，不应覆盖熔断观测。
+//   - 连败降权（consecutiveFails/degradeUntil）与上述两域都正交：喂入口只有 NoteFailures
+//     （ErrClient/传输层这类「不罚号」失败），不读不写 fails/softStreak/until；
+//     clearCoolingLocked 不清它（禁用/余额解冻都不构成「连败根因已消失」的证据），
+//     只有 NoteSuccess（成功即回池）与 Revive（人工无条件恢复）清。
 //   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked、Revive 与
 //     reviveCoolingLocked（余额恢复解冻，issue #199 收窄后仅硬冷却）共用，
 //     对冷却域的处置因此永远一致。
@@ -28,7 +34,8 @@ package pool
 import "time"
 
 // clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
-// reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
+// reason 一并清空。熔断器（fails/retryCount/breakerUntil）与连败降权
+// （consecutiveFails/degradeUntil）不属冷却域，不动。
 // 调用方必须已持有 p.mu。
 func (e *entry) clearCoolingLocked() {
 	e.until = time.Time{}
@@ -51,6 +58,12 @@ func (e *entry) clearCoolingLocked() {
 // 且本次清账的触发条件正是「账号刚被上游实测证明可用」——与 NoteSuccess /
 // reviveCoolingLocked 的恢复语义一致（恢复即清零，退避回基数）。
 // 熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
+// 连败降权（consecutiveFails/degradeUntil）同样不动：本函数的触发条件是「冷却已到期
+// 且上游实测可用」，而降权的独立证据链是「ErrClient/传输层连败」——探活请求成功
+// 不经过 NoteSuccess（探活不是用户流量，不写成功统计），故**不**在这里顺手清降权；
+// 降权号按 degradeUntil 到期自行放行（若探活目标恰好是降权号，其请求成功也只解冻
+// 冷却维度，降权仍按自己的截止走）。这样探活的「失败零惩罚」与「只清冷却」两条
+// 边界都不被破坏。
 // 调用方必须已持有 p.mu 写锁，并负责置 dirty。
 func (e *entry) clearAccountCooldownLocked() {
 	e.until = time.Time{}
@@ -113,6 +126,9 @@ func (p *Pool) ClearModelCooldown(uid, model string) bool {
 //
 // 熔断器保留：熔断是「连续 5xx 失败」信号（与授权/会话无关），禁用后再复活时
 // 熔断观测仍有效，不应被禁用覆盖。
+// 连败降权（consecutiveFails/degradeUntil）同样保留：它是「ErrClient/传输层连败」
+// 信号，与授权/会话无关；禁用期间计数继续累计（keepalive 跳过 disabled 号，
+// 实际几乎不会增长），复活后若根因未消失应立即按既有进度继续判罚，而不是重新学。
 func (p *Pool) disableLocked(e *entry, reason string) {
 	e.clearCoolingLocked()
 	e.disabled = true

@@ -925,10 +925,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if uerr == nil && terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
+			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
+			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
+			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.UID)
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避，WAF P0-2）
@@ -1124,7 +1127,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。这是**唯一**的熔断入口。
-//   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
+//   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
+//     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池——
+//     「不知道原因的兜底」，与冷却「知道原因的惩罚」并存取更长者不叠加（healthy
+//     或门；带权威分类的错误不喂连败，防重复计罚）。ErrNone 零防御路径不喂。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
 // 携带的模型名（出站裸名：6004 记模型豁免、11102 记 (账号,模型) 负缓存）。uerr 是
@@ -1223,6 +1229,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
+		// ErrClient（未知 4xx）喂连败计数（issue #114）：连续 N 次该形态失败 →
+		// 账号临时出池（NoteFailures 达阈降权），单次/偶发不罚（不误伤）。ErrNone
+		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
+		// 注意「只换号不罚」的既有语义不变：NoteFailures 不是惩罚（不冷却/不熔断/
+		// 不 Disable/不 NoteError），只是「记录以便达阈降权」，且成功一次即清零回池。
+		if kind == upstream.ErrClient {
+			h.cfg.Pool.NoteFailures(uid)
+		}
 	}
 }
 
