@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
@@ -34,7 +35,8 @@ type chatStat struct {
 	start  time.Time
 	model  string
 	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
+	uid    string // 完整 uid，展示时只取前 8 位（绝不整串进日志）
+	nick   string // 账号昵称（auth.Auth.Nickname，登录时落盘）；空则只显示 uid8
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
@@ -57,7 +59,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -242,15 +244,20 @@ func completionTokens(resp map[string]any) int {
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
+//
+// 保留本函数是因为 logging_test.go 直接断言它；实现委托 logfmt.UID8，避免
+// "截 8 位" 的规则在 server 与 logfmt 两处各写一份而走样。
 func uidPrefix(uid string) string {
-	if uid == "" {
-		return "-"
-	}
-	if len(uid) > 8 {
-		return uid[:8]
-	}
-	return uid
+	return logfmt.UID8(uid)
 }
+
+// chatAcctWidth 流水行账号列的显示宽度（列宽非字节）。取固定宽度而不是让内容自然
+// 长度撑开，是为了让 stdout 里成百上千行能竖着扫：中文昵称按字节补空格会错位
+// （"猫" 3 字节 2 列），整张表往上缩，肉眼没法一列列对齐着看。
+//
+// 22 容纳 "昵称(uid8)"：中文昵称按 2 列/字算，5 字中文 + "(xxxxxxxx)" = 20 列，留
+// 2 列余量。只补不截（见 logfmt.Pad）：昵称超宽时让该行自然变宽，不丢信息。
+const chatAcctWidth = 22
 
 // modelLogWidth 表格日志中模型名的显示宽度（按 rune 计）。
 //
@@ -283,13 +290,25 @@ func shortModel(model string, width int) string {
 }
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
-// toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+//
+// 参数：
+//   - model：模型名（含 realm 前缀），超 modelLogWidth 按 rune 截断并补 "…"（见 shortModel）；
+//   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只打 uid8
+//     时人眼无法判断是哪个号，要辨认必须再查 auths/ 或 state.json，排障多一跳；
+//   - toks<0 表示 usage 缺失，显示 "-"。
+//
+// 账号列按**显示列宽**右补空格（logfmt.Pad）：中文昵称按 2 列/字算，不再因按字节数
+// 补齐而错位——账号列定宽后，右侧 TTFB/tok 等列在成百行里自然竖着对齐。账号列只补
+// 不截：昵称是排查主线索，超宽时宁可让该行变宽，也不丢昵称。
+func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
 	if !chatLogEnabled {
 		return
 	}
 	seq := chatSeq.Add(1)
 	model = shortModel(model, modelLogWidth)
+	// 账号列保留 "acct=" 键值前缀（上游 b61d7b4 是裸值列）：本仓日志一律键值写法
+	// （uid=/tok=/TTFB=），保留前缀才能 grep 'acct=' 直接定位账号列，不必按列序号数位。
+	acct := "acct=" + logfmt.Pad(logfmt.Label(uid, nick), chatAcctWidth)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
@@ -304,13 +323,13 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
-		uidPrefix(uid),
+		acct,
 		ttfbMS,
 		tokField,
 		tokpsField,

@@ -873,6 +873,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		st.uid = acct.UID
+		// 同步昵称：流水行只写 uid8 时无法直观看是哪个号，昵称随本次选号带入日志行
+		// （昵称认人、uid8 供 grep，见 logfmt.Label）。轮转换号时随之覆盖为最终成功号。
+		st.nick = acct.Nickname
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
