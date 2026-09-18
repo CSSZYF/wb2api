@@ -1,6 +1,6 @@
 # 仓库内一律 LF：CI 在 Linux 构建，历史上有过 CRLF 的 Dockerfile 续行隐患。
 * text=auto eol=lf
-# Windows 脚本必须 CRLF，否则 cmd.exe 解析出错（本仓库暂不提交这些）
+# Windows 脚本必须 CRLF；已提交 start/stop/status-wb2api.cmd 三件套，存盘时必须显式写 CRLF
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf

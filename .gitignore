@@ -40,6 +40,9 @@ docs/
 /login.exe
 /credit.exe
 
+# Windows \u670d\u52a1\u811a\u672c\u7684 PID \u6587\u4ef6\uff08\u8fd0\u884c\u65f6\u751f\u6210\uff0c\u4e0d\u8fdb\u7248\u672c\u5e93\uff09
+*.pid
+
 # 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
 /cmd/desktopverify*/
 *.zip

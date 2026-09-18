@@ -276,6 +276,31 @@ go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
 
+#### Windows 服务化启停（start / stop / status 三件套）
+
+上面的方式是前台运行，关掉窗口服务就停。仓库自带三个 `.cmd` 脚本，把 wb2api 作为后台服务管理：
+
+```powershell
+.\start-wb2api.cmd     # 后台启动（窗口关掉不影响），PID 落盘 wb2api.pid
+.\status-wb2api.cmd    # 进程状态（PID / 路径 / 启动时间 / 运行时长 / 内存）+ /healthz 探活
+.\stop-wb2api.cmd      # 停止（先试优雅关闭，失败转强制终止）
+```
+
+三个脚本的工作目录都自动切到脚本所在目录，因此双击运行、从任意目录调用、或放进计划任务都能正确工作。
+
+要点：
+
+- **防误杀**：`stop` / `status` 不会「按进程名杀」。它们先用 PowerShell 读取 `wb2api.pid` 里的 PID，再校验该进程的可执行文件路径 `$p.Path` **等于本目录下的 `wb2api.exe`**；不匹配（进程已退出，或 PID 被系统复用给了别的程序）时只清理陈旧的 PID 文件，**绝不 taskkill**。这比 `taskkill /IM wb2api.exe` 安全——后者会杀掉机器上任何同名的进程。
+- **不写死端口**：`status` 从 `config.json` 的 `listen` 推导探活地址（`:7863` / `0.0.0.0:7863` / `127.0.0.1:7863` / `[::]:7863` 都支持），改了端口不用改脚本。也可用环境变量 `WB2API_HEALTH_URL` 直接指定完整 URL。
+- **日志**：标准错误与标准输出分别重定向到 `data/server.err.log`（启动与运行日志）和 `data/server.out.log`（对话表格日志），与前台运行时的控制台输出内容一致。
+- **可覆盖的环境变量**：`WB2API_CONFIG`（配置文件路径，默认 `config.json`）、`WB2API_STOP_TIMEOUT`（优雅关闭等待秒数，默认 10，`0` = 直接强制终止）、`WB2API_HEALTH_URL`（status 探活地址）。
+
+`status` 的退出码可用于脚本 / 监控判断：`0` = 在跑且 `/healthz` 返回 2xx；`1` = 未运行或 PID 文件陈旧；`2` = 无法从 `config.json` 解析出探活地址；`7` = 连接失败（进程在跑但端口连不上）；`22` = HTTP 503（进程在跑但当前无可用账号）。
+
+> `stop` 会先尝试不带 `/F` 的 `taskkill`（只发 `WM_CLOSE` 关闭请求，不强制），给进程自行收尾的机会：请求被接受时，服务侧收到 `CTRL_CLOSE_EVENT`（Go 运行时映射为 SIGTERM），会先落盘 `state.json` 再优雅退出。Windows 上控制台程序多数会直接回绝该请求，此时脚本立刻转为强制终止，不会白等。`state.json` 另有每 5 秒的后台落盘兜底，强制终止最多可能少最近 5 秒的状态变动；`auths/` 下的账号凭证不受影响。
+
+> 这三个脚本按 **PID 文件**工作，因此**只管理由 `start-wb2api.cmd` 启动的实例**。手工前台运行（`wb2api.exe -config config.json`）的进程没有 PID 文件，`stop` 不会去猜进程——请用任务管理器结束，或先 `stop` 再改用 `start` 启动。
+
 ### 方式三：源码运行（开发调试）
 
 ```bash
@@ -664,6 +689,7 @@ http://127.0.0.1:7863/panel/
 | `./login.sh` | OAuth 登录 → 落盘 auth → 重启容器 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
+| `start-wb2api.cmd` / `stop-wb2api.cmd` / `status-wb2api.cmd` | Windows 服务化启停（PID 文件 + `$p.Path` 防误杀校验；status 按 `config.json` 的 `listen` 探活，退出码可用于监控，见「Windows 服务化启停」） |
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑（probe=只读 / report=单号上报 / unlock=单号领猫 / ALL=全池；写操作默认 dry-run，需 `--yes`） |
 | `python3 scripts/probe_max_tokens.py` | 探测各模型**真实输出上限**（区分静默钳制与模型主动收尾），`--panel-out` 结果可直接进面板展示（见下节） |
 
