@@ -721,10 +721,13 @@ type Client struct {
 	GlobalEnabled bool
 }
 
-// New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：禁 h2 /
+// New 生产默认值。Transport 由 newTransport() 集中构造（连接层参数：h2 默认启用 /
 // TLS 握手超时 / 短 keepalive 探测，参数见 transport.go），配置连接池减少 TLS 握手。
+//
+// 此处走 TransportOpts 零值 = 生产默认（h2 启用 + 30s/30s/90s）；cmd/server/main.go
+// 在 New() 之后立刻用 cfg.Upstream.* 调 ConfigureTransport 按配置重建。
 func New() *Client {
-	tr := newTransport()
+	tr := newTransport(TransportOpts{})
 	c := &Client{
 		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
@@ -738,6 +741,49 @@ func New() *Client {
 	// 指纹脱敏默认开（零宽脱敏默认关 = 零值），与改 atomic 前的字段默认值一致。
 	c.SetSanitizeFingerprints(true)
 	return c
+}
+
+// ConfigureTransport 按连接层配置重建共享出站 Transport，并同步替换 HTTP 与
+// ChatHTTP 两个 client 的 Transport 字段——二者**共享同一 *http.Transport 实例**
+// （连接池不重复，见 Client.ChatHTTP 注释），重建时必须一起换：只换一个会让两个
+// client 各持一份连接池，连接复用率腰斩，旧池也无人在用（泄漏到 GC 回收）。
+//
+// 调用时机：**启动装配期**（cmd/server/main.go 在 New() 之后立刻调用，且先于
+// HeaderTimeout 覆盖——重建会换掉 Transport 实例，顺序固定可避免覆盖被丢弃）。
+// 这四项（h2 开关 / TLS 握手 / 拨号 / 空闲池超时）在 restartRequiredFields 里
+// 列为「需重启」——运行期重建会换掉在途请求脚下的 Transport，不做热改。
+//
+// ResponseHeaderTimeout 从旧 Transport 沿用（旧值 >0 时）：该字段由 main 侧按
+// cfg.Upstream.HeaderTimeoutSeconds 覆盖，不属于 TransportOpts 的四项。启动期
+// 旧值仍是构造默认 120s，沿用即等价；这层兜底是为「先覆盖、后重建」的调用顺序
+// 与重复调用（幂等，不丢已配置值）。旧 Transport 的空闲连接随即关闭（启动期无
+// 连接，等价空操作；重复调用也不会把已死连接留给下一个请求）。
+func (c *Client) ConfigureTransport(opts TransportOpts) {
+	tr := newTransport(opts)
+	if old := c.sharedTransport(); old != nil {
+		if old.ResponseHeaderTimeout > 0 {
+			tr.ResponseHeaderTimeout = old.ResponseHeaderTimeout
+		}
+		old.CloseIdleConnections()
+	}
+	if c.HTTP != nil {
+		c.HTTP.Transport = tr
+	}
+	if c.ChatHTTP != nil {
+		c.ChatHTTP.Transport = tr
+	}
+}
+
+// sharedTransport 返回当前共享出站 Transport（HTTP 优先，非 *http.Transport 或
+// 未设置时返回 nil）。供 ConfigureTransport 沿用旧字段与测试回读断言。
+func (c *Client) sharedTransport() *http.Transport {
+	if c.HTTP == nil {
+		return nil
+	}
+	if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
+		return tr
+	}
+	return nil
 }
 
 // SetSanitizeFingerprints 热改出站请求体指纹脱敏开关（面板保存配置路径调用）。

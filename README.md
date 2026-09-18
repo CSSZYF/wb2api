@@ -363,6 +363,10 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
+| `upstream.disable_http2` | `false` | **默认启用 HTTP/2**。走 TUN 代理（verge-mihomo）时 CN 上游链路握手长，实测（各 10 次）允许 h2 = HTTP/2.0 + 连接复用 **90%** + 握手首次 1123ms / 后续 92-98ms；禁 h2 = HTTP/1.1 且 abort 模式复用率 **0%**（每请求重新握手）→ 频繁 TLS handshake timeout。仅当 h2 复用异常时置 `true` 退回 HTTP/1.1（逃生门）。**需重启** |
+| `upstream.tls_handshake_timeout_seconds` | `30` | TLS 握手上限（0 / 负数回落 30）。国内网络握手常态 >10s，勿调小。**需重启** |
+| `upstream.dial_timeout_seconds` | `30` | TCP 建连上限（0 / 负数回落 30）。半死连接快速失败闸门。**需重启** |
+| `upstream.idle_conn_timeout_seconds` | `90` | 空闲连接池保留时长（0 / 负数回落 90）。过小则连接刚建好就过期、每请求重新握手。**需重启** |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
@@ -392,7 +396,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_DISABLE_HTTP2`(bool) · `WB2A_TLS_HANDSHAKE_TIMEOUT_SECONDS` · `WB2A_DIAL_TIMEOUT_SECONDS` · `WB2A_IDLE_CONN_TIMEOUT_SECONDS`
 
 ## 核心行为语义
 

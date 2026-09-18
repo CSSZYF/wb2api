@@ -972,3 +972,150 @@ func TestRestartRequiredFieldsSessionTTLHotApplied(t *testing.T) {
 		t.Errorf("session_sticky.gc_interval 仍应需重启，清单里缺失: %v", got)
 	}
 }
+
+// TestUpstreamConnLayerDefaults 连接层四项缺省：h2 **启用**（DisableHTTP2 零值
+// false）+ 30/30/90。h2 默认启用是本任务的核心约定（CN 上游走 TUN 代理实测：
+// 允许 h2 复用 90%，禁 h2 复用率 0%）——这条锁住默认值不被回退成 HTTP/1.1。
+func TestUpstreamConnLayerDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Upstream.DisableHTTP2 {
+		t.Error("disable_http2 缺省必须为 false（= 启用 h2）")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 30 {
+		t.Errorf("tls_handshake_timeout_seconds=%d want 30", c.Upstream.TLSHandshakeTimeoutSeconds)
+	}
+	if c.Upstream.DialTimeoutSeconds != 30 {
+		t.Errorf("dial_timeout_seconds=%d want 30", c.Upstream.DialTimeoutSeconds)
+	}
+	if c.Upstream.IdleConnTimeoutSeconds != 90 {
+		t.Errorf("idle_conn_timeout_seconds=%d want 90（30s 太激进，v1.9.6 的 90s 实测顺滑）", c.Upstream.IdleConnTimeoutSeconds)
+	}
+}
+
+// TestUpstreamConnLayerJSONRoundTrip JSON 键名往返：四个键按任务书约定的
+// snake_case 落盘，且 Default() 序列化后含这四个键（面板/样例文件同口径）。
+func TestUpstreamConnLayerJSONRoundTrip(t *testing.T) {
+	raw, err := json.Marshal(Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		`"disable_http2"`, `"tls_handshake_timeout_seconds"`,
+		`"dial_timeout_seconds"`, `"idle_conn_timeout_seconds"`,
+	} {
+		if !strings.Contains(string(raw), key) {
+			t.Errorf("Default() 序列化缺 JSON 键 %s", key)
+		}
+	}
+}
+
+// TestUpstreamConnLayerFileOverride 文件覆盖：四个键各自独立生效（含 h2 显式关闭）。
+func TestUpstreamConnLayerFileOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"disable_http2":true,"tls_handshake_timeout_seconds":15,`+
+		`"dial_timeout_seconds":7,"idle_conn_timeout_seconds":45}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Upstream.DisableHTTP2 {
+		t.Error("disable_http2=true 应生效（显式关闭 h2）")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 15 {
+		t.Errorf("tls_handshake_timeout_seconds=%d want 15", c.Upstream.TLSHandshakeTimeoutSeconds)
+	}
+	if c.Upstream.DialTimeoutSeconds != 7 {
+		t.Errorf("dial_timeout_seconds=%d want 7", c.Upstream.DialTimeoutSeconds)
+	}
+	if c.Upstream.IdleConnTimeoutSeconds != 45 {
+		t.Errorf("idle_conn_timeout_seconds=%d want 45", c.Upstream.IdleConnTimeoutSeconds)
+	}
+}
+
+// TestUpstreamConnLayerInvalidFallsBack 非法值回落：三个超时 0 / 负数一律回落
+// 推荐值（30/30/90），不报错——与 max_rotate / max_in_flight_global 同风格，
+// 「0 没有合理语义」时回落默认而非让部署起不来。显式 0 的 disable_http2 无回落
+// 语义（bool false 就是「启用 h2」）。
+func TestUpstreamConnLayerInvalidFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"disable_http2":false,"tls_handshake_timeout_seconds":0,`+
+		`"dial_timeout_seconds":-5,"idle_conn_timeout_seconds":-1}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("非法值应回落而非报错: %v", err)
+	}
+	if c.Upstream.DisableHTTP2 {
+		t.Error("disable_http2=false 应保持 false（启用 h2）")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 30 {
+		t.Errorf("tls_handshake_timeout_seconds=%d want 回落 30", c.Upstream.TLSHandshakeTimeoutSeconds)
+	}
+	if c.Upstream.DialTimeoutSeconds != 30 {
+		t.Errorf("dial_timeout_seconds=%d want 回落 30", c.Upstream.DialTimeoutSeconds)
+	}
+	if c.Upstream.IdleConnTimeoutSeconds != 90 {
+		t.Errorf("idle_conn_timeout_seconds=%d want 回落 90", c.Upstream.IdleConnTimeoutSeconds)
+	}
+}
+
+// TestUpstreamConnLayerEnvOverride env 覆盖（与 JSON/面板同口径）。
+func TestUpstreamConnLayerEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_DISABLE_HTTP2", "true")
+	t.Setenv("WB2A_TLS_HANDSHAKE_TIMEOUT_SECONDS", "25")
+	t.Setenv("WB2A_DIAL_TIMEOUT_SECONDS", "26")
+	t.Setenv("WB2A_IDLE_CONN_TIMEOUT_SECONDS", "27")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Upstream.DisableHTTP2 {
+		t.Error("WB2A_DISABLE_HTTP2=true 应生效")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 25 || c.Upstream.DialTimeoutSeconds != 26 || c.Upstream.IdleConnTimeoutSeconds != 27 {
+		t.Errorf("env 覆盖失败: %+v", c.Upstream)
+	}
+}
+
+// TestUpstreamConnLayerEnvInvalidIgnored env 非法值忽略（保持文件/默认值），
+// 与既有 WB2A_PASSTHROUGH_IP 的 ParseBool 口径一致。
+func TestUpstreamConnLayerEnvInvalidIgnored(t *testing.T) {
+	t.Setenv("WB2A_DISABLE_HTTP2", "notabool")
+	t.Setenv("WB2A_TLS_HANDSHAKE_TIMEOUT_SECONDS", "abc")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.DisableHTTP2 {
+		t.Error("非法 bool 应忽略（保持默认 false = 启用 h2）")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 30 {
+		t.Errorf("非法 int 应忽略（保持默认 30），got %d", c.Upstream.TLSHandshakeTimeoutSeconds)
+	}
+}
+
+// TestRestartRequiredFieldsConnLayer 连接层四项必须在「需重启」清单里：
+// Transport 是装配期对象（HTTP/ChatHTTP 共享），运行期重建会换掉在途请求脚下的
+// Transport，刻意不做热改。清单缺项 → 面板提示"已立即生效"，而实际要重启才生效。
+func TestRestartRequiredFieldsConnLayer(t *testing.T) {
+	got := restartRequiredFields(Default())
+	want := []string{
+		"upstream.disable_http2",
+		"upstream.tls_handshake_timeout_seconds",
+		"upstream.dial_timeout_seconds",
+		"upstream.idle_conn_timeout_seconds",
+	}
+	set := map[string]bool{}
+	for _, f := range got {
+		set[f] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			t.Errorf("需重启清单缺 %s: %v", w, got)
+		}
+	}
+}

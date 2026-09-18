@@ -775,6 +775,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="idle_timeout_seconds" type="number" min="1" placeholder="300">
                 <span class="hint">需重启</span></label>
             </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">TLS 握手上限（秒）</span>
+                <input name="tls_handshake_timeout_seconds" type="number" min="1" placeholder="30">
+                <span class="hint">国内网络握手常态 &gt;10s，勿调小；留空/≤0 回落 30；需重启</span></label>
+              <label class="fld"><span class="lb">建连上限（秒）</span>
+                <input name="dial_timeout_seconds" type="number" min="1" placeholder="30">
+                <span class="hint">TCP 建连快速失败闸门；留空/≤0 回落 30；需重启</span></label>
+              <label class="fld"><span class="lb">空闲连接保留（秒）</span>
+                <input name="idle_conn_timeout_seconds" type="number" min="1" placeholder="90">
+                <span class="hint">过小则连接刚建好就过期（每请求重握手）；留空/≤0 回落 90；需重启</span></label>
+            </div>
             <div class="hr"></div>
             <div class="grid3">
               <label class="fld"><span class="lb">请求体上限（MB）</span>
@@ -837,6 +848,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">透传客户端 IP</span>
               <input type="checkbox" name="passthrough_ip">
               <span class="hint">向上游注入 X-Forwarded-For / X-Real-IP；默认关（反代安全边界）；需重启</span></div>
+            <div class="switch"><span class="lb">禁用 HTTP/2</span>
+              <input type="checkbox" name="disable_http2">
+              <span class="hint">默认不勾选 = 启用 h2（实测走 TUN 代理时连接复用 90%、握手快；禁 h2 复用率 0% 易触发 TLS 握手超时）。仅当 h2 复用异常时勾选退回 HTTP/1.1；需重启</span></div>
             <div class="switch"><span class="lb">对外模型名去域前缀</span>
               <input type="checkbox" name="strip_realm_prefix">
               <span class="hint">勾选（缺省）= /v1/models 输出裸名；取消 = 保留 cn: / global: 前缀；需重启</span></div>

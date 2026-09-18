@@ -129,6 +129,24 @@ func main() {
 	}
 
 	up := upstream.New()
+	// 连接层四项（h2 开关 / TLS 握手 / 拨号 / 空闲池）按配置重建共享 Transport：
+	// Transport 是 HTTP 与 ChatHTTP 的共享实例（连接池不重复），ConfigureTransport
+	// 同步替换两者。配置缺键 = TransportOpts 零值 = **h2 启用** + 30/30/90，与用户
+	// 实测结论一致（TUN 代理下 h2 复用 90%，禁 h2 复用率 0%）。
+	// 重建放在最前：后续按 config 覆盖的 client/transport 字段一律落在最终实例上。
+	up.ConfigureTransport(upstream.TransportOpts{
+		DisableHTTP2:        cfg.Upstream.DisableHTTP2,
+		TLSHandshakeTimeout: time.Duration(cfg.Upstream.TLSHandshakeTimeoutSeconds) * time.Second,
+		DialTimeout:         time.Duration(cfg.Upstream.DialTimeoutSeconds) * time.Second,
+		IdleConnTimeout:     time.Duration(cfg.Upstream.IdleConnTimeoutSeconds) * time.Second,
+	})
+	if cfg.Upstream.DisableHTTP2 {
+		log.Printf("上游连接层：HTTP/2 已禁用（HTTP/1.1）；TLS 握手 %ds / 拨号 %ds / 空闲池 %ds",
+			cfg.Upstream.TLSHandshakeTimeoutSeconds, cfg.Upstream.DialTimeoutSeconds, cfg.Upstream.IdleConnTimeoutSeconds)
+	} else {
+		log.Printf("上游连接层：HTTP/2 启用；TLS 握手 %ds / 拨号 %ds / 空闲池 %ds",
+			cfg.Upstream.TLSHandshakeTimeoutSeconds, cfg.Upstream.DialTimeoutSeconds, cfg.Upstream.IdleConnTimeoutSeconds)
+	}
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
@@ -446,6 +464,11 @@ func restartRequiredFields(c *Config) []string {
 		out = append(out, "state_file")
 	}
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
+	// 连接层四项同样是装配期依赖：Transport 在启动时按配置构造一次（见 main 的
+	// ConfigureTransport 调用），HTTP 与 ChatHTTP 共享该实例；运行期重建会换掉
+	// 在途请求脚下的 Transport，刻意不做热改。
+	out = append(out, "upstream.disable_http2", "upstream.tls_handshake_timeout_seconds",
+		"upstream.dial_timeout_seconds", "upstream.idle_conn_timeout_seconds")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

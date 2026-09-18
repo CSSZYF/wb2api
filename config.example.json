@@ -52,7 +52,11 @@
     "client_name": "",
     "device_token": "",
     "device_token_file": "",
-    "passthrough_ip": false
+    "passthrough_ip": false,
+    "disable_http2": false,
+    "tls_handshake_timeout_seconds": 30,
+    "dial_timeout_seconds": 30,
+    "idle_conn_timeout_seconds": 90
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,

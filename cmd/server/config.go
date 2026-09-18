@@ -113,6 +113,25 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// DisableHTTP2 是否禁用出站 HTTP/2（默认 **false = 启用 h2**）。
+		// 默认启用的依据（2026-09-18 CN 上游各 10 次实测）：走 TUN 代理
+		// （verge-mihomo）时链路握手长——允许 h2 为 HTTP/2.0、连接复用 90%、
+		// TLS 握手首次 1123ms 后续 92-98ms；禁 h2 为 HTTP/1.1 且 abort 模式下
+		// 复用率 0%（每请求重新握手）→ 频繁 TLS handshake timeout。
+		// 语义用「disable」而非「enable」：h2 是默认行为，本键只描述要不要关掉，
+		// 缺键（JSON 零值 false）天然落在「启用」一侧，漏配不会被静默降级。
+		// 显式 true = 逃生门（h2 半死流复用异常时退回 HTTP/1.1）。
+		DisableHTTP2 bool `json:"disable_http2"`
+		// TLSHandshakeTimeoutSeconds TLS 握手上限，默认 30（<=0 回落 30）。
+		// 10s 在国内网络过紧（实测常态 >10s 会误杀重试），30s 与 dial 取齐。
+		TLSHandshakeTimeoutSeconds int `json:"tls_handshake_timeout_seconds"`
+		// DialTimeoutSeconds TCP 建连上限，默认 30（<=0 回落 30）。半死连接的
+		// 第一道闸：连不上快速失败轮转换号，不干等系统 TCP 重传窗口。
+		DialTimeoutSeconds int `json:"dial_timeout_seconds"`
+		// IdleConnTimeoutSeconds 空闲连接池保留时长，默认 90（<=0 回落 90）。
+		// 从 30s 回退到 90s：30s 太激进（连接刚建好就过期，h2 下一条连接承载
+		// 全部流，被回收等于下个请求重新握手）；v1.9.6 用 90s 实测表现顺滑。
+		IdleConnTimeoutSeconds int `json:"idle_conn_timeout_seconds"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -231,6 +250,13 @@ func Default() *Config {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
+	// 连接层四项（h2 / 握手 / 拨号 / 空闲池）：h2 默认启用——DisableHTTP2 不在此
+	// 显式赋值，靠 bool 零值 false = 启用（语义见字段注释；反写成 enable 语义就会
+	// 出现「漏配一项即静默退回 HTTP/1.1」）；三个超时显式给推荐值，<=0 在
+	// normalize() 回落同一批值（幂等）。
+	c.Upstream.TLSHandshakeTimeoutSeconds = 30
+	c.Upstream.DialTimeoutSeconds = 30
+	c.Upstream.IdleConnTimeoutSeconds = 90
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
@@ -394,6 +420,27 @@ func applyEnv(c *Config) {
 			c.Upstream.PassthroughIP = b
 		}
 	}
+	// 连接层四项 env 覆盖（与面板/JSON 同口径；名字对齐 JSON 键）。
+	if v := os.Getenv("WB2A_DISABLE_HTTP2"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.DisableHTTP2 = b
+		}
+	}
+	if v := os.Getenv("WB2A_TLS_HANDSHAKE_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.TLSHandshakeTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_DIAL_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.DialTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_IDLE_CONN_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.IdleConnTimeoutSeconds = n
+		}
+	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
@@ -481,6 +528,19 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	// 连接层三项超时：<=0 一律回落推荐值（与 Default() 同值，幂等）。不回落到
+	// timeout_seconds——它们语义独立（握手/建连是连接层，timeout_seconds 是短
+	// RPC 总时长），混用会让「短请求超时调小」意外把握手闸门也收紧。
+	// DisableHTTP2 无回落：bool 的 false 就是「启用 h2」（默认），无需兜底。
+	if c.Upstream.TLSHandshakeTimeoutSeconds <= 0 {
+		c.Upstream.TLSHandshakeTimeoutSeconds = 30
+	}
+	if c.Upstream.DialTimeoutSeconds <= 0 {
+		c.Upstream.DialTimeoutSeconds = 30
+	}
+	if c.Upstream.IdleConnTimeoutSeconds <= 0 {
+		c.Upstream.IdleConnTimeoutSeconds = 90
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

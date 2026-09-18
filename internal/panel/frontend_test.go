@@ -131,6 +131,48 @@ func TestAppJSAccountsModelLimitWiring(t *testing.T) {
 	}
 }
 
+// TestAppJSConnLayerWiring 连接层四项（h2 开关 / TLS 握手 / 拨号 / 空闲池）的
+// 面板接线必须齐全：CFG_MAP 四键 + index.html 表单项。app.js/index.html 是
+// go:embed 静态资源，Go 编译器不校验其内容——少一处映射，用户在面板改了
+// 「禁用 HTTP/2」或三个超时保存后后端收不到该键，静默不生效（用户抱怨的正是
+// "面板看不到 TLS 配置"，见任务书）。同 TestAppJSMaxRotateWiring 的动因。
+//
+// h2 的默认语义额外锁一层：checkbox 未勾选 = false = **启用 h2**（不能写成
+// "启用 HTTP/2" 的勾选语义——那会让缺省态变成禁用）。
+func TestAppJSConnLayerWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+	for _, must := range []string{
+		`disable_http2: ['upstream', 'disable_http2']`,
+		`tls_handshake_timeout_seconds: ['upstream', 'tls_handshake_timeout_seconds']`,
+		`dial_timeout_seconds: ['upstream', 'dial_timeout_seconds']`,
+		`idle_conn_timeout_seconds: ['upstream', 'idle_conn_timeout_seconds']`,
+	} {
+		if !strings.Contains(s, must) {
+			t.Errorf("app.js 缺连接层 CFG_MAP 映射：%s", must)
+		}
+	}
+
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, want := range []string{
+		`name="disable_http2"`, `type="checkbox" name="disable_http2"`, // 复选框（缺省不勾 = 启用 h2）
+		`name="tls_handshake_timeout_seconds"`,
+		`name="dial_timeout_seconds"`,
+		`name="idle_conn_timeout_seconds"`,
+	} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 缺连接层表单项 %s", want)
+		}
+	}
+}
+
 // jsFuncBody 返回 src 中名为 sig（形如 "function foo("）的函数体文本，用于把源码断言
 // 收窄到单个函数——否则全文件搜索会被别处的同名片段放行。朴素花括号配对（本仓 app.js
 // 无模板字符串嵌套花括号的写法，够用）；找不到函数名返回空串。
