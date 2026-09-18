@@ -206,3 +206,151 @@ func TestTransitionReenableOnlyHardCooling(t *testing.T) {
 		t.Fatal("余额刷新不得清熔断")
 	}
 }
+
+// TestClearModelCooldownOnlyTargetModel 单模型解冻的边界：只删指定模型的条目，
+// 同账号其他模型的冷却、账号级冷却域（until/coolKind/softStreak）与熔断器全部原样。
+// 这是「面板测试成功 → 只解冻这个模型」的底层语义（Chen 需求），多模型独立冷却
+// 不能被顺手整表清掉。
+func TestClearModelCooldownOnlyTargetModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 账号级冷却域 + 熔断域：解冻单模型绝不能碰（单模型可用 ≠ 账号级恢复）。
+	// 顺序有意为之：CooldownSoftRate 会清 modelCooldowns（账号级限流不产生模型豁免），
+	// 故模型级条目必须在其后写入。
+	p.CooldownSoftRate("u1", time.Hour, time.Time{}, "429 rate limit")
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // 触发熔断
+	// 两个模型级冷却：6004 形态（ResetAt 非零）+ 11102 形态（Reason 前缀，ResetAt 零值）。
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+
+	before, _ := p.Status("u1")
+	if !p.ClearModelCooldown("u1", "glm-5.3") {
+		t.Fatal("ClearModelCooldown 应返回 true（条目存在）")
+	}
+
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	_, gone := e.modelCooldowns["glm-5.3"]
+	_, kept := e.modelCooldowns["deepseek-v3-2-volc"]
+	until, kind, streak := e.until, e.coolKind, e.softStreak
+	p.mu.RUnlock()
+	if gone {
+		t.Errorf("glm-5.3 条目应被清除（本次解冻目标）")
+	}
+	if !kept {
+		t.Errorf("deepseek-v3-2-volc 条目不得被连带清除（模型级冷却各自独立）")
+	}
+	if until.IsZero() || kind != CoolSoft || streak != before.SoftStreak {
+		t.Errorf("账号级冷却域被改写：until=%v kind=%v streak=%d（want 非零/soft/%d）",
+			until, kind, streak, before.SoftStreak)
+	}
+	after, _ := p.Status("u1")
+	if !after.Cooling || after.CoolKind != "soft_rate" {
+		t.Errorf("账号级冷却必须保留（单模型成功不构成账号级恢复的证据）: %+v", after)
+	}
+	if after.BreakerFails != before.BreakerFails || !after.BreakerUntil.Equal(before.BreakerUntil) {
+		t.Errorf("熔断器不得被单模型解冻改动：before fails=%d until=%v after fails=%d until=%v",
+			before.BreakerFails, before.BreakerUntil, after.BreakerFails, after.BreakerUntil)
+	}
+	// 台账只剩另一个模型：解除后该模型的限额行应立即从 /status 消失。
+	if len(after.RateLimitedModels) != 1 || after.RateLimitedModels[0].Model != "deepseek-v3-2-volc" {
+		t.Errorf("rate_limited_models=%+v want 只剩 deepseek-v3-2-volc", after.RateLimitedModels)
+	}
+	// 6004 条目本就只锁模型：账号级冷却仍在时 healthyForModel 一律 false（冷却域优先），
+	// 这里只断言台账口径，避免与「账号级未恢复」的语义混为一谈。
+}
+
+// TestClearModelCooldownRestoresHealthyForModel 11102 负缓存解冻后立即可再选号：
+// BlockModelBackoff 制造的 6h 冷却被 ClearModelCooldown 提前解除（不必等 TTL），
+// healthyForModel 与选号器都恢复放行该 (账号, 模型)。
+func TestClearModelCooldownRestoresHealthyForModel(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.BlockModelBackoff("u1", "deepseek-v3-2-volc", "11102 model not available")
+
+	// 前置：负缓存生效（healthyForModel=false，选号跳过 u1 → 池里仅此一号 → 返回 nil）。
+	if p.byUID["u1"].healthyForModel(time.Now(), "deepseek-v3-2-volc") {
+		t.Fatal("precondition: 11102 后该模型应被拦截")
+	}
+	if got := p.PickExcludingForModel(nil, "deepseek-v3-2-volc"); got != nil {
+		t.Fatalf("precondition: 唯一账号被负缓存时该模型应选不出号，got %+v", got)
+	}
+
+	if !p.ClearModelCooldown("u1", "deepseek-v3-2-volc") {
+		t.Fatal("ClearModelCooldown 应返回 true")
+	}
+	if !p.byUID["u1"].healthyForModel(time.Now(), "deepseek-v3-2-volc") {
+		t.Error("解冻后 healthyForModel 应恢复 true（该模型可再被选号）")
+	}
+	if got := p.PickExcludingForModel(nil, "deepseek-v3-2-volc"); got == nil || got.UID != "u1" {
+		t.Errorf("解冻后选号器应放行 u1，got %+v", got)
+	}
+	// 空表归 nil：最后一个条目被清后不留空 map（与 clearCoolingLocked/落盘口径一致）。
+	p.mu.RLock()
+	nilMap := p.byUID["u1"].modelCooldowns == nil
+	p.mu.RUnlock()
+	if !nilMap {
+		t.Error("清掉最后一个条目后 modelCooldowns 应为 nil（不留空 map）")
+	}
+}
+
+// TestClearModelCooldownNilMapAndMissingModels map 为 nil / 条目不存在 / 账号不存在
+// / 空参数一律空操作并返回 false（调用方据此决定是否打日志，绝不 panic）。
+func TestClearModelCooldownNilMapAndMissingModels(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"}) // modelCooldowns 为 nil（从未有过模型级冷却）
+
+	if p.ClearModelCooldown("u1", "m") {
+		t.Error("modelCooldowns 为 nil 时应返回 false（空操作）")
+	}
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(10*time.Minute), "a", "6004 model rate limit")
+	if p.ClearModelCooldown("u1", "b") {
+		t.Error("条目不存在（仅 a 在冷却）时应返回 false")
+	}
+	if p.ClearModelCooldown("no-such-uid", "a") {
+		t.Error("账号不存在时应返回 false")
+	}
+	if p.ClearModelCooldown("", "a") || p.ClearModelCooldown("u1", "") {
+		t.Error("空 uid/model 应为空操作返回 false")
+	}
+	// 上述空操作都不得碰既有条目。
+	p.mu.RLock()
+	_, kept := p.byUID["u1"].modelCooldowns["a"]
+	p.mu.RUnlock()
+	if !kept {
+		t.Error("空操作调用不得删除既有条目 a")
+	}
+	if got := p.ClearModelCooldown("u1", "a"); !got {
+		t.Error("条目 a 存在时应返回 true")
+	}
+	if p.ClearModelCooldown("u1", "a") {
+		t.Error("条目已被清，二次调用应返回 false（幂等语义）")
+	}
+}
+
+// TestClearModelCooldownDirtyFlag 解冻必须置脏位（落盘）：缓存解冻不落盘会在重启后
+// 复活——6004 单模型冷却可长达数小时，跨重启是常态（见 stateAccount.ModelCooldowns）。
+// 真清→脏位置位；空操作→不凭空置位（与 NoteSuccess 等入口的既有口径一致）。
+func TestClearModelCooldownDirtyFlag(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(10*time.Minute), "a", "6004 model rate limit")
+
+	p.dirty.Store(false)
+	if !p.ClearModelCooldown("u1", "a") {
+		t.Fatal("应返回 true")
+	}
+	if !p.dirty.Load() {
+		t.Error("真清冷却后应置 dirty（否则重启后负缓存复活）")
+	}
+
+	p.dirty.Store(false)
+	if p.ClearModelCooldown("u1", "a") {
+		t.Fatal("条目已清，应返回 false")
+	}
+	if p.dirty.Load() {
+		t.Error("空操作不应置 dirty")
+	}
+}
