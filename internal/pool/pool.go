@@ -26,6 +26,13 @@ type Pool struct {
 	// softRateMax 软冷却的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）：
 	// 同时封顶「无重置时间的有界退避」与「对齐上游重置墙钟时的截断」。
 	softRateMax time.Duration
+	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
+	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
+	// 与熔断参数族完全独立：阈值管「不罚号的失败连败几次出池」，时长是固定值
+	// （不做指数退避），封顶只做上限钳制。
+	degradeThreshold   int
+	degradeCooldown    time.Duration
+	degradeCooldownMax time.Duration
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -59,6 +66,9 @@ func New(stateFp string) *Pool {
 		breakerThreshold:   defaultBreakerThreshold,
 		breakerCooldown:    defaultBreakerCooldown,
 		breakerCooldownMax: defaultBreakerCooldownMax,
+		degradeThreshold:   defaultDegradeThreshold,
+		degradeCooldown:    defaultDegradeCooldown,
+		degradeCooldownMax: defaultDegradeCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 	}
@@ -105,6 +115,24 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	defer p.mu.Unlock()
 	if d > 0 {
 		p.softRateMax = d
+	}
+}
+
+// SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。
+// 非正值保留原值（用默认，见 defaultDegrade*），风格同 SetBreaker/SetSoftRateMax。
+// 三个参数各管一段：threshold 是连败几次出池；cooldown 是固定出池时长；
+// cooldownMax 只做时长上限钳制（连败降权不做指数退避，见 degrade.go）。
+func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if threshold > 0 {
+		p.degradeThreshold = threshold
+	}
+	if cooldown > 0 {
+		p.degradeCooldown = cooldown
+	}
+	if cooldownMax > 0 {
+		p.degradeCooldownMax = cooldownMax
 	}
 }
 

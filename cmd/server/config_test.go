@@ -191,6 +191,131 @@ func TestBadSoftRateMax(t *testing.T) {
 	}
 }
 
+// TestDegradeConfigDefaults 连败降权三键默认值（issue #114）：5 次 / 10m / 封顶 2h。
+// 默认开启但阈值保守（宽于熔断 3）：ErrClient/传输层的判据比 5xx 弱。
+func TestDegradeConfigDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Pool.DegradeThreshold != 5 {
+		t.Errorf("degrade_threshold=%d want 5", c.Pool.DegradeThreshold)
+	}
+	if c.DegradeCooldownDur.Minutes() != 10 {
+		t.Errorf("degrade_cooldown=%v want 10m", c.DegradeCooldownDur)
+	}
+	if c.DegradeCooldownMaxD.Hours() != 2 {
+		t.Errorf("degrade_cooldown_max=%v want 2h", c.DegradeCooldownMaxD)
+	}
+}
+
+// TestDegradeConfigParsedFromFile 连败降权三键可从 config.json 覆盖。
+func TestDegradeConfigParsedFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"degrade_threshold":9,"degrade_cooldown":"3m","degrade_cooldown_max":"45m"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pool.DegradeThreshold != 9 {
+		t.Errorf("degrade_threshold=%d want 9", c.Pool.DegradeThreshold)
+	}
+	if c.DegradeCooldownDur.Minutes() != 3 {
+		t.Errorf("degrade_cooldown=%v want 3m", c.DegradeCooldownDur)
+	}
+	if c.DegradeCooldownMaxD.Minutes() != 45 {
+		t.Errorf("degrade_cooldown_max=%v want 45m", c.DegradeCooldownMaxD)
+	}
+}
+
+// TestDegradeConfigEmptyFallsBackToDefault 时长两键空串回落默认（空串无法
+// ParseDuration，与 soft_rate_max 同口径）；阈值 0/负数回落默认 5。
+func TestDegradeConfigEmptyFallsBackToDefault(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"degrade_threshold":0,"degrade_cooldown":"","degrade_cooldown_max":""}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("空值应回落默认而非报错: %v", err)
+	}
+	if c.Pool.DegradeThreshold != 5 {
+		t.Errorf("degrade_threshold=%d want 5（0 回落默认）", c.Pool.DegradeThreshold)
+	}
+	if c.DegradeCooldownDur.Minutes() != 10 {
+		t.Errorf("degrade_cooldown=%v want 10m（空串回落默认）", c.DegradeCooldownDur)
+	}
+	if c.DegradeCooldownMaxD.Hours() != 2 {
+		t.Errorf("degrade_cooldown_max=%v want 2h（空串回落默认）", c.DegradeCooldownMaxD)
+	}
+	// 负数阈值同样回落默认。
+	c2 := Default()
+	c2.Pool.DegradeThreshold = -3
+	if err := c2.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c2.Pool.DegradeThreshold != 5 {
+		t.Errorf("degrade_threshold=-3 normalize 后=%d want 5", c2.Pool.DegradeThreshold)
+	}
+}
+
+// TestBadDegradeCooldown 非法时长 fail fast（拼写错误不静默吞掉，与 breaker 族同风格）。
+func TestBadDegradeCooldown(t *testing.T) {
+	for _, key := range []string{"degrade_cooldown", "degrade_cooldown_max"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(`{"pool":{"`+key+`":"oops"}}`), 0o600)
+		if _, err := Load(fp); err == nil {
+			t.Fatalf("want error for bad %s", key)
+		}
+	}
+}
+
+// TestDegradeEnvOverride env WB2A_DEGRADE_* 非空覆盖 JSON 值（与面板/JSON 同口径）。
+func TestDegradeEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"degrade_threshold":7,"degrade_cooldown":"5m","degrade_cooldown_max":"30m"}}`), 0o600)
+	t.Setenv("WB2A_DEGRADE_THRESHOLD", "11")
+	t.Setenv("WB2A_DEGRADE_COOLDOWN", "2m")
+	t.Setenv("WB2A_DEGRADE_COOLDOWN_MAX", "20m")
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pool.DegradeThreshold != 11 {
+		t.Errorf("degrade_threshold=%d want 11（env 覆盖）", c.Pool.DegradeThreshold)
+	}
+	if c.DegradeCooldownDur.Minutes() != 2 {
+		t.Errorf("degrade_cooldown=%v want 2m（env 覆盖）", c.DegradeCooldownDur)
+	}
+	if c.DegradeCooldownMaxD.Minutes() != 20 {
+		t.Errorf("degrade_cooldown_max=%v want 20m（env 覆盖）", c.DegradeCooldownMaxD)
+	}
+}
+
+// TestDegradeJSONKeyRoundTrip 三键的 JSON tag 名与 config.example.json 一致
+// （面板按同名键读写，tag 改了面板静默不生效）。
+func TestDegradeJSONKeyRoundTrip(t *testing.T) {
+	c := Default()
+	c.Pool.DegradeThreshold = 8
+	c.Pool.DegradeCooldown = "4m"
+	c.Pool.DegradeCooldownMax = "40m"
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"degrade_threshold":8`, `"degrade_cooldown":"4m"`, `"degrade_cooldown_max":"40m"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("config JSON 缺键 %s", want)
+		}
+	}
+	// 解析后字段（json:"-"）不得出现在 JSON 里。
+	if strings.Contains(string(raw), "DegradeCooldownDur") {
+		t.Error("解析后字段不应序列化（应为 json:\"-\"）")
+	}
+}
+
 func TestBadBreakerCooldown(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")

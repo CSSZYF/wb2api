@@ -60,6 +60,45 @@ func TestAppJSMaxRotateWiring(t *testing.T) {
 	}
 }
 
+// TestAppJSDegradeWiring 连败降权三键的面板接线必须齐全（issue #114）：CFG_MAP 映射
+// （否则表单值与后端对不上，输入框读不到也存不进去）+ 数字/文本输入项存在 + 账号表
+// 状态列能显示降权态（cool_kind=degrade → 「连败降权」标签）。
+// app.js/index.html 是 go:embed 静态资源，Go 编译器不校验其内容——少一处映射，用户改了
+// 「连败降权阈值」保存后后端收不到该键，静默不生效（与 TestAppJSMaxRotateWiring 同因）。
+func TestAppJSDegradeWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+	for _, must := range []string{
+		`degrade_threshold: ['pool', 'degrade_threshold']`,
+		`degrade_cooldown: ['pool', 'degrade_cooldown']`,
+		`degrade_cooldown_max: ['pool', 'degrade_cooldown_max']`,
+		// 状态列渲染：后端在纯降权态下发 cool_kind=degrade，前端必须翻译成人话，
+		// 否则用户看到的是「限流冷却」（误导——降权不是限流）。
+		`'degrade'`,
+		`连败降权`,
+	} {
+		if !strings.Contains(s, must) {
+			t.Errorf("app.js 缺少连败降权接线：%s", must)
+		}
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`name="degrade_threshold"`,
+		`name="degrade_cooldown"`,
+		`name="degrade_cooldown_max"`,
+	} {
+		if !strings.Contains(string(html), want) {
+			t.Errorf("index.html 缺配置表单项 %s", want)
+		}
+	}
+}
+
 // TestAppJSTestChatWiring 单账号对话测试的前端接线必须齐全：
 // 行内按钮（data-a="testchat"）→ 端点路径 → 弹窗 DOM。三者任一被误删，
 // 面板上就是一个点了没反应的按钮，而所有 Go 测试仍会全绿（与 TestAppJSSyntax 同因）。
