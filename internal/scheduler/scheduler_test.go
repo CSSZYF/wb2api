@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -212,6 +214,94 @@ func (f *fakeUpstream) server() *httptest.Server {
 			http.Error(w, "not found", 404)
 		}
 	}))
+}
+
+// expiringStub 返回一个套餐到期时间可控的 get-user-resource 响应，用于验证
+// 快过期窗口（ExpiringSoonWindow）的分桶行为；余额固定 100。
+func expiringStub(endTime string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"PackageEndTime":"` + endTime +
+				`","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0}]}}}}`))
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+}
+
+// creditsExpiringFromState 从 state.json 读出账号的快过期积分子集（0 = 未分桶）。
+//
+// 为什么不直接断言 pool 字段：creditsExpiring 是 pool 的私有运行态，对外唯一可观测
+// 口径就是 state.json 的 credits_expiring（与 pool 侧 TestCreditsExpiringPersistRoundTrip
+// 同法，且不为此新增导出 API）。
+func creditsExpiringFromState(t *testing.T, fp, uid string) int64 {
+	t.Helper()
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("读 state.json: %v", err)
+	}
+	var sf struct {
+		Accounts map[string]struct {
+			CreditsExpiring int64 `json:"credits_expiring"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		t.Fatalf("解析 state.json: %v\n%s", err, raw)
+	}
+	return sf.Accounts[uid].CreditsExpiring
+}
+
+// TestSetExpiringSoonWindowHotApplies 热改快过期窗口（面板 pool.expiring_soon）后，
+// 下一轮余额刷新立即按**新窗口**分桶：窗口 1h 时"3 天后到期"的余额不计入，
+// 热改为 30d 后同一账号立即被计入。
+//
+// 为什么以"放大窗口"为判据：pool 侧只在 expiring>0 时写入（SetCreditsDetailed），
+// 所以缩小窗口不会主动清掉陈旧分桶——但那是**既有语义**，重启也一样（creditsExpiring
+// 持久化在 state.json，恢复后同样只在下次分桶时被覆盖），故热改与重启严格等价。
+// 放大窗口则必然经过一次真实写入，能区分"读到新窗口"与"仍读启动初值"：
+// 若读取点仍读 cfg.ExpiringSoonWindow（本用例注入的 1h），第二次断言必失败。
+func TestSetExpiringSoonWindowHotApplies(t *testing.T) {
+	// 到期时间 = UTC+8 的 3 天后（30d 窗口内、1h 窗口外）。
+	cst := time.FixedZone("CST", 8*3600)
+	end := time.Now().In(cst).Add(72 * time.Hour).Format("2006-01-02 15:04:05")
+	srv := expiringStub(end)
+	defer srv.Close()
+
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := pool.New(fp)
+	defer p.Close() // 停后台落盘 goroutine（本用例传了 state 路径，New 会起 flusher）
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	// 启动初值 1h：3 天后到期的余额不在窗口内 → 不分桶。
+	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: time.Hour})
+
+	s.RunBalanceRefreshNow()
+	p.Flush()
+	if got := creditsExpiringFromState(t, fp, "u1"); got != 0 {
+		t.Fatalf("1h 窗口下 creditsExpiring=%d want 0（3 天后到期不在窗口内）", got)
+	}
+	// credits 本身照常更新（窗口只影响分桶，不影响余额口径）。
+	if st, _ := p.Status("u1"); st.Credits != 100 {
+		t.Fatalf("credits=%d want 100（窗口不影响余额本身）", st.Credits)
+	}
+
+	// 热改窗口到 30d（不经重启、不重建 Scheduler）→ 下一轮刷新即分桶。
+	s.SetExpiringSoonWindow(30 * 24 * time.Hour)
+	s.RunBalanceRefreshNow()
+	p.Flush()
+	if got := creditsExpiringFromState(t, fp, "u1"); got != 100 {
+		t.Fatalf("热改为 30d 窗口后 creditsExpiring=%d want 100（应在窗口内）", got)
+	}
+
+	// 再缩回 1h：不主动清旧分桶（与重启行为一致——见用例注释），但新账号不再分桶。
+	s.SetExpiringSoonWindow(time.Hour)
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	s.RunBalanceRefreshNow()
+	p.Flush()
+	if got := creditsExpiringFromState(t, fp, "u2"); got != 0 {
+		t.Fatalf("缩回 1h 后新账号 u2 creditsExpiring=%d want 0", got)
+	}
 }
 
 func jsonI64(v int64) string {

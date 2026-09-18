@@ -390,6 +390,10 @@ $('btnLogPin').onclick = () => {
 };
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
+// 表单名 → config.json 键路径。新增项时两边必须同步加（此处漏了 = 面板上是个
+// 只显示不保存的装饰控件；index.html 多写了 = collectConfig 收不到、静默丢弃）。
+// 取值类型约定：checkbox → bool；type=number → number；其余 → string。
+// _hours 后缀的输入按逗号/空白拆成 int 数组（见 collectConfig）。
 const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
@@ -398,13 +402,20 @@ const CFG_MAP = {
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   max_body_mb: ['server', 'max_body_mb'],
-  max_in_flight: ['pool', 'max_in_flight'], breaker_threshold: ['pool', 'breaker_threshold'],
+  max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
+  breaker_threshold: ['pool', 'breaker_threshold'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
-  ttl: ['session_sticky', 'ttl'],
+  expiring_soon: ['pool', 'expiring_soon'],
+  ttl: ['session_sticky', 'ttl'], gc_interval: ['session_sticky', 'gc_interval'],
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
+  client_version: ['upstream', 'client_version'], cli_version: ['upstream', 'cli_version'],
+  client_name: ['upstream', 'client_name'], device_token: ['upstream', 'device_token'],
+  device_token_file: ['upstream', 'device_token_file'], passthrough_ip: ['upstream', 'passthrough_ip'],
+  global_enabled: ['global', 'enabled'],
+  realm_precedence: ['models', 'realm_precedence'], strip_realm_prefix: ['models', 'strip_realm_prefix'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   zerowidth_sanitize: ['features', 'zerowidth_sanitize'],

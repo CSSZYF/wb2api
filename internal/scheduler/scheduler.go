@@ -69,6 +69,13 @@ type Scheduler struct {
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
 
+	// expiringSoonNanos 快过期积分窗口（纳秒，0=禁用分桶）。与 balanceInterval 同一
+	// 形态：cfg.ExpiringSoonWindow 只作启动初值，运行期一律经 expiringSoonWindow() /
+	// SetExpiringSoonWindow() 读写。用 atomic 而非 schedMu 的原因：读取点在
+	// runCheckin / RunBalanceRefreshNow 的并发分支里（不持 schedMu），热改窗口不应
+	// 与排程参数的锁耦合。
+	expiringSoonNanos atomic.Int64
+
 	// runningMu 巡检重入锁：五类任务的公开入口（定时批量派发与面板手动触发）互斥，
 	// TryLock 失败即放弃本次触发并记一行日志——同一时刻两趟全量巡检并发会对上游
 	// 重复轰炸（hub 版 wb_scheduler 的 _run_lock 同语义：「已有巡检正在执行」）。
@@ -107,12 +114,27 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 	}
+	// 启动初值写入原子字段；此后 cfg.ExpiringSoonWindow 不再被读取（见字段注释）。
+	s.expiringSoonNanos.Store(int64(cfg.ExpiringSoonWindow))
+	return s
+}
+
+// expiringSoonWindow 返回当前生效的快过期窗口（原子读；<=0 = 禁用分桶）。
+func (s *Scheduler) expiringSoonWindow() time.Duration {
+	return time.Duration(s.expiringSoonNanos.Load())
+}
+
+// SetExpiringSoonWindow 热更新快过期积分窗口（面板保存 pool.expiring_soon 后调用）。
+// 下一轮签到/余额刷新即按新窗口分桶（pool 的 creditsExpiring 随之更新），无需重启。
+// 窗口 <=0 = 禁用分桶（全部计入总量，行为与引入前一致）。
+func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
+	s.expiringSoonNanos.Store(int64(d))
 }
 
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
@@ -373,7 +395,7 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 		}
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.expiringSoonWindow())
 		if err != nil {
 			log.Printf("user-resource %s: %v", st.UID, err)
 			continue
@@ -517,7 +539,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.expiringSoonWindow())
 			if err != nil {
 				log.Printf("balance %s: %v", uid, err)
 				return

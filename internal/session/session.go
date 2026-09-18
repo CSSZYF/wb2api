@@ -16,6 +16,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -30,6 +31,9 @@ type entry struct {
 // Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
 // 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
 type Config struct {
+	// TTL 会话绑定 TTL 的**启动初值**：New 时写入 Router.ttlNanos（原子），此后
+	// 运行期一律经 Router.TTL()/SetTTL() 读写，本字段不再被读取——面板热改 TTL
+	// （saveConfig → SetTTL）改的是原子值，不回写配置结构。
 	TTL        time.Duration
 	GCInterval time.Duration
 	Store      redisstore.Store
@@ -49,6 +53,12 @@ type Router struct {
 	entries map[string]entry
 	cfg     Config
 	stop    chan struct{}
+	// ttlNanos 当前生效的绑定 TTL（纳秒）。用独立 atomic 而不是复用 mu：
+	// TTL 的读取点既有持 mu 的慢路径（gcOnce / 慢路径分配），也有**未持 mu 的快路径**
+	// （ResolveForModel 的 RLock 段内 expired 判定，见下），把 TTL 塞进 entries 的
+	// 同一把锁会把两件无关的事耦合起来（且快路径读锁下无法安全写 TTL）。
+	// 0 = 未初始化（理论不可达：New 一定写入非正值兜底后的默认 30m）。
+	ttlNanos atomic.Int64
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -63,7 +73,32 @@ func New(cfg Config) *Router {
 	if cfg.GCInterval <= 0 {
 		cfg.GCInterval = 5 * time.Minute
 	}
-	return &Router{entries: map[string]entry{}, cfg: cfg}
+	r := &Router{entries: map[string]entry{}, cfg: cfg}
+	r.ttlNanos.Store(int64(cfg.TTL))
+	return r
+}
+
+// TTL 返回当前生效的绑定 TTL（原子读，任意时刻安全：快路径/慢路径/GC 都可能调）。
+func (r *Router) TTL() time.Duration {
+	return time.Duration(r.ttlNanos.Load())
+}
+
+// SetTTL 热更新绑定 TTL（面板保存配置路径调用：cmd/server saveConfig → SetTTL）。
+//
+// 语义是"对新判定生效、不做追溯"：已存在的绑定不因 TTL 缩短而立刻失效，下一次
+// expired 判定（快路径惰性过期 / 慢路径 re-check / gcOnce）才按新值算——与读时
+// 惰性判定天然一致，不需要遍历 entries 重算，也不需要触锁。
+// d<=0 视为「未设置」回落默认 30m（与 New 的兜底口径一致，避免面板清空该字段后
+// 把所有绑定瞬间判为过期、粘性全丢）。
+//
+// 为什么用 atomic 而不是 mu：Read 侧有**未持锁**路径（ResolveForModel 快路径 RLock
+// 段内 / GC 写锁段内），并且 GCInterval 不做热改（见 main 的 restartRequiredFields），
+// 所以不需要借 mu 与 cfg 对齐；原子值让 SetTTL 与所有读取点零耦合、无锁竞争。
+func (r *Router) SetTTL(d time.Duration) {
+	if d <= 0 {
+		d = 30 * time.Minute
+	}
+	r.ttlNanos.Store(int64(d))
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -147,12 +182,15 @@ func (r *Router) Resolve(key string) (string, bool) {
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
 	available := r.availableSet(model)
+	// TTL 取一次快照：本次调用内的两次 expired 判定必须用同一值，否则 SetTTL 插在
+	// 两次判定之间会让同一个 key 在同一次 Resolve 里"先过期后不过期"，语义自相矛盾。
+	ttl := r.TTL()
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) {
+	if found && !expired(e, now, ttl) {
 		if available[e.uid] {
 			r.touch(key, e.uid, now)
 			return e.uid, true
@@ -165,7 +203,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	defer r.mu.Unlock()
 
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
-	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
+	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, ttl) {
 		if available[e2.uid] {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
@@ -200,7 +238,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	if existed && prev.uid != uid {
 		r.cfg.Store.DelBind(key)
 	}
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.cfg.Store.SetBind(key, uid, r.TTL())
 	return uid, true
 }
 
@@ -209,7 +247,7 @@ func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.cfg.Store.SetBind(key, uid, r.TTL())
 }
 
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
@@ -223,7 +261,7 @@ func (r *Router) Bind(key, uid string) {
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.cfg.Store.SetBind(key, uid, r.TTL())
 }
 
 // Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
@@ -249,10 +287,11 @@ func (r *Router) Count() int {
 
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
 func (r *Router) gcOnce(now time.Time) int {
+	ttl := r.TTL() // 与 ResolveForModel 同口径：本轮 GC 统一用一个 TTL 快照
 	r.mu.Lock()
 	var expiredKeys []string
 	for key, e := range r.entries {
-		if now.Sub(e.lastActive) > r.cfg.TTL {
+		if now.Sub(e.lastActive) > ttl {
 			expiredKeys = append(expiredKeys, key)
 		}
 	}

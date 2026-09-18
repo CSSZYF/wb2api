@@ -256,7 +256,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch, chatHandler)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, chatHandler, sessRouter)
 		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
@@ -340,17 +340,19 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
+//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
+//   - session_sticky.ttl → session.Router.SetTTL（原子热改；gc_interval 不在此列，
+//     GC ticker 已在 StartGC 时按旧值启动，重建风险大 → 仍列为重启项）
 //   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
-//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
+//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.gc_interval
 //
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, srv *server.Handler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, srv *server.Handler, sess *session.Router) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -403,6 +405,14 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	// 快过期积分窗口热改：原子写，下一轮签到/余额刷新即按新窗口分桶（无需重启）。
+	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
+	// 粘性 TTL 热改：原子写，下一次 expired 判定（快路径/慢路径/GC）即按新值算。
+	// sess 为 nil 表示粘性关闭（session_sticky.enabled=false，main 未建 Router）——
+	// 跳过热应用即可，落盘的 TTL 在下次开启粘性并重启后生效。
+	if sess != nil {
+		sess.SetTTL(newCfg.SessionTTL)
+	}
 	// srv 为 nil 仅出现在装配未完成的窗口（SaveConfig 只在请求期被调，理论不可达），
 	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
 	if srv != nil {
@@ -430,7 +440,10 @@ func restartRequiredFields(c *Config) []string {
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
+	// session_sticky.ttl 已从本清单移除：它现在经 Router.SetTTL 原子热生效。
+	// gc_interval 保留：GC ticker 在 StartGC 时按当时值建立，热改需重建 goroutine
+	// （StopGC+StartGC 与在途 tick 有竞态），刻意不做，仍按重启项提示。
+	out = append(out, "session_sticky.gc_interval")
 	return out
 }
 
