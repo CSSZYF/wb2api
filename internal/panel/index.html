@@ -837,6 +837,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">透传客户端 IP</span>
               <input type="checkbox" name="passthrough_ip">
               <span class="hint">向上游注入 X-Forwarded-For / X-Real-IP；默认关（反代安全边界）；需重启</span></div>
+            <div class="switch"><span class="lb">禁用 HTTP/2</span>
+              <input type="checkbox" name="disable_http2">
+              <span class="hint">默认不勾选 = 启用 h2（实测走 TUN 代理时连接复用 90%、握手快；禁 h2 复用率 0% 易触发 TLS 握手超时）。仅当 h2 复用异常时勾选退回 HTTP/1.1；需重启</span></div>
+            <div class="grid3">
+              <div class="switch"><span class="lb">TLS 握手超时 (s)</span>
+                <input type="number" name="tls_handshake_timeout_seconds" min="1" step="1">
+                <span class="hint">默认 30；&lt;=0 回落 30；需重启</span></div>
+              <div class="switch"><span class="lb">拨号超时 (s)</span>
+                <input type="number" name="dial_timeout_seconds" min="1" step="1">
+                <span class="hint">默认 30；&lt;=0 回落 30；需重启</span></div>
+              <div class="switch"><span class="lb">空闲连接池 (s)</span>
+                <input type="number" name="idle_conn_timeout_seconds" min="1" step="1">
+                <span class="hint">默认 90；&lt;=0 回落 90；需重启</span></div>
+            </div>
             <div class="switch"><span class="lb">账号设备指纹头</span>
               <input type="checkbox" name="machine_id_headers">
               <span class="hint">勾选（缺省）= chat/billing/模型目录注入按 uid 派生（跨重启稳定）的 X-Machine-ID / X-Session-ID，防多号裸奔同一设备指纹；取消 = 只带 X-Device-Token；需重启</span></div>
