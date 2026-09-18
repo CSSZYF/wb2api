@@ -1429,55 +1429,171 @@ function renderUsage(d) {
   renderUsageChart(d.series || []);
 }
 
-/* renderUsageChart 画堆叠柱状图。日点与小时点混用 x 轴，因此按数据序号等距
-   排布（不按真实时间比例），并在标签上区分粒度——用量面板看的是相对高低，
-   不是精确的时间刻度。 */
+/* renderUsageChart 画堆叠柱状图。
+ *
+ * x 轴是**真实时间轴**，不是按序号等距。这一点很实在：数据里既有 1 小时的间隔，
+ * 也有 6~8 小时的断档（没请求的时段根本不产生桶），等距排布会把 8 小时画得和
+ * 1 小时一样宽，「什么时候用的」就完全失真了。
+ *
+ * 另外不再用 preserveAspectRatio="none"：那会把 760 宽的 viewBox 横向拉伸到容器
+ * 宽度，柱子和文字一起变形。改为固定比例、高度随宽度自适应（CSS 的 height:auto）。
+ *
+ * 时间轴按本地时间解析（后端分片键就是本地时区口径），day 点按当天 00:00 参与
+ * 定位，与 hour 点落在同一条连续轴上——日桶本来就是他那天所有小时的聚合。
+ */
+
+/* parsePointTime 把后端的 t 解析成毫秒时间戳，解析不出来返回 null。
+   hour 形如 "2026-09-16T13"，day 形如 "2026-09-16"。day 必须补上 T00:00:00：
+   ES 规范里「纯日期」串按 **UTC** 解析，而后端分片键是本地时区——不补的话东八区
+   整条轴会平移 8 小时。 */
+function parsePointTime(p) {
+  const raw = String(p.t || '');
+  const s = raw.length === 13 ? raw + ':00:00' : raw + 'T00:00:00';
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+
 function renderUsageChart(series) {
   const host = $('usChart');
-  if (!series.length) {
+
+  // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
+  const pts = [];
+  for (const p of series) {
+    const t = parsePointTime(p);
+    if (t === null) continue;
+    const pt = Number(p.prompt_tokens || 0), ct = Number(p.completion_tokens || 0);
+    pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
+               req: p.requests || 0 });
+  }
+  // 后端是把日点（升序）与小时点（升序）**先后拼接**成一条时序的，正常已整体
+  // 升序；这里再排一次兜底，保证 t0/t1 真的是最早/最晚的点。
+  pts.sort((a, b) => a.t - b.t);
+  if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
     return;
   }
-  const W = 760, H = 170, PL = 46, PR = 10, PT = 12, PB = 26;
+
+  // PT 比原来多留 4px：顶上那条日界日期标注画在 PT 之上，不留白会被裁掉。
+  const W = 760, H = 180, PL = 52, PR = 12, PT = 16, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB;
 
-  const max = Math.max(1, ...series.map(p => Number(p.total_tokens || 0)));
-  const bw = Math.max(2, Math.min(26, iw / series.length - 3));
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  // 只有一个点、或所有点时刻完全相同（t1-t0 = 0）时，时间轴没有跨度可言：
+  // 画不出比例，也不能除零。这种情况把点摆到绘图区正中（见 xOf）。
+  const degenerate = t1 - t0 <= 0;
+  const span = degenerate ? 1 : t1 - t0;
 
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
+  const max = Math.max(1, ...pts.map(p => p.tt));
+
+  // 柱宽取「同粒度最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
+  // 变细，但不会细到看不见。
+  //
+  // 这里按 scope 分组算，而不是全序列取一个最小间隔：后端对超出小时窗口的数据折叠
+  // 成日点，于是 30 天/60 天窗口里 day 点（间隔 1 天）会与 hour 点（间隔 1 小时）
+  // **混在同一条轴上**。若按全局最小间隔（1 小时）定宽，日柱会被压成 1.5px 的细线，
+  // 反而比改动前更难读。分组后日柱按天宽、小时柱按小时宽，各保留原来的观感。
+  function barWidth(list, fallback) {
+    let g = Infinity;
+    for (let i = 1; i < list.length; i++) g = Math.min(g, list[i].t - list[i - 1].t);
+    if (!isFinite(g) || g <= 0) g = fallback;
+    return Math.max(1.5, Math.min(30, iw * (g / span) * 0.7));
+  }
+  const hours = pts.filter(p => p.scope !== 'day');
+  const days = pts.filter(p => p.scope === 'day');
+  const bwHour = barWidth(hours, span);
+  const bwDay = barWidth(days, 24 * 3600 * 1000);
+  const bwOf = p => (p.scope === 'day' ? bwDay : bwHour);
+  // 单点/同刻时没有真实间隔可用，退回一个能看见的宽度（上面的 fallback 已处理）。
+
+  // 时间戳 → x 坐标：真实比例映射，柱心落在自己的时刻上。左右各留出最大柱宽的
+  // 一半，免得贴边的柱子压进 y 轴刻度区或越出绘图区（内部各段的宽窄比例仍严格
+  // 按真实时间）。
+  const pad = Math.max(bwHour, bwDay) / 2;
+  const plot = Math.max(1, iw - pad * 2);
+  const xOf = t => degenerate ? PL + iw / 2 : PL + pad + (t - t0) / span * plot;
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" role="img">';
+
   // y 轴网格 + 刻度（4 档）
   for (let i = 0; i <= 4; i++) {
-    const v = max * i / 4;
     const y = PT + ih - (ih * i / 4);
-    out += '<line class="gl" x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '"/>';
-    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5) + '" text-anchor="end">' + fmtTok(v) + '</text>';
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+      '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+      '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
-  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
 
-  const step = iw / series.length;
-  series.forEach((p, i) => {
-    const pt = Number(p.prompt_tokens || 0), ct = Number(p.completion_tokens || 0);
-    const tt = Number(p.total_tokens || 0) || (pt + ct);
-    const x = PL + i * step + (step - bw) / 2;
-    const hTot = ih * (tt / max);
-    const hP = tt ? hTot * (pt / tt) : 0;
-    const hC = Math.max(tt && ct ? 1 : 0, hTot - hP);
+  for (const p of pts) {
+    const bw = bwOf(p);
+    const x = xOf(p.t) - bw / 2;
+    const hTot = ih * (p.tt / max);
+    const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
+    const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
     const yBase = PT + ih;
-    if (hP > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP).toFixed(1) +
-      '" width="' + bw.toFixed(1) + '" height="' + hP.toFixed(1) + '" fill="var(--accent)" rx="1.5"/>';
-    if (hC > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP - hC).toFixed(1) +
-      '" width="' + bw.toFixed(1) + '" height="' + hC.toFixed(1) + '" fill="var(--ok)" rx="1.5"/>';
-    // 只给稀疏的几根画标签，避免拥挤
-    const every = Math.ceil(series.length / 8);
-    if (i % every === 0) {
-      const lab = p.scope === 'day' ? p.t.slice(5) : p.t.slice(11) + ':00';
-      out += '<text class="tk" x="' + (x + bw / 2).toFixed(1) + '" y="' + (H - 8) +
-        '" text-anchor="middle">' + esc(lab) + '</text>';
+    if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) + '" fill="var(--accent)" rx="1.5"/>';
+    if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) + '" fill="var(--ok)" rx="1.5"/>';
+    out += '<title>' + esc(p.raw) + ' (' + esc(p.scope) + ')  ' +
+      fmtTok(p.pt) + ' prompt / ' + fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+  }
+
+  // x 轴基线画在柱子之后，避免压在柱底
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) +
+    '" y2="' + (PT + ih) + '"/>';
+
+  // x 轴刻度：按真实时间等距取 6 个位置，每个位置取**最近的实际柱子**做标签，
+  // 所以标签永远落在有数据的点上，不会指到空档里。
+  const TICKS = Math.min(6, pts.length);
+  const usedLabel = new Set();
+  for (let k = 0; k < TICKS; k++) {
+    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    let bi = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const d = Math.abs(pts[i].t - target);
+      if (d < best) { best = d; bi = i; }
     }
-    out += '<title>' + esc(p.t) + ' (' + esc(p.scope) + ')  ' +
-      fmtTok(p.prompt_tokens) + ' prompt / ' + fmtTok(p.completion_tokens) + ' completion / ' +
-      (p.requests || 0) + ' 次</title>';
-  });
+    if (usedLabel.has(bi)) continue;
+    usedLabel.add(bi);
+    const p = pts[bi];
+    const d = new Date(p.t);
+    const lab = p.scope === 'day'
+      ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+      : String(d.getHours()).padStart(2, '0') + ':00';
+    // 首尾标签靠边对齐，避免被裁掉
+    const cx = xOf(p.t);
+    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
+      '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+  }
+
+  // 跨天/跨周时补一条日界虚线 + 顶端日期标注，让长窗口里的「日界」可见——
+  // 小时点跨午夜时，x 轴标签只有「06:00 / 16:00」这种时刻，没有日期就分不清
+  // 是今天还是昨天。
+  let prevDay = null, markX = -Infinity, markN = 0;
+  for (const p of pts) {
+    const d = new Date(p.t);
+    // 日键用「年月日」而不是 getDate()：只比日号会把「上月的 05 号 → 本月 05 号」
+    // 这类跨月边界漏掉（日号相同就算同一天）。
+    const dk = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+    if (prevDay !== null && dk !== prevDay) {
+      const x = xOf(p.t);
+      out += '<line class="gl" x1="' + x.toFixed(1) + '" y1="' + PT + '" x2="' + x.toFixed(1) +
+        '" y2="' + (PT + ih) + '" style="opacity:.45"/>';
+      // 日期标注画在绘图区上方的空白里（y = PT 之上），绝不会压到柱子；文字比
+      // 虚线宽，只给间距够开的最多 5 条，避免糊成一团。
+      if (markN < 5 && x - markX >= 64) {
+        markX = x;
+        markN++;
+        const lab = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
+        const anchor = x < PL + 16 ? 'start' : (x > W - PR - 16 ? 'end' : 'middle');
+        out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, x)).toFixed(1) +
+          '" y="' + (PT - 3) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+      }
+    }
+    prevDay = dk;
+  }
+
   out += '</svg>';
   host.innerHTML = out;
 }

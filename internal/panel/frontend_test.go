@@ -349,3 +349,60 @@ func TestAppJSMachineIDHeadersWiring(t *testing.T) {
 		t.Error(`index.html 的 machine_id_headers 必须是 <input type="checkbox">（否则 collectConfig 不走 bool 分支）`)
 	}
 }
+
+// TestAppJSUsageChartTimeAxis 用量图必须按**真实时间戳**定位数据点，而不是按序号等距：
+//
+// 后端时序里既有 1 小时的间隔，也有 6~8 小时的断档（没请求的时段不产生桶），按序号
+// 等距排布会把 8 小时画得和 1 小时一样宽，「什么时候用的」完全失真；同时
+// preserveAspectRatio="none" 会把 760 宽的 viewBox 横向拉伸到容器宽度，柱与文字一起
+// 变形。这两点都是**只影响观感、不影响任何 Go 代码**的静默回归——app.js 是 go:embed
+// 静态资源，Go 编译器不校验其内容（同 TestAppJSSyntax）。此用例把绘图口径前移。
+func TestAppJSUsageChartTimeAxis(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+
+	// 时间戳解析辅助函数必须存在（hour "2006-01-02T15" / day "2006-01-02" 两种长度）。
+	if !strings.Contains(s, "function parsePointTime(") {
+		t.Fatal("app.js 缺少 parsePointTime（时间戳解析辅助函数）")
+	}
+	body := jsFuncBody(s, "function parsePointTime(")
+	if body == "" {
+		t.Fatal("app.js parsePointTime 函数体解析失败")
+	}
+	// day 串必须补 "T00:00:00"：ES 规范里「纯日期」按 UTC 解析，而后端分片键是本地
+	// 时区——不补的话东八区整条轴平移 8 小时（图表整体错位却毫无报错）。
+	if !strings.Contains(body, "T00:00:00") {
+		t.Error(`parsePointTime 未补 "T00:00:00"（纯日期串会按 UTC 解析，与后端本地时区口径错位）`)
+	}
+	if !strings.Contains(body, "getTime()") {
+		t.Error("parsePointTime 未取 getTime() 毫秒时间戳")
+	}
+
+	chart := jsFuncBody(s, "function renderUsageChart(")
+	if chart == "" {
+		t.Fatal("app.js 缺少函数 renderUsageChart")
+	}
+	// 真实时间轴：x 由时间戳算出，而不是 i * step 之类按序号等距。
+	for _, must := range []string{
+		"xOf",                                 // 时间戳 → x 的映射函数
+		"(t - t0) / span",                     // 真实比例映射
+		"degenerate",                          // 单点/同刻的退化保护（不除零）
+		`preserveAspectRatio="xMidYMid meet"`, // 固定比例，不再横向拉伸
+	} {
+		if !strings.Contains(chart, must) {
+			t.Errorf("renderUsageChart 缺真实时间轴要素：%q", must)
+		}
+	}
+	// 反向断言收在 svg 开标签的**实际拼接**上：注释里提到过 "none" 这个写法（说明为何
+	// 弃用），按子串全局搜索会被注释放行，所以匹配带 role 属性的完整标签片段。
+	if strings.Contains(chart, `preserveAspectRatio="none" role="img"`) {
+		t.Error(`renderUsageChart 仍用 preserveAspectRatio="none"（横向拉伸会压扁柱与文字）`)
+	}
+	// 按序号等距的老写法（x = PL + i * step）不得回归。
+	if strings.Contains(chart, "i * step") {
+		t.Error("renderUsageChart 仍按序号等距排布（x = PL + i * step），时间轴不真实")
+	}
+}
