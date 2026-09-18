@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 
@@ -34,6 +35,10 @@ type Config struct {
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
+	// ReadTimeout 入站请求体读取窗口（http.Server.ReadTimeout 的同口径值）；
+	// <=0 兜底 DefaultReadTimeout（300s）。运行期经 SetReadTimeout 热改，
+	// 由 armBodyReadDeadline 逐请求生效（面板保存后无需重启）。
+	ReadTimeout time.Duration
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -134,6 +139,14 @@ type Handler struct {
 	// 面板在线改 server.max_rotate 时经 SetMaxRotate 热生效，无需重启
 	// （池内账号多时默认 3 次试不满所有号）。
 	maxRotate atomic.Int64
+	// readTimeout 入站 body 读取窗口的运行期值（cfg.ReadTimeoutSeconds 的原子镜像）。
+	// 面板在线改 server.read_timeout_seconds 时经 SetReadTimeout 热生效，无需重启。
+	// 为什么是原子镜像而不是直接写 http.Server.ReadTimeout：后者是**裸字段**，只在
+	// readRequest（server.go:1039）里被无锁读一次，运行期从面板 goroutine 赋值是
+	// 数据竞争（-race 会报，且 http.Server 并未提供 SetReadTimeout 这样的 setter，
+	// 只有 SetKeepAlivesEnabled）。故热改走"逐请求重设读截止"路线：见
+	// armBodyReadDeadline。
+	readTimeout atomic.Int64
 }
 
 // SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
@@ -152,6 +165,71 @@ func (h *Handler) SetMaxRotate(n int) {
 		n = 3
 	}
 	h.maxRotate.Store(int64(n))
+}
+
+// DefaultReadTimeout 入站 body 读取窗口的兜底值（与 config 侧 Default() 同口径）。
+// 单一来源供 handler 与 cmd 两侧共用，避免"配置默认 300、handler 兜底 60"这类漂移。
+const DefaultReadTimeout = 300 * time.Second
+
+// SetReadTimeout 热更新入站 body 读取窗口（面板保存配置路径调用）。
+// d<=0 与 NewHandler 兜底口径一致：回落 DefaultReadTimeout（不采纳 http.Server 的
+// 「0 = 不限」语义——那等于拆掉慢速 body 闸门，与旧值 60s 的防护意图相悖）。
+//
+// 本方法只写原子镜像，不动 http.Server.ReadTimeout（后者无并发安全 setter，
+// 运行期赋值是数据竞争）；实际生效靠 armBodyReadDeadline 逐请求重设读截止。
+func (h *Handler) SetReadTimeout(d time.Duration) {
+	if d <= 0 {
+		d = DefaultReadTimeout
+	}
+	h.readTimeout.Store(int64(d))
+}
+
+// readTimeoutValue 返回当前生效的入站读窗口（运行期原子值，面板热改后立即反映）。
+// 兜底 DefaultReadTimeout 与 NewHandler/SetReadTimeout 同口径：即便 handler 未经
+// NewHandler 装配（原子值为零值）也不会退化成"不限"。
+// 不读 h.cfg.ReadTimeout：那是启动期快照，面板热改后会过期。
+func (h *Handler) readTimeoutValue() time.Duration {
+	if d := h.readTimeout.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return DefaultReadTimeout
+}
+
+// armBodyReadDeadline 把本请求的读截止推到 now+read_timeout_seconds（热生效入口）。
+//
+// 为什么需要它（v1.9.13 生产事故的修复核心）：http.Server.ReadTimeout 覆盖的是
+// 「连接建立 → body 读完」的整段窗口，且只能在启动时写死——面板改了配置也要重启
+// 才生效（且 http.Server 根本没有 SetReadTimeout 这样的 setter，只有
+// SetKeepAlivesEnabled；ReadTimeout 是裸字段，运行期从面板 goroutine 赋值是数据
+// 竞争）。这里改用 net/http 官方的逐请求接口 ResponseController.SetReadDeadline：
+// 在 handler 入口按**当前**配置值重设一次截止，于是
+//   - 面板保存 read_timeout_seconds 后，下一个请求即按新值执行（热生效）；
+//   - 在途请求不受影响（各自已握有自己的 deadline，改值不会回头改它们）；
+//   - 该接口在 HTTP/1 与 HTTP/2 下均由标准库实现（h2 的 responseWriter 也实现了
+//     SetReadDeadline），不支持时返回 http.ErrNotSupported——此时静默跳过，退回
+//     http.Server.ReadTimeout 的静态值兜底，不影响请求正常处理。
+//
+// 刻意**不**在读完 body 后清零截止，两个原因：
+//   - 不需要：HTTP/1 侧 body 一读到 EOF，标准库自己就会 startBackgroundRead →
+//     SetReadDeadline(zero) 清掉（transfer.go 的 onHitEOF 钩子），所以长 SSE 响应
+//     与 keep-alive 空闲不受本项影响；h2 侧该截止只作用于**请求体**（触发时
+//     CloseWithError(ErrDeadlineExceeded)），不碰响应流。
+//   - 反向风险：413/读失败等"没读完 body"的早退路径，handler 返回后标准库还要在
+//     finishRequest 里 drain 最多 256KB 以便复用连接；若此处清零，慢速客户端可让
+//     该 drain 无限阻塞。留着截止反而把它框在同一窗口内（超时即关连接）。
+//
+// 语义边界：只放宽/收紧「读 body」这段。ReadHeaderTimeout=30s 不动（头很小，30s
+// 足够，仍是慢速头攻击的有效闸门）；出站方向超时在 upstream 段，与本项无关。
+func (h *Handler) armBodyReadDeadline(w http.ResponseWriter, r *http.Request) {
+	// 无 body（GET/HEAD、Content-Length: 0）时无需重设：标准库在 handler 入口前已
+	// 调 startBackgroundRead 把读截止清零，此刻再设只会把 keep-alive 空闲等待
+	// 拉长到 read_timeout（与 IdleTimeout 的职责重叠）。
+	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
+		return
+	}
+	// 失败（ErrNotSupported：自定义 ResponseWriter 包装层未透出 SetReadDeadline）
+	// 不阻断请求，退回静态 ReadTimeout 兜底。
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(h.readTimeoutValue()))
 }
 
 // rotateLimit 返回当前生效的换号次数（运行期原子值，面板热改后立即反映）。
@@ -182,6 +260,9 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = DefaultReadTimeout // 入站读窗口兜底 300s
+	}
 	var hasRealm func(string) bool
 	if cfg.Pool != nil {
 		hasRealm = cfg.Pool.HasRealm
@@ -194,6 +275,7 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
 	h.maxRotate.Store(int64(cfg.MaxRotate))
+	h.readTimeout.Store(int64(cfg.ReadTimeout))
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -565,6 +647,9 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// 入站 body 读窗口按**当前**配置值逐请求重设（面板改 server.read_timeout_seconds
+	// 后无需重启即生效；慢链路大上下文不再被启动时的静态值掐断）。必须在读 body 之前。
+	h.armBodyReadDeadline(w, r)
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
@@ -575,7 +660,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	limit := h.maxBodyBytes.Load()
 	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", readBodyErrMsg(err, h.readTimeoutValue()))
 		return
 	}
 	if int64(len(body)) > limit {
@@ -1140,6 +1225,25 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
+}
+
+// readBodyErrMsg 组装「读请求体失败」的客户端可见文案。
+//
+// 读**超时**时追加可操作提示：这类失败在生产上表现为用户对话被拦腰截断，而原始
+// 错误（如 "read tcp 10.42.0.245:7863->10.42.0.1:35543: i/o timeout"）既没说是
+// 哪一端的超时，也没说能调哪个键——用户只能猜。故把生效值与调法一并给出
+// （v1.9.13 事故：460KB 上下文经跨境慢链路上传撞上写死的 60s）。
+//
+// 只在超时（net.Error.Timeout()）时加提示：普通读错误（客户端提前断开、body 被
+// 截断等）加这段文案是误导——它们与 read_timeout_seconds 无关。
+func readBodyErrMsg(err error, timeout time.Duration) string {
+	base := "read body: " + err.Error()
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		return base
+	}
+	return fmt.Sprintf("%s（请求体读取超时；网关 server.read_timeout_seconds 当前 %ds，慢链路上传大上下文可调大，面板修改即时生效）",
+		base, int(timeout.Seconds()))
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {

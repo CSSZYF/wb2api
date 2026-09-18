@@ -444,6 +444,7 @@ const CFG_MAP = {
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   auth_watch_enabled: ['schedule', 'auth_watch_enabled'], auth_watch_seconds: ['schedule', 'auth_watch_seconds'],
   max_body_mb: ['server', 'max_body_mb'], max_rotate: ['server', 'max_rotate'],
+  read_timeout_seconds: ['server', 'read_timeout_seconds'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],

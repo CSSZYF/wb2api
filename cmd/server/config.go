@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -35,6 +36,26 @@ type Config struct {
 		// 0/负数 normalize 回落默认 3（与 max_body_mb 的 fail fast 不同：此键的 0
 		// 没有"不限"之类的合理语义，无从误导用户，回落默认更友好）。
 		MaxRotate int `json:"max_rotate"`
+
+		// ReadTimeoutSeconds 入站请求体读取窗口（秒，默认 300）。
+		//
+		// 语义：从「请求开始读」到「body 读完」的整段窗口上限，对应 http.Server 的
+		// ReadTimeout。它不是"首字节超时"（那是 ReadHeaderTimeout，固定 30s，头很小
+		// 不受本项影响），也不是出站超时（那些在 upstream 段）。
+		//
+		// 为什么默认从写死的 60s 提到 300s（v1.9.13 生产事故）：旧值让 8MB 上限的请求
+		// 必须在 60s 内传完（>1.1Mbps 稳定上行），而 460KB+ 的聊天上下文经 TUN 代理 +
+		// 跨境链路时上传耗时波动极大——一旦超 60s，io.ReadAll 报 i/o timeout，用户
+		// 对话被拦腰截断（invalid_request）。300s 下 8MB 只需 27KB/s 上行，跨境链路
+		// 可满足，同时远小于慢速攻击所需的时间尺度（ReadHeaderTimeout=30s 仍是慢速
+		// 头的有效闸门）。
+		//
+		// 0/负数回落默认 300（与 max_rotate 同风格）。注意这里**刻意不采用**
+		// http.Server 的「0 = 不限」语义：0 在配置文件里更可能被当成"没填/用默认"，
+		// 而"不限"等于拆掉慢速 body 的闸门，与旧值 60s 的防护意图相悖；要放宽就显式
+		// 给个大值（如 900），别靠 0 猜。面板修改后经 handler.SetReadTimeout 逐请求
+		// 即时生效，无需重启（见 handler.armBodyReadDeadline）。
+		ReadTimeoutSeconds int `json:"read_timeout_seconds"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -239,6 +260,11 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
 	c.Server.MaxRotate = 3 // 单请求最多换号次数默认 3（与 handler 侧兜底口径一致）
+	// 入站 body 读取窗口默认 300s：8MB/5min 只需 27KB/s 上行，跨境慢链路可满足；
+	// 旧写死值 60s 是生产 503 事故根因（见字段注释）。
+	// 值取自 server.DefaultReadTimeout（handler 侧兜底同一常量），避免"配置默认一个数、
+	// handler 兜底另一个数"的静默漂移。
+	c.Server.ReadTimeoutSeconds = int(server.DefaultReadTimeout / time.Second)
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -394,6 +420,12 @@ func applyEnv(c *Config) {
 			c.Server.MaxBodyMB = n
 		}
 	}
+	// 入站 body 读取窗口（秒）：<=0 由 normalize 回落默认 300（env 与 JSON 同口径）。
+	if v := os.Getenv("WB2A_READ_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Server.ReadTimeoutSeconds = n
+		}
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -497,6 +529,12 @@ func (c *Config) normalize() error {
 	// 手写配置的部署起不来；回落默认既保住零行为变更，又不必用户猜合法区间。
 	if c.Server.MaxRotate <= 0 {
 		c.Server.MaxRotate = 3
+	}
+	// read_timeout_seconds 非正回落默认（与 max_rotate 同风格，理由见字段注释：
+	// http.Server 的「0 = 不限」语义在此刻意不采纳——拆掉慢速 body 闸门是反向风险）。
+	// 回落值取 server.DefaultReadTimeout，与 handler 侧兜底同源。
+	if c.Server.ReadTimeoutSeconds <= 0 {
+		c.Server.ReadTimeoutSeconds = int(server.DefaultReadTimeout / time.Second)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

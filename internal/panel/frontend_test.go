@@ -489,3 +489,47 @@ func TestAppJSAuthWatchWiring(t *testing.T) {
 		t.Error(`auth_watch_seconds 必须是 type="number"（否则提交字符串导致保存失败）`)
 	}
 }
+
+// TestAppJSReadTimeoutWiring server.read_timeout_seconds 的面板接线必须齐全：
+// CFG_MAP 映射（否则表单值与后端对不上，输入框读不到也存不进去）+ 数字输入项存在。
+//
+// 为什么需要：本键是 v1.9.13 生产事故（慢链路上传大上下文被 60s 读超时掐断、用户
+// 对话被拦腰截断）的修复开关——接线缺失时面板上是个只显示不保存的装饰控件，用户
+// 以为调大了就完事，实际仍按旧值跑（与 TestAppJSMaxRotateWiring 同因，把接线完整性
+// 前移；app.js/index.html 是 go:embed 静态资源，Go 编译器不校验其内容）。
+func TestAppJSReadTimeoutWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+	if !strings.Contains(s, `read_timeout_seconds: ['server', 'read_timeout_seconds']`) {
+		t.Error("app.js 缺 read_timeout_seconds 的 CFG_MAP 映射（表单值无法读写 server.read_timeout_seconds）")
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	if !strings.Contains(h, `name="read_timeout_seconds"`) {
+		t.Error(`index.html 缺配置表单项 name="read_timeout_seconds"`)
+	}
+	// 必须是 number 类型：collectConfig 按 el.type 决定是否 Number() 转换，
+	// 写成文本框会以 string 提交（后端 json 解码 int 失败 → 整个保存请求 400）。
+	if !strings.Contains(h, `name="read_timeout_seconds" type="number"`) {
+		t.Error(`read_timeout_seconds 必须是 type="number"（否则提交字符串导致保存失败）`)
+	}
+	// CFG_MAP 的 server 段必须仍在（防止误删整段把别的 server 键一起带走）。
+	body := jsFuncBody(s, "const CFG_MAP")
+	if body == "" {
+		t.Fatal("app.js 缺 CFG_MAP 定义")
+	}
+	for _, want := range []string{
+		`max_body_mb: ['server', 'max_body_mb']`,
+		`read_timeout_seconds: ['server', 'read_timeout_seconds']`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("CFG_MAP 缺 server 段映射：%s", want)
+		}
+	}
+}

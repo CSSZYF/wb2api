@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 )
 
 func TestDefault(t *testing.T) {
@@ -1336,5 +1338,172 @@ func TestConfigExampleHasAuthWatchKeys(t *testing.T) {
 	if !c.Schedule.AuthWatchEnabled || c.Schedule.AuthWatchSeconds != 30 {
 		t.Errorf("example 的 auth_watch 口径=%v/%d want true/30",
 			c.Schedule.AuthWatchEnabled, c.Schedule.AuthWatchSeconds)
+	}
+}
+
+// TestReadTimeoutDefault 默认 read_timeout_seconds=300（与 handler 侧
+// DefaultReadTimeout 同口径）。旧版该值是写死的 60s——正是生产 503 事故的根因
+// （460KB 上下文经跨境慢链路上传撞上 60s，用户对话被拦腰截断）。
+func TestReadTimeoutDefault(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Server.ReadTimeoutSeconds != 300 {
+		t.Errorf("read_timeout_seconds=%d want 300", c.Server.ReadTimeoutSeconds)
+	}
+	// 与 handler 侧兜底同源（Default()/normalize 均取自 server.DefaultReadTimeout）：
+	// 两处各写一个数字时，"配置默认 300、handler 兜底 60"这类漂移不会有任何测试报错，
+	// 只会在生产上表现为"配置明明写着 300，实际按 60 掐断"——正是本次事故的形态。
+	if want := int(server.DefaultReadTimeout / time.Second); c.Server.ReadTimeoutSeconds != want {
+		t.Errorf("config 默认 %d 与 handler.DefaultReadTimeout(%v=%ds) 漂移",
+			c.Server.ReadTimeoutSeconds, server.DefaultReadTimeout, want)
+	}
+}
+
+// TestReadTimeoutExplicit 文件覆盖 read_timeout_seconds（慢链路/大上下文调大）。
+func TestReadTimeoutExplicit(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"server":{"read_timeout_seconds":900}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 900 {
+		t.Errorf("read_timeout_seconds=%d want 900", c.Server.ReadTimeoutSeconds)
+	}
+}
+
+// TestReadTimeoutInvalidFallsBack 非法值（0/负数）回落默认 300 而非报错——与
+// max_rotate 同风格（0 没有"不限"之类的合理语义）。
+//
+// 特别注意这里**刻意不采纳** http.Server 的「0 = 不限」语义：0 在配置文件里更可能
+// 被当成"没填"，而"不限"等于拆掉慢速 body 的闸门，与旧值 60s 的防护意图相悖。
+// 故断言必须是"回落 300"而不是"变成 0"。
+func TestReadTimeoutInvalidFallsBack(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		if err := os.WriteFile(fp, []byte(`{"server":{"read_timeout_seconds":`+v+`}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("read_timeout_seconds=%s must fall back, not error: %v", v, err)
+		}
+		if c.Server.ReadTimeoutSeconds != 300 {
+			t.Errorf("read_timeout_seconds=%s normalize 后=%d want 300（回落默认，而非 0=不限）",
+				v, c.Server.ReadTimeoutSeconds)
+		}
+	}
+	// 键缺席同样保持默认 300（老配置零影响）。
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 300 {
+		t.Errorf("read_timeout_seconds 键缺席=%d want 300", c.Server.ReadTimeoutSeconds)
+	}
+}
+
+// TestReadTimeoutEnvOverride env WB2A_READ_TIMEOUT_SECONDS 覆盖 JSON 值；
+// 非法（<=0）同样走 normalize 回落 300（env 与 JSON 同口径）。
+func TestReadTimeoutEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"server":{"read_timeout_seconds":120}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WB2A_READ_TIMEOUT_SECONDS", "600")
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 600 {
+		t.Errorf("WB2A_READ_TIMEOUT_SECONDS=600 应覆盖 JSON 的 120，got %d", c.Server.ReadTimeoutSeconds)
+	}
+	t.Setenv("WB2A_READ_TIMEOUT_SECONDS", "0")
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 300 {
+		t.Errorf("WB2A_READ_TIMEOUT_SECONDS=0 应回落 300，got %d", c.Server.ReadTimeoutSeconds)
+	}
+}
+
+// TestReadTimeoutJSONKeyRoundTrip JSON 键名双向核对：面板 GET 回显（结构体序列化）
+// 与 POST 保存（反序列化）必须用同一个键名——两边漂移时表单值读不到也存不进。
+// 键名字面量用 hex 构造（显示的字符串未必等于真实字节，字面量断言可能假绿）。
+func TestReadTimeoutJSONKeyRoundTrip(t *testing.T) {
+	key := string([]byte{
+		0x72, 0x65, 0x61, 0x64, 0x5f, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75, 0x74, 0x5f,
+		0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x73,
+	}) // read_timeout_seconds
+	if key != "read_timeout_seconds" {
+		t.Fatalf("hex decode mismatch: %q", key)
+	}
+	// 入站：用 hex 键走「面板保存」的解析路径。
+	c, err := ParseConfig([]byte(`{"server":{"` + key + `":450}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 450 {
+		t.Errorf("hex-key read_timeout_seconds=%d want 450", c.Server.ReadTimeoutSeconds)
+	}
+	// 出站：序列化出来的键名必须逐字节等于 read_timeout_seconds（面板回显依赖它）。
+	out, err := json.Marshal(c.Server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m[key]; !ok {
+		t.Errorf("server 序列化缺 key %q: %s", key, out)
+	}
+}
+
+// TestReadTimeoutHotAppliedNotRestartRequired read_timeout_seconds 必须能热改，
+// 不得出现在「需重启」清单里。
+//
+// 锁的是设计取舍：本项走 handler.SetReadTimeout（逐请求重设读截止）而非
+// http.Server.ReadTimeout 静态字段，面板保存后立即生效。若被误加进重启清单，面板
+// 会对一个已即时生效的键提示"需重启"（误导性提示，用户明确抱怨过这类问题）。
+func TestReadTimeoutHotAppliedNotRestartRequired(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "read_timeout") {
+			t.Errorf("read_timeout_seconds 已热生效，不应在需重启清单里: %q", f)
+		}
+	}
+	// 反向：max_body_mb 也不该在（同口径热改），确认清单语义没被整体改坏。
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "max_body_mb") {
+			t.Errorf("max_body_mb 已热生效，不应在需重启清单里: %q", f)
+		}
+	}
+}
+
+// TestConfigExampleHasReadTimeoutKey config.example.json 必须带上新键：
+// 它是用户复制起步的模板，缺键会让新特性在手写配置的人眼里不存在。
+func TestConfigExampleHasReadTimeoutKey(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 无法解析: %v", err)
+	}
+	if c.Server.ReadTimeoutSeconds != 300 {
+		t.Errorf("example 的 read_timeout_seconds=%d want 300", c.Server.ReadTimeoutSeconds)
 	}
 }

@@ -316,6 +316,8 @@ func main() {
 		PinnedModels:     pinnedModels,
 		MaxBodyBytes:     int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 		MaxRotate:        cfg.Server.MaxRotate,              // 单请求最多换号次数（池内账号多时可调大）
+		// 入站读窗口：handler 侧按此值逐请求重设读截止（面板改完即时生效）。
+		ReadTimeout: time.Duration(cfg.Server.ReadTimeoutSeconds) * time.Second,
 	})
 	chatHandler = h
 
@@ -333,8 +335,14 @@ func main() {
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
-		// 取值大于 MaxBodyMB 在常规带宽下的上传耗时；聊天请求体上限默认 8MB。
-		ReadTimeout: 60 * time.Second,
+		// 取值来自 server.read_timeout_seconds（默认 300s）：旧版写死 60s，让 8MB 上限
+		// 的请求必须在 60s 内传完（>1.1Mbps 稳定上行），而 460KB+ 上下文经 TUN 代理 +
+		// 跨境链路的上传耗时波动极大——超时即 i/o timeout，用户对话被拦腰截断
+		// （v1.9.13 生产事故）。300s 下 8MB 只需 27KB/s 上行。
+		// 这里的值是**启动兜底**：面板改该项后由 handler 逐请求重设读截止即时生效
+		// （见 handler.armBodyReadDeadline），无需重启；本字段仍保留，覆盖 handler
+		// 未挂到的路径（如面板自身端点）并作为「连接建立 → 首个请求」的初值。
+		ReadTimeout: time.Duration(cfg.Server.ReadTimeoutSeconds) * time.Second,
 		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
 		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
@@ -355,6 +363,10 @@ func main() {
 	}()
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	// 入站读窗口透出：慢链路上传大上下文被掐断时，这一行是排查起点
+	// （server.read_timeout_seconds，面板可热改）。
+	log.Printf("[server] 入站请求体读取窗口 %ds（server.read_timeout_seconds，面板修改即时生效）；请求头上限 30s；请求体上限 %dMB",
+		cfg.Server.ReadTimeoutSeconds, cfg.Server.MaxBodyMB)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
@@ -382,6 +394,8 @@ func panelListenPath(listen string) string {
 //     GC ticker 已在 StartGC 时按旧值启动，重建风险大 → 仍列为重启项）
 //   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
 //   - server.max_rotate → handler.SetMaxRotate（同上一行口径：池内账号多时调大换号次数即时生效）
+//   - server.read_timeout_seconds → handler.SetReadTimeout（逐请求重设读截止，见
+//     handler.armBodyReadDeadline；慢链路大上下文不再被启动时的静态值掐断）
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 //   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.gc_interval
@@ -461,6 +475,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if srv != nil {
 		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
 		srv.SetMaxRotate(newCfg.Server.MaxRotate) // 池内账号多时调大换号次数，保存后即时生效
+		// 入站读窗口热改：handler 侧只写原子镜像，实际生效靠逐请求重设读截止
+		// （armBodyReadDeadline）。刻意不改 http.Server.ReadTimeout——它是裸字段、
+		// 无并发安全 setter，运行期赋值是数据竞争；且启动时那份静态值仅作兜底。
+		srv.SetReadTimeout(time.Duration(newCfg.Server.ReadTimeoutSeconds) * time.Second)
 	}
 
 	return restartRequiredFields(newCfg), nil

@@ -5,7 +5,8 @@
   "state_file": "./data/state.json",
   "server": {
     "max_body_mb": 8,
-    "max_rotate": 3
+    "max_rotate": 3,
+    "read_timeout_seconds": 300
   },
   "cooldown": {
     "soft_rate": "600s",
