@@ -448,3 +448,44 @@ func TestAppJSUsageChartTimeAxis(t *testing.T) {
 		t.Error("renderUsageChart 仍按序号等距排布（x = PL + i * step），时间轴不真实")
 	}
 }
+
+// TestAppJSAuthWatchWiring schedule.auth_watch_* 的面板接线必须齐全：CFG_MAP 映射
+// （否则表单值与后端对不上）+ 开关与数字输入项存在。
+//
+// 为什么需要：auth_watch_* 是「手工上传凭证文件免重启生效」的唯一开关，接线缺失时
+// 面板上是个只显示不保存的装饰控件——用户关掉它以为省了 IO，实际照旧每 30 秒扫描；
+// 反之改了间隔也不生效。app.js/index.html 是 go:embed 静态资源，Go 编译器不校验
+// 其内容（与 TestAppJSMaxRotateWiring 同因，把接线完整性前移）。
+func TestAppJSAuthWatchWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+	for _, want := range []string{
+		`auth_watch_enabled: ['schedule', 'auth_watch_enabled']`,
+		`auth_watch_seconds: ['schedule', 'auth_watch_seconds']`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("app.js 缺 CFG_MAP 映射：%s", want)
+		}
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`name="auth_watch_enabled"`, `name="auth_watch_seconds"`} {
+		if !strings.Contains(string(html), want) {
+			t.Errorf("index.html 缺配置表单项 %s", want)
+		}
+	}
+	// 秒数输入必须是 number 类型：collectConfig 按 el.type 决定是否 Number() 转换，
+	// 写成文本框会以 string 提交（后端 json 解码 int 失败 → 整个保存请求 400）。
+	body := jsFuncBody(s, "const CFG_MAP")
+	if body == "" {
+		t.Fatal("app.js 缺 CFG_MAP 定义")
+	}
+	if !strings.Contains(string(html), `name="auth_watch_seconds" type="number"`) {
+		t.Error(`auth_watch_seconds 必须是 type="number"（否则提交字符串导致保存失败）`)
+	}
+}

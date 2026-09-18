@@ -233,6 +233,12 @@ func main() {
 	case cfg.BalanceRefreshInterval > 0:
 		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
 	}
+	switch {
+	case !cfg.Schedule.AuthWatchEnabled:
+		log.Printf("auths 目录热加载已禁用（schedule.auth_watch_enabled=false）：手工上传的账号文件需重启才生效")
+	case cfg.AuthWatchInterval > 0:
+		log.Printf("auths 目录热加载：每 %s 扫描 %s（手工上传/删除账号文件免重启）", cfg.AuthWatchInterval, cfg.AuthDir)
+	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
@@ -317,6 +323,10 @@ func main() {
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// auths 目录热加载：每 AuthWatchInterval 扫一轮，把手工上传/删除的 auth 文件对齐进池。
+	// 与启动时的 p.SyncToDir 共用 pool 的对账实现（语义逐字一致）。
+	// 注：即便 enabled=false 也调用（interval=0 → 循环空转等热启用），面板打开开关即生效。
+	sch.StartAuthWatch(ctx, cfg.AuthDir, cfg.AuthWatchInterval)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -367,7 +377,7 @@ func panelListenPath(listen string) string {
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights
-//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
+//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetAuthWatchInterval
 //   - session_sticky.ttl → session.Router.SetTTL（原子热改；gc_interval 不在此列，
 //     GC ticker 已在 StartGC 时按旧值启动，重建风险大 → 仍列为重启项）
 //   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
@@ -435,6 +445,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	// auths 目录热加载间隔/开关热改：原子写 + rearm（下一轮生效，无需重启）。
+	// 注意 auth_dir 本身仍是重启项（watcher 在启动时捕获目录），热改只影响扫描节奏。
+	sch.SetAuthWatchInterval(newCfg.AuthWatchInterval)
 	// 快过期积分窗口热改：原子写，下一轮签到/余额刷新即按新窗口分桶（无需重启）。
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	// 粘性 TTL 热改：原子写，下一次 expired 判定（快路径/慢路径/GC）即按新值算。

@@ -35,7 +35,9 @@
     "keepalive_enabled": true,
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
-    "balance_refresh_minutes": 5
+    "balance_refresh_minutes": 5,
+    "auth_watch_enabled": true,
+    "auth_watch_seconds": 30
   },
   "global": {
     "enabled": true,

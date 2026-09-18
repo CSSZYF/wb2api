@@ -72,6 +72,11 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// auths 目录热加载：定时扫描 auth_dir，把手工上传/删除的 auth 文件增量对齐进池，
+		// 免重启生效（云服务器场景：本地登录后把凭证文件上传到 auths/）。缺省开启。
+		AuthWatchEnabled bool `json:"auth_watch_enabled"` // 缺省 true；false = 关闭
+		AuthWatchSeconds int  `json:"auth_watch_seconds"` // 缺省 30；<=0 回落 30
 	} `json:"schedule"`
 
 	Global struct {
@@ -218,6 +223,7 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
+	AuthWatchInterval      time.Duration `json:"-"` // 0 = 不启动/暂停（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
 }
 
@@ -251,6 +257,9 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	// auths 目录热加载缺省开启、30 秒一轮（账号数是个位数，每轮只做目录列表 + stat）。
+	c.Schedule.AuthWatchEnabled = true
+	c.Schedule.AuthWatchSeconds = 30
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -582,6 +591,14 @@ func (c *Config) normalize() error {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	// auths 目录热加载：启用时 seconds<=0 回落默认 30；关闭时 interval 保持 0（不扫描）。
+	// 与余额刷新同一形态：0 是「开关关闭」的哨兵，故 <=0 一律先回落再判。
+	if c.Schedule.AuthWatchEnabled {
+		if c.Schedule.AuthWatchSeconds <= 0 {
+			c.Schedule.AuthWatchSeconds = 30
+		}
+		c.AuthWatchInterval = time.Duration(c.Schedule.AuthWatchSeconds) * time.Second
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
