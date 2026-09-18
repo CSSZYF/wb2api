@@ -122,25 +122,32 @@ func TestPromoteReasoningPartsMultiAndExisting(t *testing.T) {
 	}
 }
 
-// TestPromoteReasoningPartsGlobalPassthrough global 域原样透传：数组形态与 part 一字不动，
-// 且不新增顶层 reasoning_content（global 上游接受该格式，改它反而引入风险）。
-func TestPromoteReasoningPartsGlobalPassthrough(t *testing.T) {
+// TestPromoteReasoningPartsBothRealmsConvert 两个域都转换（实测修正）：
+// 最初假设 global 域接受 reasoning part、只 CN 域转换；2026-09-18 实测证伪——
+// global 域同样 400 code=11101，转成顶层 reasoning_content 后两域均 200。
+// 故本用例锁死「不分域」：global 与 CN 产出必须一致（都提升、都不残留 part）。
+func TestPromoteReasoningPartsBothRealmsConvert(t *testing.T) {
 	body := `{"model":"glm-5.2","messages":[
 		{"role":"assistant","content":[
 			{"type":"reasoning","text":"  [A]\nthought  "},
 			{"type":"text","text":"answer"}]}]}`
-	out := PrepareBodyOptRealm([]byte(body), "global", false, false, nil, nil)
-	asst := msgAt(t, out, 0)
-	if _, has := asst["reasoning_content"]; has {
-		t.Errorf("global 域不应提升 reasoning_content: %v (out=%s)", asst, out)
+	cn := PrepareBodyOptRealm([]byte(body), "cn", false, false, nil, nil)
+	gl := PrepareBodyOptRealm([]byte(body), "global", false, false, nil, nil)
+	if string(cn) != string(gl) {
+		t.Errorf("两个域产出应逐字节相同\ncn =%s\ngl =%s", cn, gl)
+	}
+	asst := msgAt(t, gl, 0)
+	rc, _ := asst["reasoning_content"].(string)
+	if rc != "  [A]\nthought  " {
+		t.Errorf("global 域 reasoning_content = %q want %q (out=%s)", rc, "  [A]\nthought  ", gl)
 	}
 	parts, ok := asst["content"].([]any)
-	if !ok || len(parts) != 2 {
-		t.Fatalf("global 域 content 数组应原样 2 个 part，got %#v (out=%s)", asst["content"], out)
+	if !ok || len(parts) != 1 {
+		t.Fatalf("content 应只剩 1 个 text part，got %#v (out=%s)", asst["content"], gl)
 	}
 	p0, _ := parts[0].(map[string]any)
-	if p0["type"] != "reasoning" || p0["text"] != "  [A]\nthought  " {
-		t.Errorf("global 域 reasoning part 被改动: %v", p0)
+	if p0["type"] != "text" || p0["text"] != "answer" {
+		t.Errorf("text part 被改动: %v", p0)
 	}
 }
 
@@ -185,8 +192,8 @@ func TestPromoteReasoningPartsNoReasoningZeroChange(t *testing.T) {
 // 转换必须在前，backfill 才看得见「历史里有思考痕迹」——提升出的 reasoning_content
 // 触发 DeepSeek 多轮一致性，所有 assistant 消息补齐该字段。
 //
-// 对照组（global 域，不转换）：backfill 第一遍只扫顶层字段，数组 part 它看不见 →
-// 零改动。这正是修复前 CN 域的行为，也是「转换必须早于 backfill」的证据。
+// 两个域行为一致（转换不分域）：CN 与 global 都必须补齐，不得再有「数组 part 对
+// backfill 不可见」的对照组（修复前的 global 行为已被实测证伪为 bug）。
 func TestPromoteReasoningPartsBeforeBackfill(t *testing.T) {
 	body := `{"model":"deepseek-v4-flash","messages":[
 		{"role":"user","content":"u"},
@@ -194,22 +201,17 @@ func TestPromoteReasoningPartsBeforeBackfill(t *testing.T) {
 		{"role":"user","content":"u2"},
 		{"role":"assistant","content":"a2"}]}`
 
-	cn := PrepareBodyOptRealm([]byte(body), "cn", false, false, nil, nil)
-	got := assistantRC(t, cn)
-	if len(got) != 2 {
-		t.Fatalf("assistant 消息数 = %d want 2 (out=%s)", len(got), cn)
-	}
-	if got[0] != "t1" {
-		t.Errorf("assistant[0].reasoning_content = %q want %q (out=%s)", got[0], "t1", cn)
-	}
-	if got[1] != "" {
-		t.Errorf("backfill 应给无痕迹的 assistant 补空串，got %q (out=%s)", got[1], cn)
-	}
-
-	gl := PrepareBodyOptRealm([]byte(body), "global", false, false, nil, nil)
-	for i, rc := range assistantRC(t, gl) {
-		if rc != "<absent>" {
-			t.Errorf("global 域（不转换）backfill 不应看到数组 part：assistant[%d]=%q (out=%s)", i, rc, gl)
+	for _, realm := range []string{"cn", "global"} {
+		out := PrepareBodyOptRealm([]byte(body), realm, false, false, nil, nil)
+		got := assistantRC(t, out)
+		if len(got) != 2 {
+			t.Fatalf("[%s] assistant 消息数 = %d want 2 (out=%s)", realm, len(got), out)
+		}
+		if got[0] != "t1" {
+			t.Errorf("[%s] assistant[0].reasoning_content = %q want %q (out=%s)", realm, got[0], "t1", out)
+		}
+		if got[1] != "" {
+			t.Errorf("[%s] backfill 应给无痕迹的 assistant 补空串，got %q (out=%s)", realm, got[1], out)
 		}
 	}
 }
@@ -344,11 +346,11 @@ func TestChatStreamWireBodyCNReasoningPartPromoted(t *testing.T) {
 	}
 }
 
-// TestChatStreamWireBodyGlobalReasoningPartPreserved 端到端（global realm）：同一 body
-// 数组形态原样出站（global 上游接受该格式），不新增顶层字段。
+// TestChatStreamWireBodyGlobalReasoningPartPromoted 端到端（global realm）：与 CN 同口径
+// 必须提升——实测 global 上游同样 400 code=11101，原「global 原样透传」的假设已证伪。
 // global 路径会先跑 ensureConsoleSystem（首条非 system 时前置兜底 system），
 // 故这里显式带一条 system，assistant 稳定落在 index 1。
-func TestChatStreamWireBodyGlobalReasoningPartPreserved(t *testing.T) {
+func TestChatStreamWireBodyGlobalReasoningPartPromoted(t *testing.T) {
 	var gotBody []byte
 	ts := newTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
@@ -387,15 +389,18 @@ func TestChatStreamWireBodyGlobalReasoningPartPreserved(t *testing.T) {
 		t.Fatalf("messages 数变了: %d (%s)", len(msgs), gotBody)
 	}
 	asst, _ := msgs[1].(map[string]any)
-	if _, has := asst["reasoning_content"]; has {
-		t.Errorf("global 域不应提升 reasoning_content: %v", asst)
+	if got, _ := asst["reasoning_content"].(string); got != "thought" {
+		t.Errorf("global wire reasoning_content = %q want %q", got, "thought")
 	}
 	parts, ok := asst["content"].([]any)
-	if !ok || len(parts) != 2 {
-		t.Fatalf("global 域 content 数组应原样 2 个 part，got %#v", asst["content"])
+	if !ok || len(parts) != 1 {
+		t.Fatalf("global wire content 应保留 1 个 text part，got %#v", asst["content"])
 	}
 	p0, _ := parts[0].(map[string]any)
-	if p0["type"] != "reasoning" || p0["text"] != "thought" {
-		t.Errorf("global 域 reasoning part 被改动: %v", p0)
+	if p0["type"] != "text" || p0["text"] != "answer" {
+		t.Errorf("global wire text part 被改动: %v", p0)
+	}
+	if strings.Contains(string(gotBody), `"type":"reasoning"`) {
+		t.Errorf("global wire body 仍含 reasoning part: %s", gotBody)
 	}
 }

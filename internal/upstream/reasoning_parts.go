@@ -6,7 +6,7 @@
 //	{"role":"assistant","content":[{"type":"reasoning","text":"[A]\nChen reports: ..."},
 //	                               {"type":"text","text":"..."}]}
 //
-// global 域（www.workbuddy.ai）接受该格式；CN 域（copilot.tencent.com）直接 HTTP 400：
+// 两个域都不接受该 part（CN copilot.tencent.com 与 global www.workbuddy.ai 均实测复现）直接 HTTP 400：
 //
 //	{"code":11101,"msg":"Parse message failed: unsupported content type at index 0: reasoning"}
 //
@@ -19,11 +19,11 @@
 // 与零宽脱敏同类：**只做「数组 part → 顶层字符串字段」的结构搬移，text 一字不动**——
 // 用户可见内容与模型读到的语义都不变。
 //
-// 作用域（三条边界，勿越界）：
-//   - 只认 CN 域：调用点按 realmKey(realm)=="cn" 把关（见 payload.go），global 域上游
-//     接受原格式，改它反而引入风险，一律原样透传。
-//   - 不按模型名 gate：reasoning part 不是 deepseek 专属，任何模型的思考内容都可能
-//     这么发（thinking.go 的 isDeepSeekModel 只管思维链开关注入，与此无关）。
+// 作用域（两条边界，勿越界）：
+//   - **两个域都转换**：最初以为只有 CN 域拒绝该 part（global 接受），实测证伪——
+//     global 域同样 400 code=11101（2026-09-18 用同一 body 分别打 cn:/global: 前缀复现，
+//     转成顶层 reasoning_content 后两域均 200）。故转换无分域条件：结构搬移不改任何
+//     可见文本与语义，global 也无需保留原格式。
 //   - 只动 assistant 消息的 reasoning part：reasoning_content 是 assistant 侧的字段，
 //     把别的角色的 part 提到顶层属于语义错位；其余 part 类型（text/image/tool_use…）
 //     一律不动，也不把数组扁平化成字符串（那会改变上游看到的结构）。
@@ -34,7 +34,7 @@ import (
 	"strings"
 )
 
-// promoteReasoningParts 把 CN 域出站 messages 里 assistant 消息 content 数组中的
+// promoteReasoningParts 把出站 messages 里 assistant 消息 content 数组中的
 // reasoning part 提升为顶层 reasoning_content 字符串字段，并从数组移除该 part。
 //
 // 逐条 assistant 消息：
@@ -106,7 +106,7 @@ func promoteReasoningParts(obj map[string]any) int {
 	}
 	if convertedMsgs > 0 {
 		model, _ := obj["model"].(string)
-		log.Printf("cn reasoning parts promoted model=%s msgs=%d parts=%d", model, convertedMsgs, convertedParts)
+		log.Printf("reasoning parts promoted model=%s msgs=%d parts=%d", model, convertedMsgs, convertedParts)
 	}
 	return convertedMsgs
 }

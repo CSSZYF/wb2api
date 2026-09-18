@@ -38,9 +38,9 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize, zeroWidth bool, e
 	return PrepareBodyOptRealm(src, "", sanitize, zeroWidth, efforts, defaultEfforts)
 }
 
-// PrepareBodyOptRealm 同 PrepareBodyOptWithEffortsAndDefault，但显式指定 realm：
-// CN 域（realmKey(realm)=="cn"，空串按包内约定同 cn）额外做 reasoning content-part
-// 转换（见 reasoning_parts.go），global 域原样透传。
+// PrepareBodyOptRealm 同 PrepareBodyOptWithEffortsAndDefault，但显式指定 realm（供
+// efforts 缓存分桶等按域区分的处理使用；reasoning content-part 转换不分域，见
+// reasoning_parts.go——实测 CN 与 global 上游都拒绝该 part 类型）。
 //
 // 为什么用新变体而不是给原函数加参数：原函数有 20+ 处调用点（大量测试直接构造
 // 请求体），加参数等于全量改签名、把「realm 感知」扩散到与域无关的用例里；
@@ -74,10 +74,13 @@ func PrepareBodyOptRealm(src []byte, realm string, sanitize, zeroWidth bool, eff
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
 		obj["messages"] = msgs
 	}
-	// CN 域 reasoning content-part 转换（见 reasoning_parts.go）：ZCode 3.11.2 把思考
-	// 内容作为 content 数组里的 {"type":"reasoning"} part 发出，CN 上游不认该 part 类型
-	// （HTTP 400 code=11101 "unsupported content type at index 0: reasoning"），
-	// global 域接受该格式故原样透传。只做「part → 顶层字符串字段」的结构搬移，text 一字不动。
+	// reasoning content-part 转换（见 reasoning_parts.go）：ZCode 3.11.2 把思考
+	// 内容作为 content 数组里的 {"type":"reasoning"} part 发出，**两个域都不认**
+	// 该 part 类型（HTTP 400 code=11101 "unsupported content type at index 0:
+	// reasoning"），改成顶层 reasoning_content 字符串后两域均 200。
+	// （最初的 202c 只在 CN 域转换，假设 global 接受该 part；实测证伪：
+	// global 同样 400。故无条件转换——结构搬移不改任何可见文本与语义，
+	// 无需分域。）
 	//
 	// 位置理由（顺序敏感，三处）：
 	//  1. 必须早于 backfillReasoningContent：backfill 第一遍只检测顶层 msg["reasoning"] /
@@ -90,9 +93,7 @@ func PrepareBodyOptRealm(src []byte, realm string, sanitize, zeroWidth bool, eff
 	//  3. 必须早于 sanitize：提升后的 reasoning_content 走 sanitizeMessages 的
 	//     reasoning_content 分支净化，覆盖面与提升前 sanitizeContent 对 reasoning part
 	//     的 text 字段净化一致（sanitizeContent 只认 part 的 text 键、不看 type）。
-	if realmKey(realm) == "cn" {
-		promoteReasoningParts(obj)
-	}
+	promoteReasoningParts(obj)
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
