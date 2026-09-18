@@ -67,6 +67,8 @@ type Scheduler struct {
 	// rearmAuthWatch 同上，供 auths 目录热加载循环（authwatch.go）消费：间隔/开关热改
 	// 时立刻唤醒重算。三条循环各用独立 channel，同 channel 被多个 select 消费会丢信号。
 	rearmAuthWatch chan struct{}
+	// rearmCooldownProbe 同上，供后台冷却探活循环（cooldownprobe.go）消费。
+	rearmCooldownProbe chan struct{}
 
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
@@ -75,6 +77,16 @@ type Scheduler struct {
 	// authWatchInterval auths 目录扫描间隔（纳秒，0=暂停）。形态同 balanceInterval：
 	// 循环每轮读当前值，SetAuthWatchInterval 热改（面板保存配置）。
 	authWatchInterval atomic.Int64
+
+	// cooldownProbeInterval 后台冷却探活间隔（纳秒，0=暂停）。形态同 balanceInterval：
+	// 循环每轮读当前值，SetCooldownProbeInterval 热改（面板保存配置）。
+	cooldownProbeInterval atomic.Int64
+
+	// cooldownProbeGap 探活请求之间的最小间隔（<=0 回落 cooldownProbeGapDefault）。
+	// 实例字段而非包级 var：读取点在探活循环 goroutine，包级 var 被测试直接改写即与
+	// 该 goroutine 的读构成数据竞争（fix/200e-race 对 wakeupGrace 的同类修正）。
+	// 生产零配置（恒缺省），仅测试构造后直接改本字段。
+	cooldownProbeGap time.Duration
 
 	// expiringSoonNanos 快过期积分窗口（纳秒，0=禁用分桶）。与 balanceInterval 同一
 	// 形态：cfg.ExpiringSoonWindow 只作启动初值，运行期一律经 expiringSoonWindow() /
@@ -128,11 +140,12 @@ func New(cfg Config) *Scheduler {
 		cfg.BlackcatHours = []int{23}
 	}
 	s := &Scheduler{
-		cfg:            cfg,
-		adoptTried:     make(map[string]string),
-		rearmSchedule:  make(chan struct{}, 1),
-		rearmBalance:   make(chan struct{}, 1),
-		rearmAuthWatch: make(chan struct{}, 1),
+		cfg:                cfg,
+		adoptTried:         make(map[string]string),
+		rearmSchedule:      make(chan struct{}, 1),
+		rearmBalance:       make(chan struct{}, 1),
+		rearmAuthWatch:     make(chan struct{}, 1),
+		rearmCooldownProbe: make(chan struct{}, 1),
 	}
 	// 启动初值写入原子字段；此后 cfg.ExpiringSoonWindow 不再被读取（见字段注释）。
 	s.expiringSoonNanos.Store(int64(cfg.ExpiringSoonWindow))

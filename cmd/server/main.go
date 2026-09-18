@@ -239,6 +239,12 @@ func main() {
 	case cfg.AuthWatchInterval > 0:
 		log.Printf("auths 目录热加载：每 %s 扫描 %s（手工上传/删除账号文件免重启）", cfg.AuthWatchInterval, cfg.AuthDir)
 	}
+	switch {
+	case !cfg.Schedule.CooldownProbeEnabled:
+		log.Printf("冷却探活已禁用（schedule.cooldown_probe_enabled=false）：到期的软冷却只能等自然到期或手动解冻")
+	case cfg.CooldownProbeInterval > 0:
+		log.Printf("冷却探活：每 %s 试探已到期的软冷却（成功即解冻，失败零惩罚；硬冷却不探）", cfg.CooldownProbeInterval)
+	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
@@ -329,6 +335,9 @@ func main() {
 	// 与启动时的 p.SyncToDir 共用 pool 的对账实现（语义逐字一致）。
 	// 注：即便 enabled=false 也调用（interval=0 → 循环空转等热启用），面板打开开关即生效。
 	sch.StartAuthWatch(ctx, cfg.AuthDir, cfg.AuthWatchInterval)
+	// 后台冷却探活：每 CooldownProbeInterval 把「已到期的软冷却」试探一遍，成功即解冻。
+	// 与 authwatch 同一形态：即便 enabled=false 也调用（interval=0 → 空转等热启用）。
+	sch.StartCooldownProbe(ctx, cfg.CooldownProbeInterval)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -389,7 +398,7 @@ func panelListenPath(listen string) string {
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights
-//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetAuthWatchInterval
+//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetAuthWatchInterval/SetCooldownProbeInterval
 //   - session_sticky.ttl → session.Router.SetTTL（原子热改；gc_interval 不在此列，
 //     GC ticker 已在 StartGC 时按旧值启动，重建风险大 → 仍列为重启项）
 //   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
@@ -462,6 +471,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// auths 目录热加载间隔/开关热改：原子写 + rearm（下一轮生效，无需重启）。
 	// 注意 auth_dir 本身仍是重启项（watcher 在启动时捕获目录），热改只影响扫描节奏。
 	sch.SetAuthWatchInterval(newCfg.AuthWatchInterval)
+	// 后台冷却探活间隔/开关热改：原子写 + rearm（下一轮生效，无需重启）。
+	sch.SetCooldownProbeInterval(newCfg.CooldownProbeInterval)
 	// 快过期积分窗口热改：原子写，下一轮签到/余额刷新即按新窗口分桶（无需重启）。
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	// 粘性 TTL 热改：原子写，下一次 expired 判定（快路径/慢路径/GC）即按新值算。

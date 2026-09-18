@@ -1507,3 +1507,112 @@ func TestConfigExampleHasReadTimeoutKey(t *testing.T) {
 		t.Errorf("example 的 read_timeout_seconds=%d want 300", c.Server.ReadTimeoutSeconds)
 	}
 }
+
+// TestCooldownProbeDefaults 后台冷却探活缺省开启、10 分钟一轮。
+//
+// 缺省开启的依据（用户痛点）：单账号部署撞 6004 后整站 503，网关没有任何机制去试
+// 上游是否已提前恢复——探活是唯一出路，默认关掉等于把这个痛点留给用户自己发现。
+// 成本可控：无到期目标时整轮零出站流量（只做一次池遍历）。
+func TestCooldownProbeDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.CooldownProbeEnabled {
+		t.Error("cooldown_probe_enabled 缺省应为 true")
+	}
+	if c.Schedule.CooldownProbeMinutes != 10 {
+		t.Errorf("cooldown_probe_minutes 缺省=%d want 10", c.Schedule.CooldownProbeMinutes)
+	}
+	if c.CooldownProbeInterval != 10*time.Minute {
+		t.Errorf("CooldownProbeInterval=%v want 10m", c.CooldownProbeInterval)
+	}
+}
+
+// TestCooldownProbeNormalize 三种配置形态：显式改间隔 / 显式关闭 / <=0 回落 10。
+// 回落口径与 balance_refresh / auth_watch 一致：0 是「开关关闭」的哨兵值，
+// 故 <=0 先回落再判（否则「配了 0 分钟」会被当成关闭开关，而不是回落默认）。
+
+// TestCooldownProbeNormalize 三种配置形态：显式改间隔 / 显式关闭 / <=0 回落 10。
+// 回落口径与 balance_refresh / auth_watch 一致：0 是「开关关闭」的哨兵值，
+// 故 <=0 先回落再判（否则「配了 0 分钟」会被当成关闭开关，而不是回落默认）。
+func TestCooldownProbeNormalize(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	write := func(body string) *Config {
+		t.Helper()
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", body, err)
+		}
+		return c
+	}
+
+	c := write(`{"schedule":{"cooldown_probe_enabled":true,"cooldown_probe_minutes":3}}`)
+	if c.CooldownProbeInterval != 3*time.Minute {
+		t.Errorf("显式 3 分钟: interval=%v want 3m", c.CooldownProbeInterval)
+	}
+
+	c = write(`{"schedule":{"cooldown_probe_enabled":false,"cooldown_probe_minutes":3}}`)
+	if c.CooldownProbeInterval != 0 {
+		t.Errorf("显式关闭: interval=%v want 0（不启动/暂停）", c.CooldownProbeInterval)
+	}
+	if c.Schedule.CooldownProbeEnabled {
+		// 显式 false 应生效——这里若为 true 说明开关被 normalize 覆盖了。
+		t.Error("显式 cooldown_probe_enabled=false 未生效")
+	}
+
+	// <=0 回落默认 10（0 是关闭哨兵，不表意"不限/立即"）。
+	c = write(`{"schedule":{"cooldown_probe_enabled":true,"cooldown_probe_minutes":0}}`)
+	if c.Schedule.CooldownProbeMinutes != 10 || c.CooldownProbeInterval != 10*time.Minute {
+		t.Errorf("minutes=0: %d/%v want 10/10m（回落默认）",
+			c.Schedule.CooldownProbeMinutes, c.CooldownProbeInterval)
+	}
+	c = write(`{"schedule":{"cooldown_probe_enabled":true,"cooldown_probe_minutes":-5}}`)
+	if c.Schedule.CooldownProbeMinutes != 10 || c.CooldownProbeInterval != 10*time.Minute {
+		t.Errorf("minutes=-5: %d/%v want 10/10m（回落默认）",
+			c.Schedule.CooldownProbeMinutes, c.CooldownProbeInterval)
+	}
+}
+
+// TestCooldownProbeNotRestartRequired 探活间隔/开关必须**不**出现在重启项清单里：
+// 它经 SetCooldownProbeInterval 原子热改（面板保存后下一轮即按新值），列为重启项
+// 会让面板给出误导性提示（用户以为要重启，实际已生效）。
+
+// TestCooldownProbeNotRestartRequired 探活间隔/开关必须**不**出现在重启项清单里：
+// 它经 SetCooldownProbeInterval 原子热改（面板保存后下一轮即按新值），列为重启项
+// 会让面板给出误导性提示（用户以为要重启，实际已生效）。
+func TestCooldownProbeNotRestartRequired(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "cooldown_probe") {
+			t.Errorf("restartRequiredFields 含 %q：探活间隔/开关是热改项，不该提示重启", f)
+		}
+	}
+}
+
+// TestConfigExampleHasCooldownProbeKeys config.example.json 必须带上新键
+// （且能被启动路径原样解析）——模板缺键时用户不知道有这个开关存在。
+
+// TestConfigExampleHasCooldownProbeKeys config.example.json 必须带上新键
+// （且能被启动路径原样解析）——模板缺键时用户不知道有这个开关存在。
+func TestConfigExampleHasCooldownProbeKeys(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 无法解析: %v", err)
+	}
+	if !c.Schedule.CooldownProbeEnabled || c.Schedule.CooldownProbeMinutes != 10 {
+		t.Errorf("example 的 cooldown_probe 口径=%v/%d want true/10",
+			c.Schedule.CooldownProbeEnabled, c.Schedule.CooldownProbeMinutes)
+	}
+}

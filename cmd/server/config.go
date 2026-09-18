@@ -98,6 +98,16 @@ type Config struct {
 		// 免重启生效（云服务器场景：本地登录后把凭证文件上传到 auths/）。缺省开启。
 		AuthWatchEnabled bool `json:"auth_watch_enabled"` // 缺省 true；false = 关闭
 		AuthWatchSeconds int  `json:"auth_watch_seconds"` // 缺省 30；<=0 回落 30
+
+		// 后台冷却探活：定时把「已到期的软冷却」（账号级 CoolSoft 到期 / 模型级
+		// modelCooldowns 条目到期）拿出来各发一个最小 chat 请求，试探上游是否已提前
+		// 恢复——上游重置文案保守（或提前放量）时，网关不必干等声明的墙钟。
+		// 成功即解冻（模型级条目提前失效；账号级软冷却一并清）；**失败零惩罚**
+		// （不推进 softStreak、不延长冷却、不喂熔断器——探活绝不能把账号越探越死）。
+		// 硬冷却（CoolHard：积分耗尽）绝不探（恢复条件是签到到账，探了白花配额）。
+		// 缺省开启（用户痛点：单账号部署撞 6004 后整站 503 且无从试探）。
+		CooldownProbeEnabled bool `json:"cooldown_probe_enabled"` // 缺省 true；false = 关闭
+		CooldownProbeMinutes int  `json:"cooldown_probe_minutes"` // 缺省 10；<=0 回落 10
 	} `json:"schedule"`
 
 	Global struct {
@@ -245,6 +255,7 @@ type Config struct {
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	AuthWatchInterval      time.Duration `json:"-"` // 0 = 不启动/暂停（enabled=false）
+	CooldownProbeInterval  time.Duration `json:"-"` // 0 = 暂停/未启用（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
 }
 
@@ -286,6 +297,10 @@ func Default() *Config {
 	// auths 目录热加载缺省开启、30 秒一轮（账号数是个位数，每轮只做目录列表 + stat）。
 	c.Schedule.AuthWatchEnabled = true
 	c.Schedule.AuthWatchSeconds = 30
+	// 后台冷却探活缺省开启、10 分钟一轮：探活只在「有到期目标」时才发请求（无目标时
+	// 整轮零出站流量），故默认开启的边际成本仅是每 10 分钟一次池遍历。
+	c.Schedule.CooldownProbeEnabled = true
+	c.Schedule.CooldownProbeMinutes = 10
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -637,6 +652,14 @@ func (c *Config) normalize() error {
 			c.Schedule.AuthWatchSeconds = 30
 		}
 		c.AuthWatchInterval = time.Duration(c.Schedule.AuthWatchSeconds) * time.Second
+	}
+	// 后台冷却探活：启用时 minutes<=0 回落默认 10；关闭时 interval 保持 0（循环暂停）。
+	// 与余额刷新/authwatch 同一形态（0 是「开关关闭」的哨兵，故 <=0 一律先回落再判）。
+	if c.Schedule.CooldownProbeEnabled {
+		if c.Schedule.CooldownProbeMinutes <= 0 {
+			c.Schedule.CooldownProbeMinutes = 10
+		}
+		c.CooldownProbeInterval = time.Duration(c.Schedule.CooldownProbeMinutes) * time.Minute
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
