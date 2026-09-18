@@ -20,7 +20,11 @@ const (
 	// dialTimeout TCP 连接建立上限。半死连接的第一道闸：连不上就快速失败
 	// 轮转换号，不再干等系统 TCP 重传窗口（实测半开 TCP 单次 TTFB 卡 936s
 	// ——默认 Dialer 无超时上限）。
-	dialTimeout = 10 * time.Second
+	//
+	// 2026-09-18 与 tlsHandshakeTimeout 同步放宽到 30s：TCP 建连与 TLS 握手
+	// 是同一网络路径上的相邻阶段，握手实测 >10s 的链路建连也可能偏慢；
+	// 两者取齐避免「建连 10s 截断、握手 30s 放行」的口径分裂。
+	dialTimeout = 30 * time.Second
 	// dialKeepAlive TCP keepalive 探测周期。默认 Dialer 2h 才发首个探测——
 	// NAT 黑洞里 2h 足够连接半死且被复用。15s 周期让死连接在 15~30s 内被
 	// 内核掐掉（RST/ETIMEDOUT），复用侧立即感知而非卡到重传窗口。
@@ -28,7 +32,13 @@ const (
 	// tlsHandshakeTimeout TLS 握手上限。此前完全缺失——握手挂起时无任何层
 	// 兜底（ResponseHeaderTimeout 只在请求写完后才计时），只能干等到
 	// HTTP.Client.Timeout(120s)。
-	tlsHandshakeTimeout = 10 * time.Second
+	//
+	// 2026-09-18 实测修正：10s 过紧。CN 上游 copilot.tencent.com 在国内网络下
+	// 握手常态 >10s，实测单次请求连续两次 TLS handshake timeout（各白等 10.5s）
+	// 后第三次才成功——用户观感是「开头卡一两分钟」。放宽到 30s：正常握手
+	// （<3s）零影响，慢握手不再被误杀；半死连接仍由 dialKeepAlive(15s) 与
+	// ResponseHeaderTimeout 兜底。
+	tlsHandshakeTimeout = 30 * time.Second
 	// idleConnTimeout 空闲连接池保留时长。从 90s 收到 30s：WAF 风暴后上游
 	// 常态性掐闲置连接，90s 池里的连接多半已死；复用侧仍有 15s keepalive
 	// 兜底识别。

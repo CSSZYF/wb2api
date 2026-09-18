@@ -25,8 +25,8 @@ func TestNewDialerParams(t *testing.T) {
 	if d.KeepAlive != dialKeepAlive {
 		t.Errorf("dialer.KeepAlive=%v want %v", d.KeepAlive, dialKeepAlive)
 	}
-	if d.Timeout != 10*time.Second || d.KeepAlive != 15*time.Second {
-		t.Errorf("dial params=(%v, %v) want (10s, 15s)", d.Timeout, d.KeepAlive)
+	if d.Timeout != 30*time.Second || d.KeepAlive != 15*time.Second {
+		t.Errorf("dial params=(%v, %v) want (30s, 15s)——30s 为 2026-09-18 国内网络实测放宽", d.Timeout, d.KeepAlive)
 	}
 }
 
@@ -51,8 +51,8 @@ func TestNewTransportHardening(t *testing.T) {
 		t.Errorf("TLSNextProto must be empty, got %d entries", len(tr.TLSNextProto))
 	}
 	// 2. TLS 握手超时（此前完全缺失：握手挂起只能干等到 HTTP.Client.Timeout）。
-	if tr.TLSHandshakeTimeout != 10*time.Second {
-		t.Errorf("TLSHandshakeTimeout=%v want 10s", tr.TLSHandshakeTimeout)
+	if tr.TLSHandshakeTimeout != 30*time.Second {
+		t.Errorf("TLSHandshakeTimeout=%v want 30s（国内网络握手实测 >10s，10s 会误杀）", tr.TLSHandshakeTimeout)
 	}
 	// 3. 空闲连接池：从 90s 收到 30s（WAF 风暴后池里连接多半已死）。
 	if tr.IdleConnTimeout != 30*time.Second {
