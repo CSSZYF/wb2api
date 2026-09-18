@@ -1762,13 +1762,22 @@ func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 	return remain, total, err
 }
 
-// packageEndLayout 上游套餐到期时间的墙钟格式（UTC+8，与 softRateResetLoc 同口径）。
+// packageEndLayout 上游 CycleEndTime / 请求体过滤串的时间格式（墙钟，UTC+8，
+// 与 softRateResetLoc 同口径）。响应侧到期字段与请求侧过滤串实测同格式，共用一个常量。
 const packageEndLayout = "2006-01-02 15:04:05"
 
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
-// soon > 0 且套餐 PackageEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
+// soon > 0 且套餐 CycleEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
 // （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
 // 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
+//
+// 到期字段必须读 CycleEndTime：上游 get-user-resource 的响应字段全集（CN/global
+// 两域实测）**没有** PackageEndTime——旧实现读该字段恒 miss，导致 expiring 恒 0、
+// 选号第四因子（expiringWeight）自上线从未生效。真实到期字段是 CycleEndTime。
+// 解析失败/缺失的套餐保守归入 Stable（不误标为快过期而插队）。
+//
+// 注意：请求体里的 PackageEndTimeRangeBegin/End 是**过滤参数**，与响应侧到期字段
+// 同名但无关，不得改动。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
 	now := time.Now()
 	body := map[string]any{
@@ -1788,7 +1797,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 			Data struct {
 				Accounts []struct {
 					PackageName         string `json:"PackageName"`
-					PackageEndTime      string `json:"PackageEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
+					CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
 					CapacityUsed        int64  `json:"CapacityUsed"`
@@ -1821,8 +1830,9 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		remain += r
 		total += size
 		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
-		if soon > 0 && r > 0 && acct.PackageEndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.PackageEndTime, softRateResetLoc); perr == nil {
+		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
+			// 上游时间为 UTC+8 墙钟（与 softRateResetLoc 同口径，官网展示时区）。
+			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil {
 				if !end.After(now.Add(soon)) {
 					expiring += r
 				}

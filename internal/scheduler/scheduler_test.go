@@ -218,11 +218,13 @@ func (f *fakeUpstream) server() *httptest.Server {
 
 // expiringStub 返回一个套餐到期时间可控的 get-user-resource 响应，用于验证
 // 快过期窗口（ExpiringSoonWindow）的分桶行为；余额固定 100。
+// 到期字段必须是 CycleEndTime（上游响应字段全集实测无 PackageEndTime，旧桩喂
+// PackageEndTime 会把「读到错误字段」的 bug 掩盖过去）。
 func expiringStub(endTime string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
-			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"PackageEndTime":"` + endTime +
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleEndTime":"` + endTime +
 				`","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0}]}}}}`))
 		default:
 			http.Error(w, "not found", 404)

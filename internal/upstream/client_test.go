@@ -826,6 +826,111 @@ func TestUserResourceNegativeClamped(t *testing.T) {
 	}
 }
 
+// resourceStub 返回一个 get-user-resource 响应，body 为 Accounts 数组内容。
+func resourceStub(accounts string) *Client {
+	return testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[`+accounts+`]}}}}`), nil
+	})
+}
+
+// TestUserResourceDetailedExpiringFromCycleEndTime 锁定快过期分桶的判据字段是
+// CycleEndTime（上游 get-user-resource 响应字段全集实测无 PackageEndTime——旧实现
+// 读 PackageEndTime 恒 miss，expiring 恒 0，选号第四因子自上线从未生效）。
+func TestUserResourceDetailedExpiringFromCycleEndTime(t *testing.T) {
+	now := time.Now()
+	in3d := now.Add(3 * 24 * time.Hour).Format(packageEndLayout)
+	in30d := now.Add(30 * 24 * time.Hour).Format(packageEndLayout)
+	c := resourceStub(
+		`{"PackageName":"奖励包","CycleEndTime":"` + in3d + `","CycleCapacitySize":1500,"CycleCapacityRemain":1200,"CycleCapacityUsed":300},` +
+			`{"PackageName":"周期包","CycleEndTime":"` + in30d + `","CycleCapacitySize":500,"CycleCapacityRemain":300,"CycleCapacityUsed":200}`)
+	remain, _, expiring, err := c.UserResourceDetailed(&auth.Auth{AccessToken: "at"}, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("detailed: %v", err)
+	}
+	if remain != 1500 {
+		t.Errorf("remain=%d want 1500", remain)
+	}
+	if expiring != 1200 {
+		t.Errorf("expiring=%d want 1200（CycleEndTime 在 7 天窗内的奖励包）", expiring)
+	}
+}
+
+// TestUserResourceDetailedNoWindowAllStable soon ≤ 0 时禁用分桶：即便到期时间就在
+// 眼前也全部归 Stable（与引入分桶前行为一致，expiring 恒 0）。
+func TestUserResourceDetailedNoWindowAllStable(t *testing.T) {
+	in1h := time.Now().Add(time.Hour).Format(packageEndLayout)
+	c := resourceStub(`{"PackageName":"p","CycleEndTime":"` + in1h + `","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}`)
+	remain, _, expiring, err := c.UserResourceDetailed(&auth.Auth{AccessToken: "at"}, 0)
+	if err != nil {
+		t.Fatalf("detailed: %v", err)
+	}
+	if remain != 80 || expiring != 0 {
+		t.Errorf("remain=%d expiring=%d, want 80/0（soon<=0 禁用分桶）", remain, expiring)
+	}
+}
+
+// TestUserResourceDetailedIgnoresPackageEndTime 反向断言：只喂旧字段 PackageEndTime
+// 时 expiring 必须为 0。这正是 bug 的本质——上游从不下发该字段，任何"兼容旧字段"
+// 的兜底都会让判据重新变成永远 miss（或引入上游不存在的行为），故锁死此事实。
+func TestUserResourceDetailedIgnoresPackageEndTime(t *testing.T) {
+	in3d := time.Now().Add(3 * 24 * time.Hour).Format(packageEndLayout)
+	c := resourceStub(
+		`{"PackageName":"奖励包","PackageEndTime":"` + in3d + `","CycleCapacitySize":1500,"CycleCapacityRemain":1200,"CycleCapacityUsed":300}`)
+	remain, _, expiring, err := c.UserResourceDetailed(&auth.Auth{AccessToken: "at"}, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("detailed: %v", err)
+	}
+	if remain != 1200 {
+		t.Errorf("remain=%d want 1200", remain)
+	}
+	if expiring != 0 {
+		t.Errorf("expiring=%d want 0（PackageEndTime 不是上游下发字段，不得被读取）", expiring)
+	}
+}
+
+// TestUserResourceDetailedMissingEndTimeStable 响应不含 CycleEndTime：保守归 Stable，
+// 不 panic、不误算为快过期（避免插队）。
+func TestUserResourceDetailedMissingEndTimeStable(t *testing.T) {
+	c := resourceStub(`{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}`)
+	remain, _, expiring, err := c.UserResourceDetailed(&auth.Auth{AccessToken: "at"}, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("detailed: %v", err)
+	}
+	if remain != 80 || expiring != 0 {
+		t.Errorf("remain=%d expiring=%d, want 80/0（无到期字段归 Stable）", remain, expiring)
+	}
+}
+
+// TestUserResourceDetailedInvalidEndTimeStable 字段值格式非法（非墙钟串）：解析失败
+// 保守归 Stable，不 panic、不误标快过期。
+func TestUserResourceDetailedInvalidEndTimeStable(t *testing.T) {
+	c := resourceStub(`{"PackageName":"p","CycleEndTime":"not-a-time","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}`)
+	remain, _, expiring, err := c.UserResourceDetailed(&auth.Auth{AccessToken: "at"}, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("detailed: %v", err)
+	}
+	if remain != 80 || expiring != 0 {
+		t.Errorf("remain=%d expiring=%d, want 80/0（解析失败归 Stable）", remain, expiring)
+	}
+}
+
+// TestUserResourceDetailedRequestKeepsPackageEndTimeRange 请求侧过滤串是
+// PackageEndTimeRangeBegin/End（与响应侧到期字段同名但无关），改响应侧判据时
+// 不得被顺手改名——上游按该参数过滤套餐列表，改错会直接查不到包。
+func TestUserResourceDetailedRequestKeepsPackageEndTimeRange(t *testing.T) {
+	var got []byte
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		got, _ = io.ReadAll(r.Body)
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`), nil
+	})
+	if _, _, _, err := c.UserResourceDetailed(&auth.Auth{AccessToken: "at"}, time.Hour); err != nil {
+		t.Fatalf("detailed: %v", err)
+	}
+	if !bytes.Contains(got, []byte(`"PackageEndTimeRangeBegin"`)) || !bytes.Contains(got, []byte(`"PackageEndTimeRangeEnd"`)) {
+		t.Errorf("请求体缺 PackageEndTimeRange* 过滤串: %s", got)
+	}
+}
+
 func TestDailyCheckinAlready(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/daily-checkin") {
