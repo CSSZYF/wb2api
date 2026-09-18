@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
 // captureStdout 重定向 os.Stdout（连同 chatLogOut，见 SetChatLogOutput 的注入点）
@@ -153,16 +154,87 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", "sample", http.StatusOK, 1234)
 	})
 	// 断言**完整**模型名：只写 "deepseek-v4" 的话，截断成 11 字符后的
 	// "deepseek-v4"（本文件的回归对象）同样能通过 —— 弱断言正是该 bug 存活的原因。
+	// 账号列断言同样写全 "sample(00e26541)"：只写 uid8 的话，退回无昵称分支
+	// （Label 未接昵称）也能通过，昵称丢失不会被发现。
 	for _, want := range []string{
-		"| #", "deepseek-v4-flash", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "deepseek-v4-flash", "| stream |", "| 200 |", "acct=sample(00e26541)", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "00e26541abcdef") {
+		t.Errorf("full uid leaked: %s", out)
+	}
+	if strings.Contains(out, "uid=") {
+		t.Errorf("账号列已改名 acct=，不应再有 uid= 列：%s", out)
+	}
+}
+
+// TestLogChatRowAccountLabel 账号列形态：昵称(uid8)，中文昵称按显示宽补齐。
+//
+// 回归对象：按**字节数**补齐。中文昵称 3 字节/字但只占 2 列，按字节补空格会少补，
+// 账号列之后的 TTFB/tok 列整体左移，成百行日志没法竖着扫（本任务的核心动机）。
+func TestLogChatRowAccountLabel(t *testing.T) {
+	withChatLog(t)
+	tests := []struct {
+		name string
+		nick string
+		// want 是 "acct=" 起、到下一个 "|" 前的账号列**含补空格**的完整内容：
+		// 标签按显示宽补到 chatAcctWidth（22）列。
+		want string
+	}{
+		{"中文昵称按显示宽补", "示例昵称甲", "acct=示例昵称甲(00e26541)" + strings.Repeat(" ", 2)},
+		{"ascii 昵称按字符宽补", "sample", "acct=sample(00e26541)" + strings.Repeat(" ", 6)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureStdout(t, func() {
+				logChatRow(0, time.Second, "glm-5.2", "sync", "00e26541abcdef", tc.nick, http.StatusOK, 1)
+			})
+			if !strings.Contains(out, tc.want+" |") {
+				t.Errorf("账号列对齐不符\n got: %q\nwant: %q", out, tc.want+" |")
+			}
+			// 显示宽不变量：账号列（含 "acct=" 前缀 5 列）恒为 5+chatAcctWidth 列，
+			// 与昵称字节数无关。切到 " |" 之前，避免把列间分隔空格算进列宽。
+			col := out[strings.Index(out, "acct="):]
+			col = col[:strings.Index(col, " |")]
+			if got := logfmt.DisplayWidth(col); got != 5+chatAcctWidth {
+				t.Errorf("账号列显示宽 %d，want %d：%q", got, 5+chatAcctWidth, col)
+			}
+		})
+	}
+}
+
+// TestLogChatRowNicknameFallback 无昵称（旧 auth 文件未落 account.nickname）时退回 uid8，
+// 且不得出现空括号 "()"。
+func TestLogChatRowNicknameFallback(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(0, time.Second, "glm-5.2", "sync", "00e26541abcdef", "", http.StatusOK, 1)
+	})
+	if !strings.Contains(out, "acct=00e26541 ") {
+		t.Errorf("want bare uid8 label without nickname:\n%s", out)
+	}
+	if strings.Contains(out, "(") {
+		t.Errorf("empty nickname must not render parens:\n%s", out)
+	}
+}
+
+// TestLogChatRowOverwideLabelNotTruncated 只补不截：昵称超宽时账号列变宽也不截断
+// （昵称是排查主线索，截断会丢信息）。同时全量 uid 仍不得泄露。
+func TestLogChatRowOverwideLabelNotTruncated(t *testing.T) {
+	withChatLog(t)
+	const nick = "超长昵称超长昵称超长昵称超长昵称超长昵称"
+	out := captureStdout(t, func() {
+		logChatRow(0, time.Second, "glm-5.2", "sync", "00e26541abcdef", nick, http.StatusOK, 1)
+	})
+	if !strings.Contains(out, "acct="+nick+"(00e26541)") {
+		t.Errorf("超宽昵称被截断（应只补不截）：\n%s", out)
 	}
 	if strings.Contains(out, "00e26541abcdef") {
 		t.Errorf("full uid leaked: %s", out)
@@ -172,9 +244,9 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", "", http.StatusServiceUnavailable, -1)
 	})
-	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
+	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |", "acct=s1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
@@ -184,8 +256,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -218,7 +290,7 @@ func TestChatLogsStreamRow(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| stream |", "| 200 |", "uid=u1", "TTFB=", "tok=1"} {
+	for _, want := range []string{"| stream |", "| 200 |", "acct=u1", "TTFB=", "tok=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stream row missing %q:\n%s", want, out)
 		}
@@ -245,7 +317,7 @@ func TestChatLogsSyncRowTTFBDash(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| sync |", "| 200 |", "TTFB=-", "tok=1"} {
+	for _, want := range []string{"| sync |", "| 200 |", "acct=u1", "TTFB=-", "tok=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("sync row missing %q:\n%s", want, out)
 		}
@@ -267,7 +339,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 		}
 	})
-	for _, want := range []string{"uid=u1", "| 503 |", "tok=-"} {
+	for _, want := range []string{"acct=u1", "| 503 |", "tok=-"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("error row missing %q:\n%s", want, out)
 		}
@@ -356,9 +428,44 @@ func TestShortModelTruncationIsVisible(t *testing.T) {
 func TestLogChatRowKeepsFullModelName(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "deepseek-v4.1-flash", "sync", "u1", 200, 1)
+		logChatRow(0, time.Second, "deepseek-v4.1-flash", "sync", "u1", "", 200, 1)
 	})
 	if !strings.Contains(out, "deepseek-v4.1-flash") {
 		t.Errorf("日志应含完整模型名，实际输出: %s", out)
+	}
+}
+
+// TestChatLogsRowShowsNickname 端到端：一次真实请求的流水行里出现 acct= 且含昵称。
+//
+// 这是本任务的用户可见价值锚——handler 选号后把 acct.Nickname 带进 st.nick
+// （handler.go 选号分支），流水行据此打出 "昵称(uid8)"。只断言 uid8 的话，
+// handler 忘记填 st.nick 也能通过（Label 会退回 uid8），昵称丢失不会被发现。
+func TestChatLogsRowShowsNickname(t *testing.T) {
+	withChatLog(t)
+	const (
+		fullUID = "c8a3e793-0000-4000-8000-000000000009"
+		nick    = "示例昵称甲"
+	)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: fullUID, Nickname: nick, AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	out := captureStdout(t, func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+	})
+	if !strings.Contains(out, "acct="+nick+"(c8a3e793)") {
+		t.Errorf("流水行应含 acct=昵称(uid8)（昵称随选号带入 st.nick）：\n%s", out)
+	}
+	if strings.Contains(out, fullUID) {
+		t.Errorf("full uid leaked: %s", out)
 	}
 }

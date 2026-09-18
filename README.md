@@ -32,6 +32,7 @@
 > | 零宽字符脱敏 | `features.zerowidth_sanitize`（默认关，面板可勾）：在 system 消息的指纹词内插入 U+200B，可见文本不变、只破坏上游逐字匹配。词表移植自 [codebuddy2api](https://github.com/maiphucgiang/codebuddy2api)（83 项，含安全术语与身份指纹两类）；只动 system，用户消息一字不改 |
 > | 配置落卷 + 入口脚本 | 配置改到 `/app/data/config.json`（持久卷），面板保存不再 permission denied；入口脚本修正卷属主、迁移旧配置、su-exec 降权 |
 > | 日志模型名不再歧义 | 表格日志原先硬切前 11 字符，`deepseek-v4.1-flash` 会显示成 `deepseek-v4`（另一个真实存在的模型名）；现按 rune 截断到 32 并加 `…` 标记 |
+> | 日志账号列显示昵称 | 流水行账号列 `uid=0851ce35` → `acct=昵称(0851ce35)`：昵称认人、uid8 供 grep，不必再拿 uid8 去 `auths/` 或 `state.json` 反查。列宽按**显示列宽**补齐（中文/全角/emoji 记 2 列，手写实现、不引 `go-runewidth`），中文昵称不再因按字节数补空格而错位 |
 > | 多架构 Dockerfile | `TARGETOS`/`TARGETARCH` + `VERSION` 构建参数，`BUILDPLATFORM` 固定构建机避免 qemu 里跑编译器 |
 >
 > 完整改动见 git 历史；`v1.9.1` tag 即上游基线，可直接 diff。
@@ -628,17 +629,17 @@ http://127.0.0.1:7863/panel/
 每个 `/v1/chat/completions` 请求结束时输出一行表格日志（stdout）：
 
 ```text
-| #001 | 18:31:31 | deepseek-v4 | stream | 200 | uid=0851ce35 | TTFB=801ms | tok=60 | 23.5tok/s | total=2.6s |
+| #001 | 18:31:31 | deepseek-v4 | stream | 200 | acct=示例昵称甲(0851ce35)   | TTFB=801ms | tok=60 | 23.5tok/s | total=2.6s |
 ```
 
 | 字段 | 说明 |
 |---|---|
 | `#001` | 进程级请求序号 |
 | `18:31:31` | 结束时刻 |
-| `deepseek-v4` | 模型名（超 11 字符截断） |
+| `deepseek-v4` | 模型名（超 32 字符按 rune 截断并加 `…`） |
 | `stream` / `sync` | 请求模式 |
 | `200` | 状态码 |
-| `uid=0851ce35` | 账号 UID 前 8 位 |
+| `acct=示例昵称甲(0851ce35)` | 账号标签：`昵称(uid8)`。昵称认人、uid8 供 grep（全量 uid 不进日志）；账号无昵称时只显示 uid8。按**显示列宽**补齐（中文/全角/emoji 记 2 列），中文昵称列不再错位 |
 | `TTFB` | 流式首帧耗时（非流式为 `-`） |
 | `tok` / `tok/s` / `total` | 输出 token 数 / 速率 / 总时长 |
 

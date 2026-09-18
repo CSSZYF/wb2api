@@ -8,16 +8,16 @@ import (
 
 func TestClassifyLine(t *testing.T) {
 	cases := map[string]string{
-		"| #001 | glm-5.2 | stream | 200 | uid=c8a3e793 | TTFB=120ms |": ChChat,
-		"school c8a3e793: ★ 分享任务完成":                                     ChTask,
-		"streak-bonus 5c162cc9: 🎊 新手礼包 +100c":                           ChTask,
-		"blackcat c8a3e793: 完成 3 次夜间对话":                                 ChTask,
-		"checkin 5c162cc9: 已签到":                                         ChTask,
-		"panel: 任务动作 uid=x code=chat_5":                                 ChTask,
-		"panel: 队列启动：6 项（并发 2）":                                         ChTask,
-		"panel: revive uid=x":                                           ChSys,
-		"workbuddy2api listening on :7863":                              ChSys,
-		"scheduler: 余额后台刷新每 5m0s":                                       ChSys,
+		"| #001 | glm-5.2 | stream | 200 | acct=示例昵称甲(c8a3e793) | TTFB=120ms |": ChChat,
+		"school c8a3e793: ★ 分享任务完成":                                             ChTask,
+		"streak-bonus 5c162cc9: 🎊 新手礼包 +100c":                                   ChTask,
+		"blackcat c8a3e793: 完成 3 次夜间对话":                                         ChTask,
+		"checkin 5c162cc9: 已签到":                                                 ChTask,
+		"panel: 任务动作 uid=x code=chat_5":                                         ChTask,
+		"panel: 队列启动：6 项（并发 2）":                                                 ChTask,
+		"panel: revive uid=x":                                                   ChSys,
+		"workbuddy2api listening on :7863":                                      ChSys,
+		"scheduler: 余额后台刷新每 5m0s":                                               ChSys,
 	}
 	for line, want := range cases {
 		if got := classifyLine(line); got != want {
