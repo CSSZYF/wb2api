@@ -113,6 +113,11 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// MachineIDHeaders 是否在业务出站路径（chat/billing/模型目录）注入按 uid 固定盐
+		// 派生的 X-Machine-ID / X-Session-ID（默认 true，与上游三仓默认一致）。
+		// false = 完全还原旧行为（仅 X-Device-Token，无设备标识）——不想带设备指纹的
+		// 部署逃生门。refresh/auth 类路径恒不注入（与开关无关）。改动需重启进程。
+		MachineIDHeaders bool `json:"machine_id_headers"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -231,6 +236,10 @@ func Default() *Config {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
+	// MachineIDHeaders 缺省 true（同 Schedule 各开关的"缺省 true"手法：Load 先取
+	// Default() 再 json.Unmarshal 覆盖，键缺席/为 null 时保留 true，只有显式 false 才关）。
+	// 上游三仓默认就带 X-Machine-ID/X-Session-ID，缺省不带反而多一个"设备指纹缺失"特征。
+	c.Upstream.MachineIDHeaders = true
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
@@ -392,6 +401,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Upstream.PassthroughIP = b
+		}
+	}
+	if v := os.Getenv("WB2A_MACHINE_ID_HEADERS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.MachineIDHeaders = b
 		}
 	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {

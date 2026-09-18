@@ -704,6 +704,14 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
+	// MachineIDHeaders 是否在业务出站路径（chat/billing/models 目录）注入按 uid 固定盐
+	// 派生的 X-Machine-ID / X-Session-ID（config upstream.machine_id_headers，缺省 true）。
+	// 关掉 = 完全还原旧行为（只有 X-Device-Token，无设备标识），供不想带设备指纹的
+	// 部署作逃生门。refresh/auth 类路径恒不注入（与开关无关）；CommonHeaders 本身
+	// 不加（它被 RefreshHeaders 共用），见 injectAccountStableHeaders 的调用点清单。
+	// 启动装配期写入；面板改后需重启（不在热改清单）。
+	MachineIDHeaders bool
+
 	ChatBaseCN    string
 	BillingBaseCN string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
@@ -737,6 +745,9 @@ func New() *Client {
 	}
 	// 指纹脱敏默认开（零宽脱敏默认关 = 零值），与改 atomic 前的字段默认值一致。
 	c.SetSanitizeFingerprints(true)
+	// 账号级设备指纹头默认开（与 config upstream.machine_id_headers 缺省 true 一致，
+	// 上游三仓默认就带）。零值 &Client{} 不注入，生产装配恒经本构造函数。
+	c.MachineIDHeaders = true
 	return c
 }
 
@@ -1267,6 +1278,9 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 		return nil, diag, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
+	// 模型目录是账号级业务路径（带 Authorization）→ 与 chat/billing 同口径注入
+	// 设备指纹头（CommonHeaders 被 refresh 共用，故注入不放在那里，见 headers.go）。
+	c.injectAccountStableHeaders(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

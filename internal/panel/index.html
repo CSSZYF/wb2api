@@ -837,6 +837,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">透传客户端 IP</span>
               <input type="checkbox" name="passthrough_ip">
               <span class="hint">向上游注入 X-Forwarded-For / X-Real-IP；默认关（反代安全边界）；需重启</span></div>
+            <div class="switch"><span class="lb">账号设备指纹头</span>
+              <input type="checkbox" name="machine_id_headers">
+              <span class="hint">勾选（缺省）= chat/billing/模型目录注入按 uid 派生（跨重启稳定）的 X-Machine-ID / X-Session-ID，防多号裸奔同一设备指纹；取消 = 只带 X-Device-Token；需重启</span></div>
             <div class="switch"><span class="lb">对外模型名去域前缀</span>
               <input type="checkbox" name="strip_realm_prefix">
               <span class="hint">勾选（缺省）= /v1/models 输出裸名；取消 = 保留 cn: / global: 前缀；需重启</span></div>

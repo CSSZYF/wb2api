@@ -77,6 +77,7 @@ func TestSaveConfigAppliesMaxRotateHot(t *testing.T) {
 	}
 
 	// 调小到 1：不重启、不重建 handler。未接线时仍按装配期的 2 跑（断言即失败）。
+	// sess 传 nil = 本用例不涉会话粘性（saveConfig 已容忍 nil：跳过热应用，见其注释）。
 	if _, err := saveConfig([]byte(`{"server":{"max_body_mb":8,"max_rotate":1}}`),
 		cfgPath, live, p, up, sch, h, nil); err != nil {
 		t.Fatalf("saveConfig: %v", err)
