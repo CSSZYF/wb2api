@@ -3,6 +3,8 @@
 package upstream
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strings"
 
@@ -18,6 +20,12 @@ const (
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI（2.137.1）。
 	// config upstream.cli_version 可覆盖（空 = 内置默认）。
 	defaultCliVersion = "2.137.1"
+
+	// accountStableIDPrefix 账号级设备/会话标识的固定盐前缀。**跨重启恒定，
+	// 禁止改动**（改一个字节 = 全部账号的 X-Machine-ID/X-Session-ID 换值，
+	// 设备指纹漂移本身就是异常特征）。与 session 包 deriveSalt 的进程级随机盐
+	// 本质不同：那是会话键维度、重启换新；本盐是账号维度，必须跨重启恒定。
+	accountStableIDPrefix = "wb2a:"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -113,6 +121,57 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 	}
 }
 
+// deriveAccountStableID 按 uid + 用途派生 36 hex 账号级设备/会话标识
+// （sha256("wb2a:" + purpose + ":" + uid) 取前 18 字节 = 36 hex）。
+//
+// 语义（三处必须同时成立，破坏任一条都会重新暴露设备维度关联面）：
+//   - 跨重启稳定：固定盐，无随机源（与 Request-ID / session.deriveSalt 的进程级
+//     随机盐刻意相反——那两个每次重启/每会话换新，本函数是账号级固定设备）。
+//   - 账号间互异：uid 不同则派生值不同（多号不再共用同一设备指纹）。
+//   - 幂等：同 uid 同用途恒同值。
+//
+// 对齐 sliver/linguo 上游 deriveAccountStableID 同形同盐（"wb2a:" + purpose + ":" + uid
+// → sha256 → 前 36 hex），也即 hub wb_fingerprint.py:derive_id 的 md5(salt:uid)[:36]
+// 语义（本仓按项目既有口径用 sha256，非 md5；36 hex 与 hub 同形态）。
+//
+// 与本包 desktop.go 的 deriveID(a, salt) 的关系：**两者独立，不要合并**。
+// deriveID 输入是 "salt:uid"（无 "wb2a:" 前缀），已在桌面端任务路径（machineId/
+// sessionId/qimei36 等**请求体字段**）落地上线；统一盐格式会让这些既有指纹整体换值
+// （存量账号设备指纹突变 = 异常特征），故本项目**新增本函数、不改 desktop.go 的既有
+// 派生**。两者用途分层：deriveID 填请求体字段（report/user-asset），本函数填出站**头**。
+func deriveAccountStableID(uid, purpose string) string {
+	sum := sha256.Sum256([]byte(accountStableIDPrefix + purpose + ":" + uid))
+	return hex.EncodeToString(sum[:18]) // 36 hex chars
+}
+
+// injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID（按 uid 稳定派生）。
+//
+// 动机：主聊天路径原先只有 X-Device-Token，且依赖逐号配置——没配的号在上游看来
+// "无设备标识"，多号共用同一（缺失）指纹，容易被按设备维度关联风控。本注入给每个号
+// 一台"固定的虚拟设备"（官方桌面端语义），跨重启、跨会话恒定。
+//
+// 注入范围（与上游三仓共识一致）：仅**业务**出站路径——chat（ChatHeaders）、
+// billing 域（BillingHeaders：report/travel/balance/checkin）、模型目录
+// （fetchModelsOnce / globalModelsOnce 显式调用）。refresh/auth 类（登录/刷新）刻意
+// 不带设备指纹——那是凭证域，带设备标识反而是多余特征面。
+//
+// 调用点即"注入面清单"（刻意不放进 CommonHeaders：它被 RefreshHeaders 共用）：
+// headers.go ChatHeaders / BillingHeaders、client.go fetchModelsOnce、
+// global_models.go globalModelsOnce。新增业务出站路径时在此处一并接线。
+//
+// 开关：Client.MachineIDHeaders=false（config upstream.machine_id_headers）时不注入；
+// uid 为空（匿名/半装配态）时不注入——**不伪造**，宁缺毋滥。
+func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
+	if c != nil && !c.MachineIDHeaders {
+		return
+	}
+	if a == nil || a.UID == "" {
+		return
+	}
+	req.Header.Set("X-Machine-ID", deriveAccountStableID(a.UID, "machine"))
+	req.Header.Set("X-Session-ID", deriveAccountStableID(a.UID, "session"))
+}
+
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
@@ -200,6 +259,13 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
 	c.injectDeviceToken(req, a)
+	// 账号级设备指纹头（X-Machine-ID / X-Session-ID）：按 uid 固定盐派生。
+	// 刻意**不放 CommonHeaders**——那条路被 RefreshHeaders 复用，而 refresh/auth
+	// 类（登录/刷新）不该带设备指纹（凭证域，多带标识只多一个特征面）。上游把注
+	// 入放公共 headers 覆盖含 refresh；本网关按"只覆盖业务路径"的口径收敛在
+	// chat/billing/模型目录三处显式调用（其余业务出站如 report/travel 经
+	// BillingHeaders 继承；完整调用点清单见 injectAccountStableHeaders 注释）。
+	c.injectAccountStableHeaders(req, a)
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, meta)
 }
@@ -361,6 +427,9 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
 	c.injectDeviceToken(req, a)
+	// 账号级设备指纹头：billing 域未走 CommonHeaders，单独注入（同 X-Device-Token
+	// 的处理口径，保证业务路径全覆盖；refresh 不走本函数，故不带）。
+	c.injectAccountStableHeaders(req, a)
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。

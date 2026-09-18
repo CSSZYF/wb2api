@@ -317,3 +317,32 @@ func TestFrontendVoucherModalNoExternalRefs(t *testing.T) {
 		}
 	}
 }
+
+// TestAppJSMachineIDHeadersWiring upstream.machine_id_headers 的面板接线必须齐全：
+// CFG_MAP 映射（缺则表单读不到也存不进）+ index.html 的 checkbox。
+// app.js / index.html 是 go:embed 静态资源，Go 编译器不校验其内容——少一处映射，
+// 用户取消勾选保存后后端收不到该键，静默仍带设备指纹（与 TestAppJSMaxRotateWiring 同因）。
+func TestAppJSMachineIDHeadersWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(js), `machine_id_headers: ['upstream', 'machine_id_headers']`) {
+		t.Error("app.js 缺 machine_id_headers 的 CFG_MAP 映射（表单值无法读写 upstream.machine_id_headers）")
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// checkbox 必须是 checkbox 类型（CFG_MAP 按 el.type==='checkbox' 走 bool 分支）。
+	body := string(html)
+	i := strings.Index(body, `name="machine_id_headers"`)
+	if i < 0 {
+		t.Fatal(`index.html 缺配置表单项 name="machine_id_headers"`)
+	}
+	// 往前找本 input 标签（同一标签内 type 在前）。
+	start := strings.LastIndex(body[:i], "<input")
+	if start < 0 || !strings.Contains(body[start:i], `type="checkbox"`) {
+		t.Error(`index.html 的 machine_id_headers 必须是 <input type="checkbox">（否则 collectConfig 不走 bool 分支）`)
+	}
+}

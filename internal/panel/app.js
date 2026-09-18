@@ -455,6 +455,7 @@ const CFG_MAP = {
   client_version: ['upstream', 'client_version'], cli_version: ['upstream', 'cli_version'],
   client_name: ['upstream', 'client_name'], device_token: ['upstream', 'device_token'],
   device_token_file: ['upstream', 'device_token_file'], passthrough_ip: ['upstream', 'passthrough_ip'],
+  machine_id_headers: ['upstream', 'machine_id_headers'],
   global_enabled: ['global', 'enabled'],
   realm_precedence: ['models', 'realm_precedence'], strip_realm_prefix: ['models', 'strip_realm_prefix'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],

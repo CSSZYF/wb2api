@@ -972,3 +972,84 @@ func TestRestartRequiredFieldsSessionTTLHotApplied(t *testing.T) {
 		t.Errorf("session_sticky.gc_interval 仍应需重启，清单里缺失: %v", got)
 	}
 }
+
+// TestMachineIDHeadersDefaultOnAndEnvOverride 账号级设备指纹头的配置语义：
+// 缺省 true（键缺席零影响，与上游三仓默认一致），显式 false 才关，
+// WB2A_MACHINE_ID_HEADERS 可覆盖。config.example.json 必须含该键（面板/文档同一来源）。
+func TestMachineIDHeadersDefaultOnAndEnvOverride(t *testing.T) {
+	if !Default().Upstream.MachineIDHeaders {
+		t.Error("Default() 的 upstream.machine_id_headers 必须缺省 true")
+	}
+	// 键缺席（老配置）→ 保持 true：Load 先取 Default 再 Unmarshal 覆盖。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"listen":":9999"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Upstream.MachineIDHeaders {
+		t.Error("配置文件缺 machine_id_headers 键时应保持缺省 true（老配置零影响）")
+	}
+	// 显式 false → 关。
+	if err := os.WriteFile(fp, []byte(`{"upstream":{"machine_id_headers":false}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.MachineIDHeaders {
+		t.Error("显式 machine_id_headers=false 应关闭")
+	}
+	// env 覆盖。
+	t.Setenv("WB2A_MACHINE_ID_HEADERS", "false")
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.MachineIDHeaders {
+		t.Error("WB2A_MACHINE_ID_HEADERS=false 应关闭")
+	}
+	t.Setenv("WB2A_MACHINE_ID_HEADERS", "true")
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Upstream.MachineIDHeaders {
+		t.Error("WB2A_MACHINE_ID_HEADERS=true 应打开（覆盖文件里的 false）")
+	}
+}
+
+// TestMachineIDHeadersInExampleConfig config.example.json 是配置项最完整参考
+// （README 明示）——新增键必须同步落进去，否则跟随示例的用户拿着"最全样例"却看不到该开关。
+func TestMachineIDHeadersInExampleConfig(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Upstream map[string]any `json:"upstream"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("config.example.json 非法 JSON: %v", err)
+	}
+	v, ok := doc.Upstream["machine_id_headers"]
+	if !ok {
+		t.Fatal("config.example.json upstream 段缺 machine_id_headers 键")
+	}
+	if b, isBool := v.(bool); !isBool || !b {
+		t.Errorf("config.example.json 的 machine_id_headers = %v，want true（与 Default() 一致）", v)
+	}
+	// 示例文件必须能被本进程解析（新键不引入校验失败）。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(fp, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(fp); err != nil {
+		t.Errorf("config.example.json 应能被 Load 解析: %v", err)
+	}
+}

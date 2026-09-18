@@ -153,6 +153,10 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 账号级设备指纹头（X-Machine-ID / X-Session-ID，按 uid 固定盐派生）：
+	// chat/billing/模型目录业务路径注入（refresh/auth 不注入）；
+	// false = 完全还原旧行为。装配期写入，改动需重启。
+	up.MachineIDHeaders = cfg.Upstream.MachineIDHeaders
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
