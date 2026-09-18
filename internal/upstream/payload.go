@@ -1,6 +1,8 @@
 // payload.go 改写发往上游的 chat 请求体：
 //  1. 强制 stream:true（上游拒绝非流式）
 //  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101）
+//  3. max_completion_tokens 别名翻译为 max_tokens（上游只认后者，别名被静默忽略后
+//     回落默认输出上限，见 translateMaxCompletionTokens）
 package upstream
 
 import (
@@ -54,6 +56,14 @@ func PrepareBodyOptRealm(src []byte, realm string, sanitize, zeroWidth bool, eff
 		return src
 	}
 	obj["stream"] = true
+	// max_completion_tokens → max_tokens 翻译（上游 sliver edb9e97 吸收 PR #116，
+	// Closes #117）：OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens
+	// 是新别名（o-series 起引入），DeepSeek Harness 等新客户端只发别名；上游只认
+	// max_tokens，别名被忽略后**静默**回落默认输出上限（实测 32000）——用户设
+	// 128000 实际只拿到 32000 且无任何报错，属最难排查的静默降级。
+	// 位置：与 stream 强制同属「顶层标量字段归一」，紧贴在一起便于审阅；纯字段搬运，
+	// 不依赖 messages/model，与后续 stream_options 注入等步骤无顺序耦合。
+	translateMaxCompletionTokens(obj)
 	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
 	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
 	if _, has := obj["stream_options"]; !has {
@@ -122,6 +132,53 @@ func PrepareBodyOptRealm(src []byte, realm string, sanitize, zeroWidth bool, eff
 		return src
 	}
 	return out
+}
+
+// translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游认的
+// max_tokens（上游 sliver edb9e97 吸收 PR #116，Closes #117）。调用点在
+// PrepareBodyOptRealm 管线里 stream 强制之后（与上游挂载位置一致：同一 payload 预处理
+// 管线，见上游提交说明「任务书 prompt-too-long §3」）。
+//
+// 为什么必须翻译：OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新
+// 字段；DeepSeek Harness 等新客户端只发别名。上游只认 max_tokens，别名被忽略后**静默**
+// 回落默认输出上限（实测 32000）——用户设 128000 实际只拿到 32000，无任何报错。
+//
+// 规则（严格对齐上游边界，不放宽也不收紧）：
+//   - 显式 max_tokens 已存在 → 别名只删不译（显式优先，不覆盖用户明确设置的值）；
+//   - 别名值为正整数（v > 0 且无小数尾巴）→ 译为 max_tokens；
+//   - 别名 0 / null / 负数 / 浮点尾巴 / 非数值 → 不翻译（0/null 语义是「未设置」，
+//     走上游默认；把 0 或负数翻进 max_tokens 等于把「未设置」变成「限制为 0」，是
+//     反向风险）；
+//   - 别名一律删除（无论是否翻译成功）——否则上游可能对未知字段报错，且留着徒增
+//     body 体积与排障噪音。
+//
+// 不分域：CN /v2 与 global /console 是同一套 API 的两次部署（见 context_catalog
+// 文件头实测结论），global 域上游同样只认 max_tokens，故翻译对两域同口径执行。
+func translateMaxCompletionTokens(obj map[string]any) {
+	alias, has := obj["max_completion_tokens"]
+	delete(obj, "max_completion_tokens") // 无论翻译与否，别名一律删（见上方注释）
+	if !has {
+		return
+	}
+	if _, explicit := obj["max_tokens"]; explicit {
+		return // 显式 max_tokens 优先：别名只删不译
+	}
+	// json.Unmarshal 把数字解成 float64（整数去整后回写，避免 1.28e5 科学计数法/小数
+	// 尾巴进上游 body）；int 家族分支是防御性兼容——手构造 map 的调用方（测试/内部）。
+	switch v := alias.(type) {
+	case float64:
+		if v > 0 && v == float64(int64(v)) {
+			obj["max_tokens"] = int64(v)
+		}
+	case int64:
+		if v > 0 {
+			obj["max_tokens"] = v
+		}
+	case int:
+		if v > 0 {
+			obj["max_tokens"] = int64(v)
+		}
+	}
 }
 
 // effortRank 档位从低到高。
