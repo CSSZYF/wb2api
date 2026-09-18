@@ -264,3 +264,68 @@ func TestLoadDirDuplicateUIDWarning(t *testing.T) {
 		t.Errorf("expected WARN with both paths, got output: %s", string(raw))
 	}
 }
+
+// TestLoadFileMatchesLoadDir 启动全量加载（LoadDir）与运行期热加载（LoadFile）必须
+// 走同一条解析/迁移路径：同一文件的 uid / token / FilePath / realm 全等。
+//
+// 为什么需要：auths 目录热加载逐文件调 LoadFile，而启动走 LoadDir；两者一旦漂移
+// （例如只在 LoadDir 里做 realm 存量迁移），就会出现「重启后 realm 正常、热加载后
+// realm 缺失」——请求路由按域分派，这类问题只在运行期暴露且难定位。
+func TestLoadFileMatchesLoadDir(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"auth":{"accessToken":"at1","refreshToken":"rt1","expiresAt":1753600000,"domain":"www.workbuddy.ai"},"account":{"uid":"u1","nickname":"n1"}}`
+	fp := filepath.Join(dir, "workbuddy-u1.json")
+	if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := LoadDir(dir)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("LoadDir: err=%v len=%d", err, len(list))
+	}
+	one, err := LoadFile(fp)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if one.UID != list[0].UID || one.AccessTokenValue() != list[0].AccessTokenValue() ||
+		one.RefreshTokenValue() != list[0].RefreshTokenValue() ||
+		one.ExpiresAtValue() != list[0].ExpiresAtValue() {
+		t.Errorf("两条路径解析结果不一致:\n LoadFile=%+v\n LoadDir =%+v", one, list[0])
+	}
+	if one.FilePath != list[0].FilePath {
+		t.Errorf("FilePath 不一致: %q vs %q", one.FilePath, list[0].FilePath)
+	}
+	if one.Realm() != list[0].Realm() {
+		t.Errorf("realm 不一致: %q vs %q", one.Realm(), list[0].Realm())
+	}
+}
+
+// TestLoadFileErrorIsReported LoadFile 把错误原样上抛（静默跳过是 LoadDir 那层的策略）：
+// auths 热加载依赖这个差异打 WARN——半截 JSON 若静默丢弃，运维看到的就是
+// 「文件明明上传了却一直不生效，日志里什么都没有」。
+func TestLoadFileErrorIsReported(t *testing.T) {
+	dir := t.TempDir()
+	half := filepath.Join(dir, "workbuddy-half.json")
+	if err := os.WriteFile(half, []byte(`{"auth":{"access`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFile(half); err == nil {
+		t.Error("半截 JSON 应返回错误（供调用方打 WARN 并下轮重试）")
+	}
+	if _, err := LoadFile(filepath.Join(dir, "nope.json")); err == nil {
+		t.Error("文件不存在应返回错误")
+	}
+}
+
+// TestLoadFileNoTokenRejected 缺 accessToken 的文件同样上抛（与 Parse 同门槛）：
+// 半写入的空壳文件可能解析成合法 JSON 但无 token，不能当成有效账号入池。
+func TestLoadFileNoTokenRejected(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "workbuddy-empty.json")
+	if err := os.WriteFile(fp, []byte(`{"auth":{"refreshToken":"rt"},"account":{"uid":"u9"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFile(fp); err == nil {
+		t.Error("缺 accessToken 应返回错误")
+	}
+}

@@ -1693,6 +1693,58 @@ func TestRemoveMissingFromDir(t *testing.T) {
 	}
 }
 
+// TestSyncToDirExceptKeepsMissingUIDs keep 集合内的 uid 即便不在本轮扫描结果里也不被剔除。
+// 这是 auths 目录热加载的关键保护：某轮读不出文件（上传中途的半截 JSON / 瞬时权限错误）
+// 必须被当成「本轮没有该账号的新信息」，而不是「文件被删了」——否则一次写入中间态就会把
+// 在用账号从池里抹掉，连带丢掉它的积分/冷却状态（再入池是全新 entry）。
+func TestSyncToDirExceptKeepsMissingUIDs(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1"})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at2"})
+
+	// 本轮只扫到 u2，但 u1 在 keep 里（文件仍在、只是这轮读不出来）。
+	added, removed := p.SyncToDirExcept([]*auth.Auth{{UID: "u2", AccessToken: "at2b"}},
+		map[string]bool{"u1": true})
+	if len(added) != 0 || len(removed) != 0 {
+		t.Fatalf("keep 内的 uid 不应被剔除: added=%v removed=%v", added, removed)
+	}
+	if _, ok := p.Status("u1"); !ok {
+		t.Fatal("u1 应被 keep 保留")
+	}
+
+	// keep 为空 → u1 被剔除（等价 SyncToDir），并如实上报 removed。
+	added, removed = p.SyncToDirExcept([]*auth.Auth{{UID: "u2", AccessToken: "at2b"}}, nil)
+	if len(added) != 0 || len(removed) != 1 || removed[0] != "u1" {
+		t.Fatalf("added=%v removed=%v want removed=[u1]", added, removed)
+	}
+
+	// 新 uid 仍按 SyncToDir 语义加入并上报。
+	added, removed = p.SyncToDirExcept([]*auth.Auth{{UID: "u3", AccessToken: "at3"}},
+		map[string]bool{"u2": true})
+	if len(added) != 1 || added[0] != "u3" || len(removed) != 0 {
+		t.Fatalf("added=%v removed=%v want added=[u3]", added, removed)
+	}
+}
+
+// TestSyncToDirUnchangedStillWorks SyncToDir 的对外语义不因抽出共用实现而漂移
+// （启动路径 p.SyncToDir 现在委托给内部 syncToDirLocked）：新号加入、消失的号剔除、
+// 留存账号的运行态（积分）原样保留。
+func TestSyncToDirUnchangedStillWorks(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u2", 99, 0)
+
+	p.SyncToDir([]*auth.Auth{{UID: "u2"}})
+	if _, ok := p.Status("u1"); ok {
+		t.Fatal("u1 应被剔除")
+	}
+	st, ok := p.Status("u2")
+	if !ok || st.Credits != 99 {
+		t.Fatalf("u2 应保留状态: %+v ok=%v", st, ok)
+	}
+}
+
 func TestFlushPersistsCredits(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")

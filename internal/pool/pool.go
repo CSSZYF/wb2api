@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -233,21 +234,51 @@ func (p *Pool) Add(a *auth.Auth) {
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.syncToDirLocked(auths, nil)
+}
+
+// SyncToDirExcept 同 SyncToDir，但 keep 集合内的 uid **不参与剔除**：即便本轮扫描
+// 结果里没有它们，也原样留在池内（新增/upsert 语义与 SyncToDir 逐字一致）。
+//
+// 供 auths 目录热加载（scheduler.authWatcher）使用：某轮扫描可能读不出某个已存在的
+// 文件（正在被上传/写入的半截 JSON、瞬时权限错误），此时必须当作「本轮没有该账号的
+// 新信息」，而不能当成「文件被删了」——否则一次上传中间态就会把在用账号从池里抹掉，
+// 且再入池时 state 已丢（upsertLocked 对不存在的 uid 建全新 entry）。配合 watcher 的
+// 「解析失败 → WARN + 下轮重试」，账号只在文件确实从目录消失时才出池。
+// keep 为 nil 时与 SyncToDir 完全等价。
+// 返回 (新增 uid, 剔除 uid)，按 UID 升序，供调用方打运维日志。
+func (p *Pool) SyncToDirExcept(auths []*auth.Auth, keep map[string]bool) (added, removed []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.syncToDirLocked(auths, keep)
+}
+
+// syncToDirLocked 是 SyncToDir / SyncToDirExcept 的唯一对账实现（启动全量对齐与
+// 运行期热加载共用，避免两套 diff 各自演化出口径差）。调用方必须已持有 p.mu。
+func (p *Pool) syncToDirLocked(auths []*auth.Auth, keep map[string]bool) (added, removed []string) {
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
+		if _, ok := p.byUID[a.UID]; !ok {
+			added = append(added, a.UID)
+		}
 		seen[a.UID] = true
 		p.upsertLocked(a)
 	}
 	changed := false
 	for uid := range p.byUID {
-		if !seen[uid] {
-			delete(p.byUID, uid)
-			changed = true
+		if seen[uid] || keep[uid] {
+			continue
 		}
+		delete(p.byUID, uid)
+		removed = append(removed, uid)
+		changed = true
 	}
 	if changed {
 		p.saveLocked()
 	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	return added, removed
 }
 
 // Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证

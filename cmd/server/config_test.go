@@ -972,3 +972,111 @@ func TestRestartRequiredFieldsSessionTTLHotApplied(t *testing.T) {
 		t.Errorf("session_sticky.gc_interval 仍应需重启，清单里缺失: %v", got)
 	}
 }
+
+// TestAuthWatchDefaults auths 目录热加载的缺省口径：开启 + 30 秒。
+// 缺省必须是「开着」——这个特性的存在意义就是让手工上传的账号文件免重启生效，
+// 默认关闭等于把它退化成「用户得先知道有这个东西并去打开」。
+func TestAuthWatchDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.AuthWatchEnabled {
+		t.Error("auth_watch_enabled 缺省应为 true")
+	}
+	if c.Schedule.AuthWatchSeconds != 30 {
+		t.Errorf("auth_watch_seconds 缺省=%d want 30", c.Schedule.AuthWatchSeconds)
+	}
+	if c.AuthWatchInterval != 30*time.Second {
+		t.Errorf("AuthWatchInterval=%v want 30s", c.AuthWatchInterval)
+	}
+}
+
+// TestAuthWatchNormalize 三种配置形态：显式改间隔 / 显式关闭 / <=0 回落 30。
+// 回落口径与 balance_refresh 一致：0 是「开关关闭」的哨兵值，故 <=0 先回落再判
+// （否则「配了 0 秒」会被当成关闭开关，而不是回落默认）。
+func TestAuthWatchNormalize(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	write := func(body string) *Config {
+		t.Helper()
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", body, err)
+		}
+		return c
+	}
+
+	// 显式间隔 120 秒。
+	c := write(`{"schedule":{"auth_watch_seconds":120}}`)
+	if c.AuthWatchInterval != 2*time.Minute {
+		t.Errorf("interval=%v want 2m", c.AuthWatchInterval)
+	}
+	if !c.Schedule.AuthWatchEnabled {
+		t.Error("只配间隔不应关掉开关")
+	}
+
+	// 显式关闭：interval 归零（main 侧据此不扫描）。
+	c = write(`{"schedule":{"auth_watch_enabled":false}}`)
+	if c.AuthWatchInterval != 0 {
+		t.Errorf("关闭时 interval=%v want 0", c.AuthWatchInterval)
+	}
+
+	// 启用但秒数 <=0 → 回落默认 30。
+	c = write(`{"schedule":{"auth_watch_seconds":-5}}`)
+	if c.Schedule.AuthWatchSeconds != 30 || c.AuthWatchInterval != 30*time.Second {
+		t.Errorf("秒数<=0 应回落 30：sec=%d interval=%v", c.Schedule.AuthWatchSeconds, c.AuthWatchInterval)
+	}
+
+	// 关闭且秒数 <=0：不回落（开关关了就没有生效间隔可言）。
+	c = write(`{"schedule":{"auth_watch_enabled":false,"auth_watch_seconds":-5}}`)
+	if c.AuthWatchInterval != 0 {
+		t.Errorf("关闭时不应回落出间隔: %v", c.AuthWatchInterval)
+	}
+}
+
+// TestAuthWatchNotRestartRequired auth_dir 本身仍是重启项（watcher 在启动时捕获目录），
+// 但 interval/开关必须能热改——面板保存后不应把它列进「需重启」提示。
+func TestAuthWatchNotRestartRequired(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "auth_watch") {
+			t.Errorf("auth_watch 可热改，不应出现在重启项清单: %q", f)
+		}
+	}
+	// auth_dir 仍在清单里（目录是装配期捕获的）。
+	found := false
+	for _, f := range restartRequiredFields(c) {
+		if f == "auth_dir" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("auth_dir 应仍是重启项（watcher 启动时捕获目录，运行期不跟随热改）")
+	}
+}
+
+// TestConfigExampleHasAuthWatchKeys config.example.json 必须带上新键：
+// 它是用户复制起步的模板（也是「程序自动生成推荐配置」的形状参考），缺键会让新特性
+// 在用户眼里不存在——面板能改，但手写配置的人不会知道有这项。
+func TestConfigExampleHasAuthWatchKeys(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模板必须能被启动路径原样解析（含所有新键）。
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 无法解析: %v", err)
+	}
+	if !c.Schedule.AuthWatchEnabled || c.Schedule.AuthWatchSeconds != 30 {
+		t.Errorf("example 的 auth_watch 口径=%v/%d want true/30",
+			c.Schedule.AuthWatchEnabled, c.Schedule.AuthWatchSeconds)
+	}
+}

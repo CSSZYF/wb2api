@@ -87,6 +87,23 @@ func (a *Auth) DomainValue() string {
 	return a.Domain
 }
 
+// ExpiresAtValue 加锁读取 ExpiresAt（Unix 秒；<=0 = 未知/无 expiry）。
+//
+// 与 AccessToken/Domain 同因加锁：ExpiresAt 由 RefreshToken 在 a.mu 内写回
+// （见 upstream.Client.RefreshToken 的写回段），锁外直读同样构成数据竞争。
+// 本函数补齐三个既有加锁访问器（AccessToken/Domain/RefreshToken）之外的最后一项，
+// 使「想读凭证字段就一定有加锁入口」成为可执行约定，后来者无需逐个翻 RefreshToken
+// 实现去判断某字段会不会被并发改写。当前无跨包调用点（池内对象一律经 pool 的加锁
+// 接口访问），与 accessor_race_test.go 覆盖的是同一族接口。
+func (a *Auth) ExpiresAtValue() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ExpiresAt
+}
+
 // RefreshTokenValue 加锁读取 RefreshToken（同 AccessTokenValue：RefreshToken 在锁内
 // 改写它）。调度器的「有无凭证」前置守卫（checkin/keepalive/travel 的
 // `a.RefreshToken == ""`）必须经此取值，勿直读字段。
@@ -359,12 +376,19 @@ func (a *Auth) SaveAtomic() error {
 	return os.Rename(tmp, a.FilePath)
 }
 
+// FilePattern auth 目录内的凭证文件匹配式（workbuddy-<uid>.json）。
+//
+// 导出给运行期目录热加载（internal/scheduler/authwatch.go）复用：扫描范围必须与启动期
+// LoadDir 逐字一致，否则「启动看得到的文件」与「热加载看得到的文件」会出现口径差——
+// 手工上传一个别名文件（如 my-account.json）时，重启能生效而热加载永远发现不了。
+const FilePattern = "workbuddy*.json"
+
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
 // 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
 func LoadDir(dir string) ([]*Auth, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
+	files, err := filepath.Glob(filepath.Join(dir, FilePattern))
 	if err != nil {
 		return nil, err
 	}
@@ -373,30 +397,46 @@ func LoadDir(dir string) ([]*Auth, error) {
 	seenUID := make(map[string]string, len(files))
 	var out []*Auth
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		a, err := LoadFile(f)
 		if err != nil {
 			continue
 		}
-		a, err := Parse(raw)
-		if err != nil {
-			continue
-		}
-		a.FilePath = f
 		if prev, ok := seenUID[a.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
 				logfmt.UID8(a.UID), prev, f)
 		}
 		seenUID[a.UID] = f
-		if a.RealmStored() == "" {
-			if changed, r := a.BackfillRealm(); changed {
-				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.UID8(a.UID), err)
-				} else if r == "global" {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.UID8(a.UID), a.Domain)
-				}
-			}
-		}
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// LoadFile 读取并解析单个 auth 文件（ReadFile → Parse → FilePath 标记 → realm 存量迁移）。
+// LoadDir 与 auths 目录热加载（internal/scheduler/authwatch.go）共用本函数，
+// 保证「启动全量加载」与「运行期热加载」两条路径的解析/迁移语义逐字一致，不会出现
+// 「重启后正常、热加载后 realm 缺失」这类两套逻辑漂移。
+//
+// 与 LoadDir 的差异仅在错误处理：LoadDir 对启动期个别坏文件静默跳过（避免一个手写
+// 残缺文件拖垮整个服务启动），本函数把错误原样上抛，由调用方决定 WARN 还是跳过
+// （热加载据此识别「正在写入的半截文件」并打 WARN）。
+func LoadFile(path string) (*Auth, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	a, err := Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	a.FilePath = path
+	if a.RealmStored() == "" {
+		if changed, r := a.BackfillRealm(); changed {
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("WARN: auth %s realm backfill save: %v", logfmt.UID8(a.UID), err)
+			} else if r == "global" {
+				log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.UID8(a.UID), a.Domain)
+			}
+		}
+	}
+	return a, nil
 }

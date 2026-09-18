@@ -168,6 +168,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
+| **auths 目录热加载** | `schedule.auth_watch_seconds`（默认 30）周期扫描 `auth_dir`，手工上传/删除凭证文件免重启生效；写入中的半截文件跳过重试，账号不会因上传中间态出池 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
@@ -517,6 +518,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 ## API 端点
 
 **余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
+
+**auths 目录热加载**（`schedule.auth_watch_enabled`，缺省开启）：每 `auth_watch_seconds`（缺省 30）秒扫描 `auth_dir`，把手工上传/删除的凭证文件与池内账号增量对账（新增入池、消失出池，运行态保留）——云服务器场景下本地登录后上传 `workbuddy-*.json` 免重启即生效，与启动时的对齐语义完全一致。扫描只做一次目录列表 + 逐文件 stat，未变更的文件不重复解析；正在写入的半截文件跳过并打 WARN，下轮重试，账号不会因上传中间态被误剔除。开关与间隔支持面板热改（`auth_dir` 本身仍需重启）。
 
 ## 🖥️ Web 管理面板
 

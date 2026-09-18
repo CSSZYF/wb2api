@@ -64,10 +64,17 @@ type Scheduler struct {
 	schedMu       sync.Mutex
 	rearmSchedule chan struct{}
 	rearmBalance  chan struct{}
+	// rearmAuthWatch 同上，供 auths 目录热加载循环（authwatch.go）消费：间隔/开关热改
+	// 时立刻唤醒重算。三条循环各用独立 channel，同 channel 被多个 select 消费会丢信号。
+	rearmAuthWatch chan struct{}
 
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// authWatchInterval auths 目录扫描间隔（纳秒，0=暂停）。形态同 balanceInterval：
+	// 循环每轮读当前值，SetAuthWatchInterval 热改（面板保存配置）。
+	authWatchInterval atomic.Int64
 
 	// expiringSoonNanos 快过期积分窗口（纳秒，0=禁用分桶）。与 balanceInterval 同一
 	// 形态：cfg.ExpiringSoonWindow 只作启动初值，运行期一律经 expiringSoonWindow() /
@@ -115,10 +122,11 @@ func New(cfg Config) *Scheduler {
 		cfg.BlackcatHours = []int{23}
 	}
 	s := &Scheduler{
-		cfg:           cfg,
-		adoptTried:    make(map[string]string),
-		rearmSchedule: make(chan struct{}, 1),
-		rearmBalance:  make(chan struct{}, 1),
+		cfg:            cfg,
+		adoptTried:     make(map[string]string),
+		rearmSchedule:  make(chan struct{}, 1),
+		rearmBalance:   make(chan struct{}, 1),
+		rearmAuthWatch: make(chan struct{}, 1),
 	}
 	// 启动初值写入原子字段；此后 cfg.ExpiringSoonWindow 不再被读取（见字段注释）。
 	s.expiringSoonNanos.Store(int64(cfg.ExpiringSoonWindow))
