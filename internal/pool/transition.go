@@ -10,7 +10,8 @@
 //
 //	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
 //	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
-//	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked 清
+//	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked（整域）清，
+//	                     单模型提前解冻走 clearModelCooldownLocked（ClearModelCooldown）
 //	breakerUntil       ← recordBreakerFailureLocked（NoteError 唯一喂入）；NoteSuccess 清
 //	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/Revive/reviveCoolingLocked（仅硬冷却）清
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
@@ -35,6 +36,51 @@ func (e *entry) clearCoolingLocked() {
 	e.reason = ""
 	e.softStreak = 0
 	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
+}
+
+// clearModelCooldownLocked 清单个 (账号, 模型) 的模型级冷却记录，返回是否确有条目被删。
+// 只动 modelCooldowns[model] 一个键：其他模型的冷却、账号级冷却域（until/coolKind/
+// softStreak/reason）与熔断器（fails/retryCount/breakerUntil）全部原样——单模型被
+// 证明可用不构成账号级恢复的证据。map 为 nil 或 key 不存在时是空操作（返回 false）。
+// 调用方必须已持有 p.mu 写锁，并负责置 dirty。
+func (e *entry) clearModelCooldownLocked(model string) bool {
+	if _, ok := e.modelCooldowns[model]; !ok {
+		return false
+	}
+	delete(e.modelCooldowns, model)
+	if len(e.modelCooldowns) == 0 {
+		e.modelCooldowns = nil // 空表归 nil：与 clearCoolingLocked/落盘口径一致（不残留空 map）
+	}
+	return true
+}
+
+// ClearModelCooldown 清除指定 (账号, 模型) 的模型级冷却记录，返回是否真清了。
+//
+// 语义：面板「测试」（POST /panel/api/account/test_chat）成功 = 该模型在此账号上刚刚
+// 被上游实测证明可用 → 立刻解除这条负缓存，不必再等 TTL/重置墙钟。覆盖两种承载语义：
+//   - 6004 模型级限流：提前失效，切回该模型不再被 healthyForModel 拦截（限流豁免提前生效）；
+//   - 11102「该后端无此模型」：负缓存提前失效，无需等 6h 起步的指数退避到期。
+//
+// 边界（刻意收窄，勿在后续迭代"顺手"放宽）：
+//   - 只清这一个模型的条目：其他模型、账号级冷却（until/coolKind/softStreak）与熔断
+//     运行态全部不动——一次单模型成功不构成账号级恢复的证据（与 NoteSuccess 不碰
+//     modelCooldowns 的既有正交性互为对偶）。
+//   - 账号不存在 / model 条目不存在均为空操作，返回 false（调用方据此决定是否打日志）。
+//   - 不清 reason 前缀分流：6004 与 11102 都清。二者都表达"该模型在此账号上不可用"，
+//     而本入口的触发条件正是"该模型刚刚可用"，前提被证伪即应解除（与 BlockModelClear
+//     只认 11102 的窄口径不同：那是 chat 成功路径的最小改动，这里是人工诊断的显式解冻）。
+func (p *Pool) ClearModelCooldown(uid, model string) bool {
+	if uid == "" || model == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || !e.clearModelCooldownLocked(model) {
+		return false
+	}
+	p.dirty.Store(true)
+	return true
 }
 
 // disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。

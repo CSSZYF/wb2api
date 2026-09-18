@@ -147,7 +147,9 @@ func (p *Pool) NoteError(uid string) {
 // 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
 // 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
-// 冷却（Cooldown/reviveCoolingLocked）清除。
+// 冷却（Cooldown/reviveCoolingLocked）清除；另有两条**同模型**的提前解冻路径：
+// 11102 条目由 handler 成功路径的 BlockModelClear 清，任意条目由面板「测试」成功
+// 触发的 ClearModelCooldown 清（都是"该模型刚被证明可用"，不属本函数职责）。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

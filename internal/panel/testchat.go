@@ -6,10 +6,19 @@
 //   - 不计入账号统计与惩罚：不调 NoteError/NoteSuccess，不碰熔断与冷却。这是诊断
 //     操作，一次手点不该把好号打成冷却态；ChatStreamContext 自身只做出站请求，
 //     无任何池副作用（见 upstream/client.go），故本文件也不调用 applyErrorPolicy。
+//   - **唯一例外：成功路径单向解冻**。测试成功 = 该模型在此账号上刚被上游实测证明
+//     可用，于是调 Pool.ClearModelCooldown 清单个 (账号, 模型) 的模型级冷却（6004
+//     限流豁免提前生效 / 11102 负缓存提前失效），响应加 model_cooldown_cleared 字段。
+//     例外只朝"恢复"方向：不写失败记录、不设冷却、不动账号级冷却（until/coolKind）
+//     与熔断——单模型成功不构成账号级恢复的证据。失败路径不挂钩（无惩罚也无从清起）。
 //   - 模型可见性不做门禁：只校验 model 非空，不拿 /v1/models 的目录做硬校验。
 //     上游目录没列出的模型 ≠ 不可调用（写死条目 deepseek-v4.1-flash 就是这种
 //     情况），硬门禁会把合法诊断挡在门外。前端用 /panel/api/models 的同一份目录
 //     填下拉框（看得见 = 选得到），模型真不可用时上游自会报错并原样透出。
+//
+// 范围提示：本入口按调用方传入的 model 原样清冷却。面板下拉填的是 /panel/api/models
+// 的 id（裸模型名，无 "cn:"/"global:" 前缀），与 chat 侧写入 modelCooldowns 的
+// bareModel 同形，故正常路径一致；带前缀入参会清不到条目（返回 false，零副作用）。
 package panel
 
 import (
@@ -174,7 +183,14 @@ func (p *Panel) accountTestChat(w http.ResponseWriter, r *http.Request) {
 	ms := elapsed()
 	log.Printf("panel: test_chat uid=%s model=%s ok %dms reply=%d 字符 finish=%s reasoning=%d 字符",
 		req.UID, req.Model, ms, replyRunes, finish, reasoningRunes)
-	writeJSON(w, http.StatusOK, map[string]any{
+	// 成功即解冻（Chen 需求）：该模型刚在此账号上被上游实测证明可用 → 立刻解除它的
+	// 模型级冷却（6004 限流的模型豁免提前生效 / 11102 负缓存提前失效），不必再等
+	// TTL 或重置墙钟。这是本文件"零副作用"边界的**唯一例外**，且是单向的：只清模型级
+	// 负缓存，不写任何失败/冷却记录、不碰账号级冷却与熔断（见文件头设计边界）。
+	// 失败路径不挂钩：测试失败不设冷却（诊断不做惩罚），也就无冷却可清。
+	// 放在 ms 之后：解冻只是一把小锁，不计入回显给用户的耗时口径。
+	clearedCooldown := p.cfg.Pool.ClearModelCooldown(req.UID, req.Model)
+	out := map[string]any{
 		"ok":         true,
 		"status":     status,
 		"latency_ms": ms,
@@ -189,7 +205,14 @@ func (p *Panel) accountTestChat(w http.ResponseWriter, r *http.Request) {
 		"max_tokens": testChatMaxTokens,
 		"model":      req.Model,
 		"account":    account,
-	})
+	}
+	// model_cooldown_cleared 仅在**真的**清掉冷却时出现（零噪音：本来没冷却就不加字段，
+	// 前端也不必为 false 单独分支）。true = 该模型的 6004/11102 冷却已被本次测试成功解除。
+	if clearedCooldown {
+		log.Printf("panel: test_chat cleared model cooldown uid=%s model=%s", req.UID, req.Model)
+		out["model_cooldown_cleared"] = true
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // chatMessageContent 取聚合响应的 choices[0].message.content。

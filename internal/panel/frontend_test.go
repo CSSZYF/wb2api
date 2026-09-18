@@ -74,6 +74,9 @@ func TestAppJSTestChatWiring(t *testing.T) {
 		`'account/test_chat'`,             // 后端端点（api() 会补 /panel/api/ 前缀）
 		`openTestChat(`,                   // 行点击分发
 		`'tcModel'`, `'tcMsg'`, `'tcOut'`, // 弹窗三要素：模型下拉/输入/结果区
+		// 成功解冻回执的渲染：后端在真清了该模型冷却时回传该字段，前端漏渲染则
+		// 用户不知道"测一下"顺带摘掉了冷却标记（协议两侧必须同名，见 testchat.go）。
+		`model_cooldown_cleared`,
 	} {
 		if !strings.Contains(s, must) {
 			t.Errorf("app.js 缺少对话测试接线：%s", must)

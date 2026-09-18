@@ -441,3 +441,202 @@ func TestTestChatRequiresAuth(t *testing.T) {
 		t.Fatalf("code=%d want 401", rec.Code)
 	}
 }
+
+// TestTestChatSuccessClearsModelCooldown 成功路径解冻（Chen 需求）：该 (账号, 模型) 处于
+// 模型级冷却时，测试成功 → 池内该模型条目被清、响应带 model_cooldown_cleared=true。
+// 这是 testchat「零副作用」边界的唯一例外（且是单向的：只清模型级负缓存）。
+func TestTestChatSuccessClearsModelCooldown(t *testing.T) {
+	srv := sseServer(t, 200, []string{"通了"})
+	defer srv.Close()
+
+	p := newTestChatPanel(t, srv)
+	uid := "u-11111111-2222-3333"
+	const model = "glm-5.2"
+	// 两种承载语义都覆盖：6004（ResetAt 非零）与 11102（负缓存，ResetAt 零值）。
+	p.cfg.Pool.CooldownSoftForModel(uid, time.Minute, time.Now().Add(30*time.Minute), model, "6004 model rate limit")
+	p.cfg.Pool.BlockModelBackoff(uid, "hy3-preview", "11102 model not available")
+
+	rec := testChatReq(t, p, `{"uid":"`+uid+`","model":"`+model+`","message":"hi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		OK                   bool `json:"ok"`
+		ModelCooldownCleared bool `json:"model_cooldown_cleared"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.OK {
+		t.Fatalf("ok=false body=%s", rec.Body.String())
+	}
+	if !got.ModelCooldownCleared {
+		t.Errorf("model_cooldown_cleared=false body=%s want true（测试成功应解冻该模型）", rec.Body.String())
+	}
+	st, _ := p.cfg.Pool.Status(uid)
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "hy3-preview" {
+		t.Errorf("rate_limited_models=%+v want 只剩 hy3-preview（被测试的模型已解冻，其他模型不动）",
+			st.RateLimitedModels)
+	}
+	// 账号级冷却不得被单模型解冻连带动到（本用例未设，断言仍为零值）。
+	if st.Cooling || !st.Until.IsZero() {
+		t.Errorf("账号级冷却被改写：Cooling=%v Until=%v（want false/零值）", st.Cooling, st.Until)
+	}
+	// 解冻后该模型可再被选号（选号侧 healthyForModel 口径）。
+	if a := p.cfg.Pool.PickByUIDForModel(uid, model); a == nil {
+		t.Error("解冻后该模型应可再被选号（PickByUIDForModel）")
+	}
+}
+
+// TestTestChatSuccessNoCooldownNoField 零噪音：本来就没有模型级冷却时，成功响应不得
+// 出现 model_cooldown_cleared 字段（前端无需为 false 单独分支）。
+func TestTestChatSuccessNoCooldownNoField(t *testing.T) {
+	srv := sseServer(t, 200, []string{"ok"})
+	defer srv.Close()
+
+	p := newTestChatPanel(t, srv)
+	rec := testChatReq(t, p, `{"uid":"u-11111111-2222-3333","model":"glm-5.2","message":"hi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "model_cooldown_cleared") {
+		t.Errorf("无冷却可清时不应回传该字段：body=%s", rec.Body.String())
+	}
+}
+
+// TestTestChatFailureKeepsModelCooldown 失败路径不挂钩：上游 429 → ok=false 且
+// 池内模型级冷却**原样保留**（测试失败不设冷却、也不清冷却——诊断无惩罚、无解冻）。
+func TestTestChatFailureKeepsModelCooldown(t *testing.T) {
+	srv := sseServer(t, http.StatusTooManyRequests, nil)
+	defer srv.Close()
+
+	p := newTestChatPanel(t, srv)
+	uid := "u-11111111-2222-3333"
+	const model = "glm-5.2"
+	p.cfg.Pool.CooldownSoftForModel(uid, time.Minute, time.Now().Add(30*time.Minute), model, "6004 model rate limit")
+
+	rec := testChatReq(t, p, `{"uid":"`+uid+`","model":"`+model+`","message":"hi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		OK                   bool `json:"ok"`
+		ModelCooldownCleared bool `json:"model_cooldown_cleared"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.OK {
+		t.Fatalf("ok=true 但上游 429 body=%s", rec.Body.String())
+	}
+	if got.ModelCooldownCleared {
+		t.Error("失败路径不得回传 model_cooldown_cleared")
+	}
+	st, _ := p.cfg.Pool.Status(uid)
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != model {
+		t.Errorf("失败路径不得清冷却：rate_limited_models=%+v want 仍含 %s", st.RateLimitedModels, model)
+	}
+	if a := p.cfg.Pool.PickByUIDForModel(uid, model); a != nil {
+		t.Error("失败路径后该模型仍应处于冷却（不可被选号）")
+	}
+}
+
+// TestTestChatParseFailureKeepsModelCooldown 上游 200 但流不可解析（解析失败也算测试
+// 失败）时不得解冻：解冻只挂在「拿到有效回复」这一条真实成功路径上。
+func TestTestChatParseFailureKeepsModelCooldown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: [DONE]\n\n")) // 只有结束标记，无任何有效帧
+	}))
+	defer srv.Close()
+
+	p := newTestChatPanel(t, srv)
+	uid := "u-11111111-2222-3333"
+	const model = "glm-5.2"
+	p.cfg.Pool.BlockModelBackoff(uid, model, "11102 model not available")
+
+	rec := testChatReq(t, p, `{"uid":"`+uid+`","model":"`+model+`","message":"hi"}`)
+	var got struct {
+		OK                   bool `json:"ok"`
+		ModelCooldownCleared bool `json:"model_cooldown_cleared"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.OK {
+		t.Fatalf("ok=true body=%s want 解析失败", rec.Body.String())
+	}
+	if got.ModelCooldownCleared {
+		t.Error("解析失败不得解冻（只有真实成功路径才解冻）")
+	}
+	st, _ := p.cfg.Pool.Status(uid)
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != model {
+		t.Errorf("解析失败不得清冷却：rate_limited_models=%+v", st.RateLimitedModels)
+	}
+}
+
+// TestTestChatClears11102EndToEnd 端到端（Chen 需求主线）：11102 负缓存把唯一账号对该
+// 模型挡在选号之外 → 面板「测试」成功 → 负缓存被清、该模型立刻可再被选号，不必等
+// 6h 起步的指数退避 TTL 到期。
+func TestTestChatClears11102EndToEnd(t *testing.T) {
+	srv := sseServer(t, 200, []string{"又通了"})
+	defer srv.Close()
+
+	p := newTestChatPanel(t, srv)
+	uid := "u-11111111-2222-3333"
+	const model = "deepseek-v3-2-volc"
+	p.cfg.Pool.BlockModelBackoff(uid, model, "11102 model not available")
+
+	// 前置：负缓存生效 → 唯一账号在该模型上选不出（PickByUIDForModel 走 healthyForModel）。
+	if a := p.cfg.Pool.PickByUIDForModel(uid, model); a != nil {
+		t.Fatal("precondition: 11102 负缓存应使该模型选不出该账号")
+	}
+
+	rec := testChatReq(t, p, `{"uid":"`+uid+`","model":"`+model+`","message":"hi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		OK                   bool `json:"ok"`
+		ModelCooldownCleared bool `json:"model_cooldown_cleared"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.OK || !got.ModelCooldownCleared {
+		t.Fatalf("ok=%v cleared=%v body=%s want true/true", got.OK, got.ModelCooldownCleared, rec.Body.String())
+	}
+	if a := p.cfg.Pool.PickByUIDForModel(uid, model); a == nil {
+		t.Error("测试成功后该模型应立即可再被选号（负缓存已解冻）")
+	}
+	if st, _ := p.cfg.Pool.Status(uid); len(st.RateLimitedModels) != 0 {
+		t.Errorf("解冻后限额台账应为空（该模型条目已清）: %+v", st.RateLimitedModels)
+	}
+}
+
+// TestTestChatClearedOnlyTargetModel 解冻只针对本次测试的模型：同账号其他模型的冷却
+// 不受影响（多模型独立冷却语义，避免"测一个解一片"）。
+func TestTestChatClearedOnlyTargetModel(t *testing.T) {
+	srv := sseServer(t, 200, []string{"ok"})
+	defer srv.Close()
+
+	p := newTestChatPanel(t, srv)
+	uid := "u-11111111-2222-3333"
+	p.cfg.Pool.CooldownSoftForModel(uid, time.Minute, time.Now().Add(30*time.Minute), "glm-5.2", "6004 model rate limit")
+	p.cfg.Pool.CooldownSoftForModel(uid, time.Minute, time.Now().Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+
+	rec := testChatReq(t, p, `{"uid":"`+uid+`","model":"glm-5.2","message":"hi"}`)
+	var got struct {
+		ModelCooldownCleared bool `json:"model_cooldown_cleared"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.ModelCooldownCleared {
+		t.Fatalf("body=%s want cleared=true", rec.Body.String())
+	}
+	if a := p.cfg.Pool.PickByUIDForModel(uid, "glm-5.3"); a != nil {
+		t.Error("其他模型（glm-5.3）的冷却不得被连带解除")
+	}
+}

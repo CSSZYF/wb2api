@@ -793,7 +793,7 @@ function testChatEl() {
     '<div class="dlg" style="width:520px">' +
       '<header>' +
         '<h3>对话测试 <span class="hint" id="tcWho"></span></h3>' +
-        '<div class="hint">用该账号向所选模型发一条消息，验证「账号 + 模型」链路是否可用。仅诊断，不计入账号统计、冷却与熔断。</div>' +
+        '<div class="hint">用该账号向所选模型发一条消息，验证「账号 + 模型」链路是否可用。仅诊断，不计入账号统计、冷却与熔断；唯一例外是成功时顺手解除该模型的冷却标记（不写任何惩罚）。</div>' +
       '</header>' +
       '<div class="body">' +
         '<label class="fld"><span class="lb">模型</span>' +
@@ -884,7 +884,10 @@ async function sendTestChat() {
     if (r.ok) {
       st.className = 'state ok';
       st.textContent = '成功 · ' + r.model + ' · ' + tcLatency(r.latency_ms) +
-        (r.reply_truncated ? ' · 回复 ' + r.reply_chars + ' 字（已截断）' : '');
+        (r.reply_truncated ? ' · 回复 ' + r.reply_chars + ' 字（已截断）' : '') +
+        // 后端在该模型本来处于冷却（6004 限流/11102 无此模型）时解冻并回传该字段：
+        // 明说一句，免得用户不知道"测一下"顺带把这个模型的冷却标记摘了。
+        (r.model_cooldown_cleared ? ' · 已解除该模型的冷却标记' : '');
       out.hidden = false;
       if (r.reply) {
         out.textContent = r.reply;
