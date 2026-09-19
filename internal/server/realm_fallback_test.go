@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -132,7 +133,12 @@ func TestChatRealmFallbackBareNameGlobalToCN(t *testing.T) {
 }
 
 // TestChatRealmFallbackExplicitPrefixDoesNotFallback 显式 "global:" 前缀是用户强指定：
-// global 号限流后**不**回落 CN，直接 503（cn 号零调用）——换域会违背用户意图。
+// global 号限流后**不**回落 CN，轮转内无更多本域候选即终止（cn 号零调用）——换域会违背
+// 用户意图。
+//
+// 末端状态码：本域（global）候选**全部**因该模型的 6004 冷却出局 → 429 +
+// Retry-After（模型级限流耗尽的既有出口，v1.9.19）；本用例的断言重点是「不跨域」，
+// 状态码取 429 而非旧 503 是同一事实的换口径呈现（详见 handler 末端注释）。
 func TestChatRealmFallbackExplicitPrefixDoesNotFallback(t *testing.T) {
 	calls := map[string]int{}
 	up, _ := newRealmUpstream(t, func(authz string) (int, string, bool) {
@@ -151,8 +157,11 @@ func TestChatRealmFallbackExplicitPrefixDoesNotFallback(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"global:deepseek-v4.1-flash","messages":[]}`)))
 
-	if rec.Code != 503 {
-		t.Fatalf("显式 global 前缀且 global 全不可用应 503，code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("显式 global 前缀且 global 全因该模型限流出局应 429，code=%d body=%s", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("429 必须带 Retry-After 头：%+v", rec.Header())
 	}
 	if calls["Bearer at-cn"] != 0 {
 		t.Fatalf("显式前缀不得跨域回落，cn 号却被调了 %d 次", calls["Bearer at-cn"])
@@ -162,9 +171,10 @@ func TestChatRealmFallbackExplicitPrefixDoesNotFallback(t *testing.T) {
 	}
 }
 
-// TestChatRealmFallbackBothRealmsLimited503 两域都对同模型 429/6004 → 503，
+// TestChatRealmFallbackBothRealmsLimited429 两域都对同模型 429/6004 → 429 +
+// Retry-After（模型级限流耗尽，v1.9.19；旧断言为 503），
 // 且不会无限回落（每个账号最多试一次，共 2 次上游调用）。
-func TestChatRealmFallbackBothRealmsLimited503(t *testing.T) {
+func TestChatRealmFallbackBothRealmsLimited429(t *testing.T) {
 	calls := map[string]int{}
 	up, _ := newRealmUpstream(t, func(authz string) (int, string, bool) {
 		calls[authz]++
@@ -181,8 +191,11 @@ func TestChatRealmFallbackBothRealmsLimited503(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
 
-	if rec.Code != 503 {
-		t.Fatalf("两域全限流应 503，code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("两域全限流应 429，code=%d body=%s", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("429 必须带 Retry-After 头：%+v", rec.Header())
 	}
 	if calls["Bearer at-global"] != 1 || calls["Bearer at-cn"] != 1 {
 		t.Fatalf("两域各试一次即止（不得无限回落），calls=%v", calls)
@@ -220,9 +233,14 @@ func TestChatRealmFallbackPrecedenceCN(t *testing.T) {
 	}
 }
 
-// TestChatRealmFallbackSingleRealmUnchanged 单域部署零回归：池内只有 global 号且
-// 它对该模型限流 → 仍 503（没有另一域可回落），不会凭空变出候选。
-func TestChatRealmFallbackSingleRealmUnchanged(t *testing.T) {
+// TestChatRealmFallbackSingleRealmLimited429 单域部署：池内只有 global 号且它对
+// 该模型限流 → 429 + Retry-After（模型级限流耗尽，v1.9.19；旧断言为 503），
+// 不会凭空变出候选（没有另一域可回落）。
+//
+// 与「池真空 → 503」的反向边界互为对照：这里池子里**有**号、号也**健康**，只是
+// 该模型全被 6004 限流——正是该给可退避状态码的窄分支。空池/全禁用的 503 契约
+// 由 TestChatNoAccountHint / TestChatAllUnavailableReturns503 锁定不变。
+func TestChatRealmFallbackSingleRealmLimited429(t *testing.T) {
 	withGlobalEnabled(t)
 	up, _ := newRealmUpstream(t, func(authz string) (int, string, bool) {
 		return modelRateLimit429()
@@ -235,7 +253,12 @@ func TestChatRealmFallbackSingleRealmUnchanged(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("单域限流应 503，code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("单域该模型全限流应 429，code=%d body=%s", rec.Code, rec.Body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Errorf("429 必须带 Retry-After 头：%+v", rec.Header())
+	} else if n, err := strconv.Atoi(ra); err != nil || n < 1 {
+		t.Errorf("Retry-After=%q want 正整数秒", ra)
 	}
 }

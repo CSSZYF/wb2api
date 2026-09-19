@@ -459,6 +459,68 @@ func (p *Pool) ServableForRealm(realm string) bool {
 	return false
 }
 
+// ModelRateLimitExhausted 报告「当前路由范围内所有候选账号都因**该模型**的限流冷却
+// 而出局」，并返回最早恢复时刻距现在的等待时长（上游 da22a92 的 realm_model_throttled
+// 语义，本 fork 侧等价实现）。
+//
+// 用途：handler 末端错误出口据此把「模型被限流」与「池子空了」分开——前者回 429 +
+// Retry-After（OpenAI 生态客户端对 429 的退避更规范），后者保持 503
+// no_healthy_account。**只在模型级冷却耗尽这一窄分支为真**，判据刻意收窄：
+//
+//   - 候选集口径与选号器一致：realm 谓词（realm=="" 不过滤，与
+//     PickExcludingForRealm 同口径）+ 排除 disabled/manualDisabled（这两类账号
+//     选号器在任何路径都不考虑，属"池子本身没有号"而非"模型被限流"）。
+//     刻意**不看** tried 与 inFlight：前者是请求级轮换进度、后者是瞬时并发，
+//     都不是"池子对这个模型的能力"，且两者到期即自动恢复。
+//   - 候选为**空**（池真空/该域无账号/全部禁用）→ false：这是"池子空了"，
+//     必须保持 503（关键反向断言）。
+//   - 只要存在**任一**候选没有该模型的限流冷却 → false：池里明明有号能服务这个
+//     模型，本次失败另有原因（账号级冷却/熔断/传输层/上游 5xx 等），不得谎报 429。
+//   - 冷却条目必须是**限流**语义（排除 11102「该后端无此模型」负缓存条目，
+//     见 entry.modelRateLimitUntil）：模型不存在不是限流，退避多久都不会变好，
+//     回 429 + Retry-After 会让客户端白等数小时（TTL 6h 起、封顶 24h）。
+//   - 判据落在**模型级**而非账号级：账号级冷却（until/breakerUntil/degradeUntil）
+//     不参与本判定。账号级冷却中的号若没有该模型的冷却条目，本方法返回 false
+//     ——它对这个模型的不可用是「账号在冷却」而非「模型被限流」，回 503 更诚实；
+//     两者叠加（账号级 + 模型级同时生效）时该号仍计入「因模型冷却出局」，因为
+//     对它而言该模型的恢复时刻就是模型冷却截止，按模型冷却退避成立。
+//
+// 返回值 wait 取所有候选里**最早**的模型冷却截止（多个账号/多个冷却条目时取 min）
+// ——客户端按最短可恢复时间退避即可，不必等最慢的那个号。调用方需保证 model 非空
+// （空模型名无判定语义，直接 false）。
+func (p *Pool) ModelRateLimitExhausted(model, realm string) (time.Duration, bool) {
+	if model == "" {
+		return 0, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	cands := 0
+	var earliest time.Time
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.disabled || e.manualDisabled {
+			continue // 禁用/临时停用号选号器一律不考虑：不是"模型被限流"
+		}
+		cands++
+		until := e.modelRateLimitUntil(now, model)
+		if until.IsZero() {
+			// 有候选能服务该模型：失败另有原因，不是模型级冷却耗尽。
+			return 0, false
+		}
+		if earliest.IsZero() || until.Before(earliest) {
+			earliest = until
+		}
+	}
+	if cands == 0 || earliest.IsZero() {
+		return 0, false // 池真空（该域无候选账号）：保持 503
+	}
+	// 每个候选的截止都严格晚于 now（modelRateLimitUntil 已保证），wait 恒为正。
+	return earliest.Sub(now), true
+}
+
 // List 返回所有账号状态（按 UID 排序，稳定输出）。
 func (p *Pool) List() []Status {
 	p.mu.RLock()

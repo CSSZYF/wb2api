@@ -85,6 +85,14 @@ const noHealthyHint = "no healthy account available in pool; check /status or re
 // NoHealthyAccountHint 本地调度错误的 gateway_hint（与 no_healthy_account code 配套）。
 func NoHealthyAccountHint() string { return noHealthyHint }
 
+// modelRateLimitedHint 末端 429（池内候选全因**该模型**限流冷却出局）的固定 hint。
+// 与 ErrSoftRate 的 GatewayHint 文案一致：同一事实（上游限流、等重置）在
+// 「上游直接 429」与「网关判定模型级冷却耗尽」两条路径上给客户端同一句提示。
+const modelRateLimitedHint = "rate limited by upstream; retry after reset"
+
+// ModelRateLimitedHint 模型级限流耗尽的 gateway_hint（与 model_rate_limited code 配套）。
+func ModelRateLimitedHint() string { return modelRateLimitedHint }
+
 // FrameHintFunc 返回 SSE error 帧的 gateway_hint 判定函数（Stream 的可选参数）。
 // ctxFn 惰性求值：仅在实际撞到 error 帧才调用（正常流零开销，模型目录查询
 // 不会为每个成功请求触发）。

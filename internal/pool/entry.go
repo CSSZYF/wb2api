@@ -2,6 +2,7 @@
 package pool
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -299,6 +300,32 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 		return false
 	}
 	return !mc.Until.IsZero() && now.Before(mc.Until)
+}
+
+// modelRateLimitUntil 返回该模型在此账号上的**限流**冷却截止（未记录/已过期/
+// 非限流条目返回零值）。与 modelCooled 的分工：那个回答"此刻是否拦截"（11102 负缓存
+// 与 6004 限流一视同仁，两者都是"该模型在此账号上不可用"），本方法回答"限流到什么
+// 时候"，供末端 429 的 Retry-After 取最早恢复时刻。
+//
+// 必须排除 11102「该后端无此模型」条目（reason 前缀判定，与 BlockModelClear 同一
+// 判别口径）：11102 与 6004 共用 modelCooldowns 承载但语义正交——11102 是"这个后端
+// 根本没有这个模型"，退避多久都不会变好（TTL 6h 起、封顶 24h），对它回 429 +
+// Retry-After 等于让客户端白等数小时，而不是去换模型。只有限流（6004 等）才该退避。
+func (e *entry) modelRateLimitUntil(now time.Time, reqModel string) time.Time {
+	if reqModel == "" {
+		return time.Time{}
+	}
+	mc, ok := e.modelCooldowns[reqModel]
+	if !ok {
+		return time.Time{}
+	}
+	if strings.HasPrefix(mc.Reason, modelBlockedReasonPrefix) {
+		return time.Time{} // 11102 模型不存在：不是限流，不参与 Retry-After
+	}
+	if mc.Until.IsZero() || !now.Before(mc.Until) {
+		return time.Time{}
+	}
+	return mc.Until
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
