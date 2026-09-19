@@ -1,10 +1,25 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+// imagePartSig 计算 part 的**规范**字节摘要（sha256 前 8 hex），供期望值精确构造——
+// 与 contentSignature 的 canonicalPartBytes 同口径（键名排序后序列化），签名算法
+// 变更时测试期望值随此 helper 单点同步。
+func imagePartSig(t *testing.T, part string) string {
+	t.Helper()
+	canon, err := canonicalPartBytes([]byte(part))
+	if err != nil {
+		t.Fatalf("canonicalPartBytes(%s): %v", part, err)
+	}
+	sum := sha256.Sum256(canon)
+	return hex.EncodeToString(sum[:4])
+}
 
 // TestResolveConversationID 覆盖 conversationId 提取的 snake/camel/缺失三态：
 //   - metadata.conversation_id / metadata.conversationId → 取值
@@ -79,8 +94,10 @@ func TestRequestIDForKeyStability(t *testing.T) {
 	}
 }
 
-// TestTurnKeyExtraction 轮级兜底键的提取：取**最后一条** user 消息的「序号+文本」，
-// 轮内追加 assistant/tool 消息不改变键；无 user / 无文本 / 坏 JSON 一律空串。
+// TestTurnKeyExtraction 轮级兜底键的提取：取**最后一条** user 消息的「序号+内容签名」，
+// 轮内追加 assistant/tool 消息不改变键；无 user / 无可签名内容 / 坏 JSON 一律空串。
+// 纯文本与图文混合形态的键值与历史逐字节一致（contentSignature 的文本优先口径），
+// 仅纯图片形态由 "" 变为 [type:摘要]（G1 修复）。
 func TestTurnKeyExtraction(t *testing.T) {
 	cases := []struct {
 		name string
@@ -99,7 +116,10 @@ func TestTurnKeyExtraction(t *testing.T) {
 		{"empty body", ``, ""},
 		{"empty content", `{"messages":[{"role":"user","content":""}]}`, ""},
 		{"null content", `{"messages":[{"role":"user","content":null}]}`, ""},
-		{"image only content", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`, ""},
+		{"image only content", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`,
+			// 纯图片 content 现按内容签名派生非空轮级键（G1 修复，原为 ""）；
+			// 键含 image part 摘要（sha256 前 8 hex）。
+			"u0:[image_url:" + imagePartSig(t, `{"type":"image_url","image_url":{"url":"x"}}`) + "]"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

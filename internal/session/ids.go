@@ -121,8 +121,13 @@ var turnSalt = NewMessageID()
 // 的「对话轮」语义。序号一并入键：两次不同轮里内容相同的提问（"继续"）不会被并成
 // 一轮。
 //
-// 无 body / 无 messages / 无 user 消息 / 该消息无文本 → ""（调用方回落请求级随机
-// ID，不伪造聚合键）。
+// 无 body / 无 messages / 无 user 消息 / 该消息无可签名内容 → ""（调用方回落
+// 请求级随机 ID，不伪造聚合键）。
+//
+// 内容签名（G1，见 contentSignature）：末条 user 消息**纯图片**（无 text part）时
+// 此前返回空串 → 聚合头退化成请求级随机碎片化。现由 contentSignature 取非文本
+// part 的 [type:摘要]，纯图片轮也能建立稳定轮级键；纯文本路径键值与历史完全一致
+// （存量轮键零漂移）。
 func TurnKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -140,20 +145,80 @@ func TurnKey(body []byte) string {
 		if obj.Messages[i].Role != "user" {
 			continue
 		}
-		text := contentText(obj.Messages[i].Content)
-		if text == "" {
-			// 最后一条 user 消息没有文本（纯图片等）→ 本轮不建立聚合键。
-			// 不继续往前找：整轮内该消息位置恒定，往前找反而会让键随 step 漂移。
+		sig := contentSignature(obj.Messages[i].Content)
+		if sig == "" {
+			// 最后一条 user 消息没有可签名内容（空 / null / 空数组）→ 本轮不建立
+			// 聚合键。不继续往前找：整轮内该消息位置恒定，往前找反而会让键随 step 漂移。
 			return ""
 		}
-		return fmt.Sprintf("u%d:%s", i, text)
+		return fmt.Sprintf("u%d:%s", i, sig)
 	}
 	return ""
 }
 
-// contentText 取消息 content 的文本：字符串形态直接返回；数组形态（多模态 parts）
-// 拼接各 part 的 text 字段。无文本（纯图片 / null / 未知形态）返回 ""。
-func contentText(raw json.RawMessage) string {
+// contentPart 内容签名的输入单元。两条解析路径（ids.go 的 RawMessage 路径与
+// session.go 的已解码 any 路径）都归一到本结构，组装规则只定义一处
+// （contentSignatureCore），避免两套算法各自漂移。
+type contentPart struct {
+	Type string // part type："" / "text" 视为文本 part，其余（image_url 等）为非文本
+	Text string // part 的 text 字段
+	Raw  []byte // part 的**规范**字节（见 canonicalPartBytes）：非文本 part 摘要的哈希源
+}
+
+// canonicalPartBytes 把 part 原文归一到「键名排序」的规范 JSON 字节，作为摘要输入。
+//
+// 为什么必须归一：同一 part 在两条路径上来源不同——TurnKey 拿的是客户端原始
+// RawMessage（键序/空白由客户端决定），deriveKey 拿的是已解码的 map[string]any
+// （Go 序列化时键名自动排序）。不归一的话同一个 image part 会在轮级键与粘性键里
+// 得到两个不同摘要（同一消息两套算法），且客户端换个字段顺序就会换键。
+// 归一到规范形态后：两路径摘要恒等，且键对空白/键序变化免疫。
+func canonicalPartBytes(raw []byte) ([]byte, error) {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	return json.Marshal(m)
+}
+
+// contentSignatureCore 组装内容签名。三条规则：
+//
+//  1. **文本优先**：只要有任何非空文本（字符串形态内容，或任一带 text 的 part）→
+//     只返回文本拼接，结果与旧 contentText 逐字节相同 → 存量键零漂移；
+//  2. 全无文本（纯图片轮）→ 返回各非文本 part 的 `[type:sha256前8hex]`（换行分隔）
+//     ——修复纯图片轮"空键"盲区（G1）；摘要只取原文哈希，data: base64 超长内联图
+//     不会把键撑长（键长有界）；
+//  3. 两者皆空 → ""（不伪造，调用方保留原有空键语义）。
+//
+// 为什么不像上游 a767465 那样"文本 + 非文本摘要"混入：本仓有既有契约——图片 URL
+// 变化不得破坏派生键稳定性（TestExtractKeyMultimodalContent）。带签名/会过期的
+// 图片 URL 每轮都变，混入摘要会让粘性键逐轮漂移，把粘性反而打散。文本优先让
+// "有文本"的形态键值与历史完全一致，只有历史上恒为空串的纯图片形态才获得新键。
+func contentSignatureCore(parts []contentPart) string {
+	var texts, markers []string
+	for _, p := range parts {
+		if p.Text != "" {
+			texts = append(texts, p.Text)
+			continue
+		}
+		if p.Type == "" || p.Type == "text" {
+			continue // 无文本的文本 part 不贡献（保持 [{"type":"text","text":""}] → "" 旧口径）
+		}
+		sum := sha256.Sum256(p.Raw)
+		markers = append(markers, "["+p.Type+":"+hex.EncodeToString(sum[:4])+"]")
+	}
+	if len(texts) > 0 {
+		return strings.Join(texts, "")
+	}
+	return strings.Join(markers, "\n")
+}
+
+// contentSignature 取消息 content 的确定性签名（G1 修复——纯图片轮不再碎片化）。
+// 入参为原始 content JSON；组装规则见 contentSignatureCore。
+//
+// 形态口径与旧 contentText 完全一致（字符串形态原样返回、数组形态拼接 text 字段、
+// 空 / null / 非字符串非数组 → ""），差异仅在"全无文本但含非文本 part"时由 "" 变为
+// 非文本摘要序列——即纯图片轮的修复面。
+func contentSignature(raw json.RawMessage) string {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || s == "null" {
 		return ""
@@ -164,19 +229,78 @@ func contentText(raw json.RawMessage) string {
 		if err := json.Unmarshal(raw, &str); err != nil {
 			return ""
 		}
-		return str
+		return contentSignatureCore([]contentPart{{Text: str}})
 	case '[':
-		var parts []struct {
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(raw, &parts); err != nil {
+		var raws []json.RawMessage
+		if err := json.Unmarshal(raw, &raws); err != nil {
 			return ""
 		}
-		var b strings.Builder
-		for _, p := range parts {
-			b.WriteString(p.Text)
+		parts := make([]contentPart, 0, len(raws))
+		for _, pr := range raws {
+			var p struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(pr, &p); err != nil {
+				// 数组里混入非对象元素（裸字符串/数字等）属未知形态：整体返回 ""
+				// 不派生键。与旧 contentText（反序列化到 []struct 直接失败）逐字节
+				// 同口径——不因未知形态伪造键，避免脏绑定。
+				return ""
+			}
+			part := contentPart{Type: p.Type, Text: p.Text}
+			// 只有"会被计入标记"的 part（非文本类型且无文本）才需要规范字节：
+			// 文本 part 只贡献 Text，空文本的文本 part 两者都不贡献。
+			if p.Text == "" && p.Type != "" && p.Type != "text" {
+				canon, err := canonicalPartBytes(pr)
+				if err != nil {
+					return ""
+				}
+				part.Raw = canon
+			}
+			parts = append(parts, part)
 		}
-		return b.String()
+		return contentSignatureCore(parts)
+	}
+	return ""
+}
+
+// contentSignatureAny 是 contentSignature 的「已解码形态」版本，供 session.go 的
+// deriveKey 使用（那里 body 已整体 Unmarshal 成 map[string]any，不再持有原始
+// RawMessage）。归一到同一 contentPart 列表 + 同一 contentSignatureCore，两条
+// 链路的签名算法**只此一处定义**，不会各自漂移；非文本 part 的摘要输入经
+// json.Marshal 得到规范字节，与 contentSignature 的 canonicalPartBytes 恒等。
+//
+// 兼容口径与旧 messageText 一致：
+//   - string → 文本原样（不 trim，与旧 messageText 相同）；
+//   - []any 的每个 map[string]any part → type/text 字段；
+//   - 数组里的非对象元素**跳过**（与旧 messageText 的 `if p, ok := ...` 同口径）；
+//   - 其他形态（数字 / 对象 / null）→ ""（旧 messageText 取不到文本即空）。
+//
+// 与 RawMessage 版（contentSignature）的唯一分歧在"数组含非对象元素"：那边沿用旧
+// contentText 的整体失败语义（→ ""）。两版各自保持本键族的存量行为，不引入键漂移。
+func contentSignatureAny(content any) string {
+	switch v := content.(type) {
+	case string:
+		return contentSignatureCore([]contentPart{{Text: v}})
+	case []any:
+		parts := make([]contentPart, 0, len(v))
+		for _, item := range v {
+			p, ok := item.(map[string]any)
+			if !ok {
+				continue // 非对象元素：跳过（旧 messageText 同口径）
+			}
+			part := contentPart{Type: strOrEmpty(p["type"]), Text: strOrEmpty(p["text"])}
+			// 同 contentSignature：只有"会被计入标记"的 part 才需要序列化字节。
+			if part.Text == "" && part.Type != "" && part.Type != "text" {
+				raw, err := json.Marshal(p)
+				if err != nil {
+					continue // 序列化失败（理论不可达：来自已成功 Unmarshal 的值）
+				}
+				part.Raw = raw
+			}
+			parts = append(parts, part)
+		}
+		return contentSignatureCore(parts)
 	}
 	return ""
 }
