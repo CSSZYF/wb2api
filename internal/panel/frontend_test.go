@@ -572,3 +572,114 @@ func TestAppJSReadTimeoutWiring(t *testing.T) {
 		}
 	}
 }
+
+// TestAppJSManualDisableWiring 临时停用/恢复的前端接线必须齐全（上游 a20d06f 吸收）：
+// 后端字段 manual_disabled/manual_reason → 状态列标签 → 行内「停用/恢复」按钮 → 端点路径。
+// 四者任一被误删，面板上就是「后端摘了号但界面上看不出来」或「点了没反应的按钮」，
+// 而所有 Go 测试仍会全绿（app.js/index.html 是 go:embed 静态资源，Go 编译器不检查内容）。
+//
+// 重点锁死「两种不可选分开呈现」：disabled（永久禁用）与 manual_disabled（临时停用）
+// 是独立两位、可叠加，面板必须同时显示（合并成一个标签会让运维分不清该点解冻还是恢复）。
+func TestAppJSManualDisableWiring(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	for _, must := range []string{
+		"manual_disabled",                     // 后端字段被引用
+		"manual_reason",                       // 停用原因（与惩罚 reason 分开两行）
+		`data-a="suspend"`, `data-a="resume"`, // 行内按钮
+		`'/suspend'`, `'/resume'`, // 端点路径（api() 会补 /accounts/{uid} 前缀）
+		"临时停用", // 状态标签文案（区别于「已禁用」）
+	} {
+		if !strings.Contains(s, must) {
+			t.Errorf("app.js 缺少临时停用接线：%s", must)
+		}
+	}
+	// 状态列渲染函数体内必须同时引用两位——全文件搜索无法区分「注释里提到」与
+	// 「真的读了字段」，删掉 renderAccounts 里的插值也会照样通过。
+	body := jsFuncBody(s, "function renderAccounts(")
+	if body == "" {
+		t.Fatal("app.js 缺少函数 renderAccounts")
+	}
+	for _, must := range []string{"manual_disabled", "manual_reason", "s.disabled"} {
+		if !strings.Contains(body, must) {
+			t.Errorf("renderAccounts 未引用 %s（两种不可选必须分开呈现）", must)
+		}
+	}
+	// 「解冻」按钮只针对惩罚态，临时停用走「恢复」——按钮分支里必须各自出现。
+	if !strings.Contains(body, `data-a="suspend"`) || !strings.Contains(body, `data-a="resume"`) {
+		t.Error("renderAccounts 未按停用位切换「停用/恢复」按钮")
+	}
+
+	// 端点注册必须与前端调用同路径（改了一边忘另一边 = 404）。
+	// 路由注册的探测用 GET：已注册的路由对方法不匹配回 405（方法不允许）；未注册则回 404。
+	// 不能用 POST + 空池判：那时 "uid 不存在" 也是 404，与"路由未注册"不可区分。
+	pn := New(Config{Version: "test", APIKey: "test-key", Pool: pool.New("")})
+	for _, p := range []string{"/panel/api/accounts/u1/suspend", "/panel/api/accounts/u1/resume"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", p, nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		pn.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("panel.go 未注册 POST %s（GET 应回 405，实际 %d）", p, rec.Code)
+		}
+	}
+}
+
+// TestPanelOverviewExposesManualDisable 面板 overview 的每账号状态必须透出
+// manual_disabled/manual_reason 两位（app.js 读的就是这些键）。缺了字段，
+// 状态列永远显示不出「临时停用」——后端摘了号而界面上看不出来。
+func TestPanelOverviewExposesManualDisable(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetManualDisabled("u1", true, "观察几天")
+
+	pn := New(Config{Version: "test", APIKey: "test-key", Pool: p})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/panel/api/overview", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	pn.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Disabled int `json:"disabled"`
+		Accounts []struct {
+			UID            string `json:"uid"`
+			Disabled       bool   `json:"disabled"`
+			ManualDisabled bool   `json:"manual_disabled"`
+			ManualReason   string `json:"manual_reason"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	// 汇总口径：临时停用计入 disabled（保证 total/healthy/cooling/disabled 闭合）。
+	if resp.Disabled != 1 {
+		t.Errorf("汇总 disabled=%d want 1（临时停用计入不可选）", resp.Disabled)
+	}
+	byUID := map[string]bool{}
+	for _, a := range resp.Accounts {
+		if a.ManualDisabled {
+			if a.UID != "u1" {
+				t.Errorf("u2 不应被连带停用: %+v", a)
+			}
+			if a.ManualReason != "观察几天" {
+				t.Errorf("manual_reason=%q 未透出", a.ManualReason)
+			}
+			if a.Disabled {
+				t.Errorf("临时停用不应置 disabled: %+v", a)
+			}
+		}
+		byUID[a.UID] = a.ManualDisabled
+	}
+	if len(byUID) != 2 {
+		t.Fatalf("accounts 应含两个号: %+v", resp.Accounts)
+	}
+	if byUID["u2"] {
+		t.Error("u2 不应被停用")
+	}
+}

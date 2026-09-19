@@ -77,9 +77,15 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string    `json:"realm,omitempty"`
-	Disabled        bool      `json:"disabled"`
-	DisabledReason  string    `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Realm          string `json:"realm,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// ManualDisabled 运维临时停用（上游 a20d06f / issue #138/#118）——与 disabled
+	// **并列独立**，叠加态分别透出不合并：面板据此区分「我主动摘的（可恢复）」与
+	// 「系统判定坏了（需复活）」，两者的可用操作不同。
+	// 零值也显式写出（运维口径，同 ConsecutiveFails：缺失会让人误以为"没记录"）。
+	ManualDisabled  bool      `json:"manual_disabled"`
+	ManualReason    string    `json:"manual_reason,omitempty"` // 仅临时停用：停用原因（运维可见）
 	SuccessCount    int64     `json:"success_count,omitempty"`
 	ErrTotal        int64     `json:"err_total,omitempty"`
 	LastSuccessTime time.Time `json:"last_success,omitempty"`
@@ -148,7 +154,20 @@ type entry struct {
 	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
 	disabled        bool
 	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// manualDisabled 运维临时停用（上游 a20d06f / issue #138/#118）：与 disabled 并列的
+	// 独立状态位，语义是「**对话流量摘除**」而非「账号冻结」——停用期间签到 / token 保活 /
+	// 排程任务照常执行（scheduler 只判 Status.Disabled，见 internal/scheduler/scheduler.go:412），
+	// 凭证与积分都是活的，只是不参与选号。
+	//
+	// 为什么必须是独立位而不能复用 disabled：我们的 disabled 会被自动路径撤销
+	// （login.go:242 重新登录即 Revive、NoteSuccess/ReenableIfCredits 清惩罚态），
+	// 运维意图若寄居在同一字段上会被这些路径无声解除——那正是上游引入独立位的理由。
+	// 两位各自独立清除（Revive/ReviveDisabled 清 disabled、ClearManualDisabled 清本字段），
+	// 都清空才回到选号池。
+	// 持久化（stateAccount.ManualDisabled）：重启保留运维意图。
+	manualDisabled bool
+	manualReason   string
+	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -231,11 +250,13 @@ func (e *entry) hardCooldownSet() bool {
 	return e.coolKind == CoolHard && !e.until.IsZero()
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
+// healthy 报告账号当前是否可选（未禁用、未临时停用、未处于任一冷却/熔断/连败降权期）。
 // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
 // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
+// 临时停用（manualDisabled）与永久禁用同判：对「能不能被选中」这个问题二者等价，
+// 区别只在**怎么解**（ClearManualDisabled vs Revive/ReviveDisabled）与面板呈现。
 func (e *entry) healthy(now time.Time) bool {
-	if e.disabled {
+	if e.disabled || e.manualDisabled {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -251,7 +272,7 @@ func (e *entry) healthy(now time.Time) bool {
 }
 
 // modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
-// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断、未降权。
+// 模型级冷却（modelCooldowns 非空），且尚未禁用、未临时停用、未熔断、未降权。
 // 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
@@ -264,7 +285,7 @@ func (e *entry) healthy(now time.Time) bool {
 // （degradeUntil 过期即 healthy=true），不产生假阴性。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && e.breakerUntil.IsZero() && e.degradeUntil.IsZero()
+		!e.disabled && !e.manualDisabled && e.breakerUntil.IsZero() && e.degradeUntil.IsZero()
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -281,7 +302,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
-//   - disabled → 永不可选（最高优先级）；
+//   - disabled / 临时停用 → 永不可选（最高优先级）；
 //   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选
 //     （多模型限流时各自独立，互不影响）；
 //   - 否则 → 回落到账号级 healthy（until/breakerUntil 维度）。
@@ -290,7 +311,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if e.disabled {
+	if e.disabled || e.manualDisabled {
 		return false
 	}
 	if e.modelCooled(now, reqModel) {
@@ -353,13 +374,18 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
-	CreditsTotal int64     `json:"credits_total,omitempty"`
-	Disabled     bool      `json:"disabled"`
-	Reason       string    `json:"reason,omitempty"`
-	Until        time.Time `json:"until,omitempty"`
-	CoolKind     CoolKind  `json:"cool_kind"`
-	SuccessCount int64     `json:"success_count,omitempty"`
+	Credits      int64  `json:"credits"`
+	CreditsTotal int64  `json:"credits_total,omitempty"`
+	Disabled     bool   `json:"disabled"`
+	Reason       string `json:"reason,omitempty"`
+	// ManualDisabled 运维临时停用（上游 a20d06f / issue #138/#118）。持久化——重启保留
+	// 运维意图，这也正是该功能要解决的痛点之一：旧权宜做法直接改 state.json 会被 5s
+	// flush 覆盖，入口化后无需再碰文件。零值也显式写出（运维口径，同 consecutive_fails）。
+	ManualDisabled bool      `json:"manual_disabled"`
+	ManualReason   string    `json:"manual_reason,omitempty"`
+	Until          time.Time `json:"until,omitempty"`
+	CoolKind       CoolKind  `json:"cool_kind"`
+	SuccessCount   int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64      `json:"err_total,omitempty"`

@@ -48,6 +48,7 @@ type CooldownProbeTarget struct {
 //
 // 选择口径（与文件头设计边界一致）：
 //   - 跳过 disabled 账号（已退出选号，冷却无意义）；
+//   - 跳过 manualDisabled 账号（运维临时摘除：探活成功也换不回选号资格，纯浪费配额）；
 //   - 跳过 hardCooldownSet 的账号（CoolHard + until 非零：积分耗尽，等签到）；
 //   - modelCooldowns 中 Until 已过的条目 → 每个 (账号, 模型) 一个目标；
 //   - 账号级 coolKind==CoolSoft 且 until 已过 → 一个账号级目标。探活模型优先取
@@ -62,7 +63,8 @@ func (p *Pool) CooldownProbeTargets(now time.Time) []CooldownProbeTarget {
 	defer p.mu.RUnlock()
 	out := make([]CooldownProbeTarget, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if e.disabled {
+		if e.disabled || e.manualDisabled {
+			// 禁用/临时停用都不参与选号：探活成功也换不回可用性，纯浪费上游配额。
 			continue
 		}
 		if e.hardCooldownSet() {

@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -163,6 +164,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	// 临时停用/恢复（上游 a20d06f 吸收）：与上面的 disable/revive 是**两套语义**——
+	// disable/revive 管「系统判定的坏号」（永久禁用，需复活），suspend/resume 管
+	// 「运维主动摘除」（临时停用，可随时恢复）。两者独立，都清空才回选号池。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/suspend", p.withAuth(p.accountSuspend))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -389,6 +395,8 @@ func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 // accountRevive 手动复活：清禁用 + 冷却 + 熔断（运维口径无条件恢复）。
+// **不解除**临时停用（manualDisabled）——那是运维意图，与「系统判定的坏号」是两件事；
+// 响应回显双位状态，前端据此提示「已解冻但仍处临时停用，还需点恢复」。
 func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	if _, ok := p.cfg.Pool.Status(uid); !ok {
@@ -397,10 +405,14 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Pool.Revive(uid)
 	log.Printf("panel: revive uid=%s（人工清除禁用/冷却/熔断）", uid)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// changed 恒 true：Revive 是无条件恢复，没有「已是该状态」的短路（幂等但每次都生效）。
+	p.writeAccountState(w, uid, true)
 }
 
-// accountDisable 人工禁用（不再参与选号，需面板 revive 或重登恢复）。
+// accountDisable 人工永久禁用（不再参与选号，需面板 revive 或重登恢复）。
+// 与 accountSuspend（临时停用）的区别：本端点是**系统判定口径**——它清冷却域
+// （disableLocked），恢复要走「解冻」（Revive）；临时停用不清任何惩罚维度，
+// 恢复走「恢复」（resume）。面板按 disabled/manual_disabled 两位分别呈现。
 func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	if _, ok := p.cfg.Pool.Status(uid); !ok {
@@ -410,6 +422,80 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.Disable(uid, "manual disable (panel)")
 	log.Printf("panel: disable uid=%s（人工禁用）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountSuspend 临时停用（上游 a20d06f / issue #138/#118）：把账号摘出选号池，
+// 但保留在池里——签到 / token 保活 / 排程任务照常执行，凭证与积分都是活的。
+//
+// 与 accountDisable 的分工：本端点只置 manualDisabled，**不清**冷却/熔断/连败降权，
+// 也**不碰** disabled 位（临时停用不是"判它坏了"，而是"我主动摘的"）。两者叠加时
+// 各自独立解除：suspend 后仍被系统禁用的号，resume 不会让它回池（要再 revive）。
+// 幂等：重复 suspend 不报错，只更新原因文案。
+func (p *Panel) accountSuspend(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	reason := panelReasonFromBody(r)
+	if reason == "" {
+		reason = "manual suspend (panel)"
+	}
+	found, changed := p.cfg.Pool.SetManualDisabled(uid, true, reason)
+	if !found {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: suspend uid=%s reason=%q（临时停用：摘除选号流量，签到/保活照常）", uid, reason)
+	p.writeAccountState(w, uid, changed)
+}
+
+// accountResume 解除临时停用。若账号仍被系统永久禁用（disabled），它**不会**因此回到
+// 选号池——那需要「解冻」（revive）。响应里的 disabled 字段就是给前端提示用的。
+func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	found, changed := p.cfg.Pool.ClearManualDisabled(uid)
+	if !found {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: resume uid=%s（解除临时停用）", uid)
+	p.writeAccountState(w, uid, changed)
+}
+
+// writeAccountState 回显操作后的双位状态：面板据此直接更新 UI 并给出准确提示
+// （例如 resume 后仍 disabled → 提示"还需解冻"），不必再打一次 overview。
+// changed 报告本次操作是否产生了状态变更（幂等重复调用为 false），前端据此决定
+// 提示「已停用」还是「本就停用」；revive 无短路语义，调用方恒传 true。
+func (p *Panel) writeAccountState(w http.ResponseWriter, uid string, changed bool) {
+	st, ok := p.cfg.Pool.Status(uid)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":              true,
+		"changed":         changed,
+		"disabled":        st.Disabled,
+		"manual_disabled": st.ManualDisabled,
+		"manual_reason":   st.ManualReason,
+	})
+}
+
+// panelReasonFromBody 读可选 JSON 体里的 reason 字段（截断到 200 字符）。
+// 空体 / 非 JSON / 无该字段都返回空串——端点不因体格式拒绝（无体是最常见调用形态）。
+func panelReasonFromBody(r *http.Request) string {
+	if r.Body == nil {
+		return ""
+	}
+	// 限制读取量：reason 是短文本，避免畸形大请求占用内存（与 server 侧 admin 端点同口径）。
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&body); err != nil {
+		return ""
+	}
+	reason := strings.TrimSpace(body.Reason)
+	if len(reason) > 200 {
+		reason = reason[:200]
+	}
+	return reason
 }
 
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），

@@ -548,3 +548,50 @@ func TestRunBalanceRefreshNowKeepsSoftCooling(t *testing.T) {
 		t.Errorf("切模型应豁免选中 model 号，got %v", got)
 	}
 }
+
+// TestCheckinAndKeepaliveIncludeManualDisabled 临时停用号必须仍参与签到与 token 保活
+// （上游 a20d06f / issue #138 用户硬约束：停用只是「对话流量摘除」，签到/保活/排程照常）。
+//
+// scheduler 的跳过判据只看 st.Disabled（scheduler.go:412/469/536/570 等），本锚防止
+// 未来有人把判据改成「Disabled || ManualDisabled」时无声破坏停用号的积分与 token 活性
+// ——那会让「临时停用」退化成「账号冻结」，正是本特性刻意区分的两件事。
+func TestCheckinAndKeepaliveIncludeManualDisabled(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 500}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1})
+	p.SetManualDisabled("u1", true, "观察几天")
+
+	up := &upstream.Client{
+		HTTP:          srv.Client(),
+		ChatBaseCN:    srv.URL,
+		BillingBaseCN: srv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunCheckinNow()
+	if f.checkinCalls.Load() != 1 {
+		t.Errorf("临时停用号应照常签到, calls=%d", f.checkinCalls.Load())
+	}
+	s.RunKeepaliveNow()
+	if f.refreshCalls.Load() != 1 {
+		t.Errorf("临时停用号应照常保活刷 token, calls=%d", f.refreshCalls.Load())
+	}
+
+	st, _ := p.Status("u1")
+	if !st.ManualDisabled {
+		t.Fatalf("签到/保活不得解除临时停用: %+v", st)
+	}
+	if st.Credits != 500 {
+		t.Errorf("签到应照常回填余额, credits=%d want 500", st.Credits)
+	}
+	if st.Disabled {
+		t.Error("临时停用不得被签到/保活路径升格成永久禁用")
+	}
+	// 仍不参与选号（活性照常 ≠ 可用）。
+	if got := p.Pick(); got != nil {
+		t.Fatalf("停用号仍不应被选中, got %+v", got)
+	}
+}
