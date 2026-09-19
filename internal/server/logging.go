@@ -76,7 +76,16 @@ type chatStatsReader struct {
 	hasPromptTokens     bool
 	hasCompletionTokens bool
 	hasTotalTokens      bool
-	pend                []byte // 已读未返回的行缓存
+	// 缓存三段与真实扣费（末帧 usage）。字段名是上游实测值（见 upstream/cache_key.go
+	// 的逆向记录：带 prompt_cache_key 时 prompt_cache_hit_tokens=7808、credit≈0.02）。
+	// hasCache 区分「上游给了缓存字段」与「上游根本没这个字段」——缺失 ≠ 全 0。
+	cacheHit  int
+	cacheMiss int
+	cacheWr   int
+	hasCache  bool
+	credit    float64
+	hasCredit bool
+	pend      []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -102,6 +111,36 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	}
 }
 
+// CacheTokens 返回末帧 usage 的缓存三段与是否有观测（供 /v1/stats 的命中率聚合）。
+// 缺观测时 ok=false，调用方据此把三个 0 记成「没看到」而不是「命中 0」。
+func (s *chatStatsReader) CacheTokens() (hit, miss, write int, ok bool) {
+	return s.cacheHit, s.cacheMiss, s.cacheWr, s.hasCache
+}
+
+// Credit 返回末帧 usage.credit（本次真实扣费）与是否有观测。
+func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
+
+// HasTTFB 报告是否观测到首帧。用 seen 而非 ttfb>0 判定：首帧在 1ms 内到达时
+// ttfb 截断为 0ms，用 >0 判定会把它误记成「无观测」，把这次样本从均值里漏掉。
+func (s *chatStatsReader) HasTTFB() bool { return s.seen }
+
+// attemptObs 一次尝试里「统计端点专用」的观测（/v1/stats 数据源）。
+//
+// 为什么不并进 pool.TokenUsageDelta：那是账号级累计器的入参，加字段会让 pool 的
+// 持久化结构跟着膨胀（那本账只要 token/延迟/吞吐）；本结构只喂 usage 记录器。
+// 两者读同一份上游 usage，但目标字段集不同，各自演进反而不会互相牵制。
+type attemptObs struct {
+	Stream     bool
+	TTFB       time.Duration
+	HasTTFB    bool
+	CacheHit   int64
+	CacheMiss  int64
+	CacheWrite int64
+	HasCache   bool
+	Credit     float64
+	HasCredit  bool
+}
+
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
@@ -121,6 +160,12 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptTokens     *int `json:"prompt_tokens"`
 			CompletionTokens *int `json:"completion_tokens"`
 			TotalTokens      *int `json:"total_tokens"`
+			// 缓存三段与真实扣费：指针区分「缺失」与「显式 0」——上游不返回这些
+			// 字段时不能当成「命中 0 个 token」（会把命中率算成 0，看起来像缓存全失效）。
+			PromptCacheHitTokens   *int     `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens  *int     `json:"prompt_cache_miss_tokens"`
+			PromptCacheWriteTokens *int     `json:"prompt_cache_write_tokens"`
+			Credit                 *float64 `json:"credit"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -137,6 +182,24 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.TotalTokens != nil {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
+	}
+	// 缓存三段按「任一字段出现」标记有观测：上游可能只给 hit（miss/write 省略），
+	// 此时未给的字段按 0 计入是对的（上游确实没算那一段的费用）。
+	if chunk.Usage.PromptCacheHitTokens != nil {
+		s.hasCache = true
+		s.cacheHit = *chunk.Usage.PromptCacheHitTokens
+	}
+	if chunk.Usage.PromptCacheMissTokens != nil {
+		s.hasCache = true
+		s.cacheMiss = *chunk.Usage.PromptCacheMissTokens
+	}
+	if chunk.Usage.PromptCacheWriteTokens != nil {
+		s.hasCache = true
+		s.cacheWr = *chunk.Usage.PromptCacheWriteTokens
+	}
+	if chunk.Usage.Credit != nil {
+		s.hasCredit = true
+		s.credit = *chunk.Usage.Credit
 	}
 }
 
@@ -228,6 +291,69 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
 	return delta
+}
+
+// usageExtraFromResponse 从非流式聚合响应里取缓存三段与真实扣费（供 /v1/stats）。
+//
+// 与 usageDeltaFromResponse 的分工：那个函数服务 token 三段（pool 与 usage 两处
+// 累计器都要），本函数只补统计端点额外需要的缓存/扣费观测。两者读同一份 usage，
+// 但目标字段不同，故不复用——强行合并会让账本依赖统计的字段集，反之亦然。
+//
+// 返回的 ok 表示「上游给了任一缓存字段」：全缺时调用方按「无观测」记账，
+// 而不是把三个 0 当命中 0 累加（那会把命中率永久压低）。
+func usageExtraFromResponse(resp map[string]any) (hit, miss, write int64, ok bool, credit float64, hasCredit bool) {
+	u, isMap := resp["usage"].(map[string]any)
+	if !isMap {
+		return 0, 0, 0, false, 0, false
+	}
+	read := func(key string) (int64, bool) {
+		v, present := u[key]
+		if !present {
+			return 0, false
+		}
+		switch n := v.(type) {
+		case float64:
+			return int64(n), true
+		case float32:
+			return int64(n), true
+		case int:
+			return int64(n), true
+		case int64:
+			return n, true
+		case json.Number:
+			i, err := n.Int64()
+			return i, err == nil
+		default:
+			return 0, false
+		}
+	}
+	if n, has := read("prompt_cache_hit_tokens"); has {
+		hit, ok = n, true
+	}
+	if n, has := read("prompt_cache_miss_tokens"); has {
+		miss, ok = n, true
+	}
+	if n, has := read("prompt_cache_write_tokens"); has {
+		write, ok = n, true
+	}
+	if c, has := u["credit"].(float64); has {
+		credit, hasCredit = c, true
+	}
+	return hit, miss, write, ok, credit, hasCredit
+}
+
+// obsFromResponse 由非流式聚合响应派生统计观测（缓存三段 + 扣费）。
+// 非流式没有「首帧」概念，HasTTFB 恒 false——计入会把首字均值拉低失真。
+func obsFromResponse(resp map[string]any) attemptObs {
+	hit, miss, write, ok, credit, hasCredit := usageExtraFromResponse(resp)
+	return attemptObs{
+		CacheHit:   hit,
+		CacheMiss:  miss,
+		CacheWrite: write,
+		HasCache:   ok,
+		Credit:     credit,
+		HasCredit:  hasCredit,
+	}
 }
 
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
