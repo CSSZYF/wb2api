@@ -167,7 +167,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
-| **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
+| **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性；纯图片轮（无文本）同样可派生 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **auths 目录热加载** | `schedule.auth_watch_seconds`（默认 30）周期扫描 `auth_dir`，手工上传/删除凭证文件免重启生效；写入中的半截文件跳过重试，账号不会因上传中间态出池 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
@@ -188,6 +188,14 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 签到幂等 | `IsAlreadyCheckin` 识别"今天已签到"（code=10001/14001），调度日志不再把重复签到当失败 |
 | 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
 | report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
+
+**第三轮（`sliver/master` 四个提交，2026-09-19，粘性键补全）**：
+
+| 上游改动 | 吸收内容 |
+|---|---|
+| `8058019` 粘性键补 `prompt_cache_key` + 首条 user 兜底 | `prompt_cache_key` 纳入会话键链（第 3 位，见上）；「无会话标识时按首条 user 派生会话级键」**未单独引入**——本仓早有同语义且更成熟的第 4 位内容派生键（`d-` 前缀，含 system 维度），并存两套内容哈希只会让同一条消息产生两个键、把粘性拆散 |
+| `10eefa8` 兜底键抑制带 `user_id` 的请求 | **吸收**（本仓此前的真实缺口）：本仓派生路径没有 `user_id` 闸门，只发 `user_id` 的客户端会借首条 prompt 重新获得粘性，绕过 P1-anti-monopoly 剔除。现 `deriveKey` 入口加 `hasUserID` 抑制（`metadata.user_id` / 顶层 `user_id`，非字符串/空串不算） |
+| `a767465` content 内容签名 | **吸收但刻意偏离**：纯图片轮（无文本）派生空键的盲区一并修复（`[type:sha256前8hex]` 签名，轮级键 + 粘性键共用）；但**文本优先**——有文本时只返回文本拼接（上游是"文本+图片摘要"混入）。理由：本仓有既有契约「图片 URL 变化不得破坏派生键稳定性」，带签名/会过期的图片 URL 每轮都变，混入摘要会让多模态会话逐轮换键。另加规范字节归一（part 键序/空白变化不换键） |
 
 未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
 
@@ -487,7 +495,13 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 同一会话尽量复用同一账号，多轮对话不跳号：
 
-- 会话键提取顺序：`metadata.conversation_id` → `metadata.conversationId` → `metadata.user_id` → 顶层 `conversation_id` → 顶层 `conversationId`（snake_case 优先于 camelCase）
+- 会话键提取顺序（`session.ExtractKey`，依次尝试、命中即返回）：
+  1. `metadata.conversation_id` / `metadata.conversationId`
+  2. 顶层 `conversation_id` / `conversationId`（snake_case 优先于 camelCase）
+  3. `prompt_cache_key` —— pi-ai 系客户端（dsh 等）把会话 ID 放在这个 OpenAI 前缀缓存字段里
+  4. **内容派生键**（`d-` 前缀）：`sha256(system 内容 + 首条 user 内容签名)[:16]`。取 `system + 首条 user` 而非全部消息——历史每轮追加，全量哈希会每轮变化；两者在会话内恒定。system 一并入键：网关可改写系统提示词，system 不同即上游前缀缓存边界不同
+- `user_id` **不是**粘性键（一个 user 的并行对话会被钉到同一账号，粒度远粗于上游对话级缓存边界）；发 `user_id` 的客户端回落加权轮换——该契约对内容派生路径同样成立：带 `metadata.user_id` / 顶层 `user_id` 的请求不派生 `d-` 键
+- 纯图片轮（content 全是 image part、无文本）也能派生键：签名取各非文本 part 的 `[type:sha256前8hex]`，part 键序/空白变化不换键、`data:` 超长内联图只入摘要（键长有界）。**带文本的形态只取文本**（图片 URL 常带签名且会过期，混入摘要会让多模态会话逐轮换键）
 - TTL 滚动续期（默认 30m），GC 周期 5m；绑定可镜像到 Redis（7 天 TTL）防重启丢失
 - 请求失败自动解绑；成功后绑定跟随最终成功账号
 

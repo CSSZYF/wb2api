@@ -461,6 +461,168 @@ func TestExtractKeyDerivedFromContent(t *testing.T) {
 	}
 }
 
+// TestExtractKeyPromptCacheKey 第 5 来源 prompt_cache_key：pi-ai 系客户端把会话 ID
+// 放在这个 OpenAI 前缀缓存字段里（而非 conversation_id），此前 ExtractKey 恒空 →
+// 粘性永不参与、逐请求换号。置于 conversation 维度四键之后、内容派生之前。
+func TestExtractKeyPromptCacheKey(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		// 主用例：只有 prompt_cache_key（无任何 conversation 键）→ 取它。
+		{"cache key only", `{"model":"m","prompt_cache_key":"pi-ai-sess-7","messages":[{"role":"user","content":"你好"}]}`, "pi-ai-sess-7"},
+		// 优先级：绝不抢占 conversation 维度四键。
+		{"top-level conversation_id wins", `{"conversation_id":"c1","prompt_cache_key":"pk","messages":[{"role":"user","content":"x"}]}`, "c1"},
+		{"metadata conversation_id wins", `{"metadata":{"conversation_id":"mc"},"prompt_cache_key":"pk","messages":[{"role":"user","content":"x"}]}`, "mc"},
+		{"camelCase conversationId wins", `{"conversationId":"c2","prompt_cache_key":"pk","messages":[{"role":"user","content":"x"}]}`, "c2"},
+		// 空串 / 非字符串不算标识（strOrEmpty 口径）→ 回落内容派生。
+		{"empty cache key falls through", `{"model":"m","prompt_cache_key":"","messages":[{"role":"user","content":"你好"}]}`, "d-46d71dd26ed9d7daba1a04dcc72be6d0"},
+		{"non-string cache key falls through", `{"model":"m","prompt_cache_key":123,"messages":[{"role":"user","content":"你好"}]}`, "d-46d71dd26ed9d7daba1a04dcc72be6d0"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ExtractKey([]byte(c.body)); got != c.want {
+				t.Errorf("ExtractKey(%s)=%q want %q", c.body, got, c.want)
+			}
+		})
+	}
+	// user_id 不抑制 prompt_cache_key：客户端显式声明的会话身份优先于
+	// P1-anti-monopoly 的内容派生抑制（该抑制只作用于派生路径，见 deriveKey）。
+	withUID := `{"prompt_cache_key":"pk","metadata":{"user_id":"u1"},"messages":[{"role":"user","content":"x"}]}`
+	if got := ExtractKey([]byte(withUID)); got != "pk" {
+		t.Errorf("user_id 不应抑制显式 prompt_cache_key: got %q", got)
+	}
+}
+
+// TestExtractKeyBackwardCompatGolden 向后兼容 golden：改动**之前**采集的键值
+// （v1.9.16 实测）在改动后必须逐字节不变——否则存量会话的粘性绑定会因键漂移而
+// 全部失配（旧绑定仍占着 TTL，新键重新分配 → 同会话短时跨号）。
+//
+// 覆盖：字符串 content（含 system/developer 角色、空白、空串边界）、图文混合
+// （文本优先，图片不入键）、以及各类空态。纯图片轮是唯一**有意**变更的形态
+// （原为空串、现派生 [type:摘要] 键），由 TestExtractKeyImageOnlyFallback 覆盖。
+func TestExtractKeyBackwardCompatGolden(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"system+首条 user", `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"}]}`,
+			"d-e5f141cd029bf33ce1cf8fda869bcab4"},
+		{"仅首条 user", `{"model":"m","messages":[{"role":"user","content":"你好"}]}`,
+			"d-46d71dd26ed9d7daba1a04dcc72be6d0"},
+		{"图文混合（文本优先）", `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`,
+			"d-883bdebc08b173ad8449b1956682a91d"},
+		{"图文混合 文本+多图", `{"messages":[{"role":"user","content":[{"type":"text","text":"A"},{"type":"image_url","image_url":{"url":"http://x/y.png"}},{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`,
+			"d-c00b4d3c929cb5cc316691ed4636f634"},
+		{"developer 角色入键", `{"messages":[{"role":"developer","content":"dev"},{"role":"user","content":"q"}]}`,
+			"d-7bc6fe0e72f9e38252cca0827c914e30"},
+		// 空白**不**归一：旧实现按原文入哈希，若新版 trim 会让存量键全部漂移。
+		{"首条 user 带首尾空白", `{"messages":[{"role":"user","content":"  hi  "}]}`,
+			"d-4d36a26596e178427ece95f5dbe3ac85"},
+		// 数组含非对象元素：旧 messageText 跳过该元素仍取到文本（不是整体失败）。
+		{"数组含非对象元素", `{"messages":["junk",{"role":"user","content":"hi"}]}`,
+			"d-e6908025cd50ce380feecfeaedb70ba2"},
+		{"role 非字符串 + user", `{"messages":[{"role":123},{"role":"user","content":"hi"}]}`,
+			"d-e6908025cd50ce380feecfeaedb70ba2"},
+		{"首条 user 空串、第二条有文本", `{"messages":[{"role":"user","content":""},{"role":"assistant","content":"x"},{"role":"user","content":"第二问"}]}`,
+			"d-26eb414d21f5b1cfed09a7458fed3648"},
+		// 空态恒空串（不伪造键）。
+		{"messages 非数组", `{"conversation_id":"c1","messages":"oops"}`, "c1"},
+		{"无 messages", `{"model":"x"}`, ""},
+		{"空数组 content", `{"messages":[{"role":"user","content":[]}]}`, ""},
+		{"content 对象", `{"messages":[{"role":"user","content":{"text":"x"}}]}`, ""},
+		{"content 数字", `{"messages":[{"role":"user","content":123}]}`, ""},
+		{"文本 part 全空串", `{"messages":[{"role":"user","content":[{"type":"text","text":""}]}]}`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ExtractKey([]byte(c.body)); got != c.want {
+				t.Errorf("键值漂移（存量粘性会失配）: ExtractKey=%q want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestExtractKeyImageOnlyFallback 纯图片轮的粘性盲区修复（G1 加重形态）：
+// 首条 user 纯图片时 deriveKey 原返回空串 → 该类会话完全无粘性（逐请求换号）。
+// 现由 contentSignatureAny 取 [type:摘要] 派生非空键，且会话内历史追加不换键。
+func TestExtractKeyImageOnlyFallback(t *testing.T) {
+	first := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]}]}`
+	k := ExtractKey([]byte(first))
+	if k == "" || !strings.HasPrefix(k, "d-") {
+		t.Fatalf("纯图片首条 user 应派生非空粘性键（G1 修复）: got %q", k)
+	}
+	// 会话推进（历史追加、首条 user 不变）→ 同键。
+	longer := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]},` +
+		`{"role":"assistant","content":"答"},{"role":"user","content":"继续"}]}`
+	if got := ExtractKey([]byte(longer)); got != k {
+		t.Errorf("纯图会话历史追加不应换键: %q vs %q", got, k)
+	}
+	// 换图 → 换键（不同会话）。
+	other := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://img.example/dog.png"}}]}]}`
+	if got := ExtractKey([]byte(other)); got == k {
+		t.Errorf("不同首图应不同键: %q", got)
+	}
+	// 键长有界：data: 超长内联图只入摘要。
+	longDataURL := "data:image/png;base64," + strings.Repeat("QUFBQQ", 4096)
+	long := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"` + longDataURL + `"}}]}]}`
+	lk := ExtractKey([]byte(long))
+	if lk == "" {
+		t.Fatal("data: 超长内联图应仍派生键")
+	}
+	if len(lk) > 128 {
+		t.Errorf("派生键长度应有界（摘要防超长）: len=%d", len(lk))
+	}
+	// 图片 part 键序/空白差异不换键（规范字节摘要）。
+	reordered := `{"messages":[{"role":"user","content":[ { "image_url" : { "url" : "https://img.example/cat.png" } , "type" : "image_url" } ]}]}`
+	if got := ExtractKey([]byte(reordered)); got != k {
+		t.Errorf("part 键序/空白变化不应换键（规范摘要）: %q vs %q", got, k)
+	}
+}
+
+// TestDeriveKeySuppressedByUserID P1-anti-monopoly 契约在**派生路径**的延伸：
+// ExtractKey 有意剔除 user_id 作粘性键（user 维度粒度过粗），但内容派生是另一条
+// 会给出非空键的路径——若不设闸，只发 user_id 的客户端会借首条 prompt 重新获得
+// 粘性，使该契约失效（上游 10eefa8 修的同款回归；我们此前**没有**此闸门）。
+//
+// 与 TestUserIdNoLongerSticky 互补：后者只断言 ExtractKey 对"无 messages 的
+// user_id body"返回空，覆盖不到"带 messages 时走派生路径"这一形态。
+func TestDeriveKeySuppressedByUserID(t *testing.T) {
+	// 闸门生效：两种 user_id 形态都恒空。
+	for _, body := range []string{
+		`{"model":"m","metadata":{"user_id":"u-42"},"messages":[{"role":"user","content":"帮我写代码"}]}`,
+		`{"model":"m","user_id":"u-42","messages":[{"role":"user","content":"帮我写代码"}]}`,
+		// 带 system 也照常抑制。
+		`{"metadata":{"user_id":"u-42"},"messages":[{"role":"system","content":"sys"},{"role":"user","content":"q"}]}`,
+	} {
+		if got := ExtractKey([]byte(body)); got != "" {
+			t.Errorf("带 user_id 的请求不应派生内容键（P1-anti-monopoly）: %s got %q", body, got)
+		}
+	}
+	// 边界：非字符串 / 空串 user_id 不算标识 → 不抑制（与 strOrEmpty 口径一致）。
+	for _, body := range []string{
+		`{"metadata":{"user_id":123},"messages":[{"role":"user","content":"帮我写代码"}]}`,
+		`{"metadata":{"user_id":""},"messages":[{"role":"user","content":"帮我写代码"}]}`,
+		`{"metadata":{"user_id":null},"messages":[{"role":"user","content":"帮我写代码"}]}`,
+	} {
+		if got := ExtractKey([]byte(body)); got == "" {
+			t.Errorf("非字符串/空 user_id 不应抑制派生: %s", body)
+		}
+	}
+	// 不误伤真正需要粘性的客户端（无 user_id 的 OpenAI 兼容形态）。
+	plain := `{"model":"m","messages":[{"role":"user","content":"帮我写代码"}]}`
+	if got := ExtractKey([]byte(plain)); got == "" {
+		t.Error("无 user_id 的请求应照常派生键")
+	}
+	// 显式 conversation 维度键不受抑制影响（user_id 只影响派生路径）。
+	explicit := `{"metadata":{"user_id":"u-42","conversation_id":"c1"},"messages":[{"role":"user","content":"q"}]}`
+	if got := ExtractKey([]byte(explicit)); got != "c1" {
+		t.Errorf("显式 conversation_id 不受 user_id 抑制影响: got %q", got)
+	}
+}
+
 // TestExtractKeyMultimodalContent 多模态 content 数组取文本部分派生。
 func TestExtractKeyMultimodalContent(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`

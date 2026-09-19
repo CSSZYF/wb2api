@@ -14,7 +14,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -346,18 +345,30 @@ func hashIndex(key string, n int) int {
 //  2. metadata.conversationId
 //  3. conversation_id
 //  4. conversationId
-//  5. 派生键：system 提示词 + 首条用户消息的哈希（客户端不发会话 id 时的回退）
+//  5. prompt_cache_key（客户端显式声明的会话级前缀缓存键）
+//  6. 派生键：system 提示词 + 首条用户消息的内容签名哈希（客户端不发会话 id 时的回退）
 //
-// 全部为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+// 1-4 均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
 // （P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
 // user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
 // 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
 // （与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
 // （7d 兜底）自然过期，键消失不产生脏绑定。
+// 该契约对第 6 项派生键同样成立（deriveKey 内的 hasUserID 闸门）：带 user_id 的
+// 请求不派生内容键，否则只发 user_id 的客户端会借首条 prompt 绕过上述剔除。
 //
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
 // snake_case 优先级高于 camelCase（同值不同名命中同一对话时返回相同值，天然不混用）。
+//
+// 第 5 项 prompt_cache_key：部分 OpenAI 系客户端（pi-ai 驱动的 dsh 等）把会话 ID
+// 放在这个前缀缓存字段里而非 conversation_id——语义与粘性同源（"同一会话复用同一
+// 前缀"）。上游同款实现亦取此字段。置于 conversation 维度四键**之后**、内容派生
+// **之前**：绝不抢占显式 conversation 维度，但优先于内容猜测（客户端已明确声明
+// 会话身份，比网关从内容反推更可信）。
+//
+// 注意：网关出站时会自行注入 prompt_cache_key（upstream.InjectPromptCacheKey，按
+// 账号隔离），但那是**出站改写**，入站 body 里没有该字段，不会自我污染粘性键。
 func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -380,6 +391,9 @@ func ExtractKey(body []byte) string {
 	if v := strOrEmpty(obj["conversationId"]); v != "" {
 		return v
 	}
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
 	return deriveKey(obj)
 }
 
@@ -387,63 +401,71 @@ func ExtractKey(body []byte) string {
 // 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
 const derivedKeyPrefix = "d-"
 
-// deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
+// deriveKey 从消息内容派生稳定会话键：SHA-256(system 内容 + 首条 user 内容签名)
+// 前 16 字节，前缀 d-。
 //
 // 为什么用「system + 首条 user」而不是全部消息：
 //   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
 //   - system 与首条 user 在一次对话中恒定，足以区分不同对话；
 //   - 同一会话多轮请求 → 同一键 → 稳定粘住同一账号（上游 prompt 缓存命中）。
+//   - system 一并入键（相对上游同款只哈希首条 user 的差异）：网关可改写系统
+//     提示词（custom / passthrough / 降级），system 不同即上游前缀缓存边界不同，
+//     纳入键能避免"同首条提问但提示词体系不同"的两段会话共用绑定。
 //
-// 取不到用户文本（纯图片等）时返回空串：不粘性，退回普通轮换（安全降级）。
+// 抑制条件（P1-anti-monopoly 契约）：body 携带 metadata.user_id 或顶层 user_id 时
+// **恒返回空串**。ExtractKey 有意剔除 user_id 作粘性键（ebd7921：user 维度粒度过粗
+// ——一个 user 的全部并行对话会被钉到同一账号，远粗于上游对话级缓存边界），但内容
+// 派生是**另一条**会给出非空键的路径：若不设闸，只发 user_id 的客户端会借首条
+// prompt 重新获得粘性，使该契约在派生路径失效（上游 10eefa8 修的同款回归）。
+//
+// 取不到可签名内容（纯图片轮已由 contentSignatureAny 签名，见 ids.go；空/null/
+// 未知形态仍为空）时返回空串：不粘性，退回普通轮换（安全降级）。
 func deriveKey(obj map[string]any) string {
+	if hasUserID(obj) {
+		return ""
+	}
 	msgs, ok := obj["messages"].([]any)
 	if !ok || len(msgs) == 0 {
 		return ""
 	}
-	systemText, firstUserText := "", ""
+	systemSig, firstUserSig := "", ""
 	for _, m := range msgs {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			continue
 		}
-		text := messageText(msg["content"])
+		sig := contentSignatureAny(msg["content"])
 		switch strOrEmpty(msg["role"]) {
 		case "system", "developer":
-			if systemText == "" {
-				systemText = text
+			if systemSig == "" {
+				systemSig = sig
 			}
 		case "user":
-			if firstUserText == "" {
-				firstUserText = text
+			if firstUserSig == "" {
+				firstUserSig = sig
 			}
 		}
-		if firstUserText != "" && systemText != "" {
+		if firstUserSig != "" && systemSig != "" {
 			break // 都已拿到：停止遍历长历史
 		}
 	}
-	if firstUserText == "" {
-		return "" // 无用户消息：无从归属会话
+	if firstUserSig == "" {
+		return "" // 无用户消息（或首条 user 无可签名内容）：无从归属会话
 	}
-	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	sum := sha256.Sum256([]byte(systemSig + "\x00" + firstUserSig))
 	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
 }
 
-// messageText 提取消息 content 的文本表示。
-// 兼容：字符串 / [{type:"text",text:"..."}] 数组（OpenAI 多模态）；其他类型取空。
-func messageText(content any) string {
-	switch v := content.(type) {
-	case string:
-		return v
-	case []any:
-		var sb strings.Builder
-		for _, part := range v {
-			if p, ok := part.(map[string]any); ok {
-				sb.WriteString(strOrEmpty(p["text"]))
-			}
+// hasUserID 报告 body 是否携带 user 维度标识（metadata.user_id 或顶层 user_id）。
+// 只判"字段存在且为非空字符串"，与 ExtractKey 的 strOrEmpty 口径一致；非字符串
+// 与空串都不算标识（不抑制派生——与上游 10eefa8 的边界一致）。
+func hasUserID(obj map[string]any) bool {
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if strOrEmpty(meta["user_id"]) != "" {
+			return true
 		}
-		return sb.String()
 	}
-	return ""
+	return strOrEmpty(obj["user_id"]) != ""
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。
