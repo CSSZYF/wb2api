@@ -32,8 +32,9 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
-	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
+	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 DefaultMaxBodyBytes（32MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
+	// 这是**网关侧内存护栏**，不是上游限制（413 文案口径见 bodyTooLargeMsg）。
 	MaxBodyBytes int64
 	// ReadTimeout 入站请求体读取窗口（http.Server.ReadTimeout 的同口径值）；
 	// <=0 兜底 DefaultReadTimeout（300s）。运行期经 SetReadTimeout 热改，
@@ -150,10 +151,13 @@ type Handler struct {
 }
 
 // SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
-// n<=0 与 NewHandler 兜底口径一致：回落 8MB。
+// n<=0 与 NewHandler 兜底口径一致：回落 DefaultMaxBodyBytes（32MB）。
+//
+// 本方法只改运行期原子镜像，与默认值（config 侧 Default()）无关——默认值变更不影响
+// 此处的注入路径，故 v1.9.17 的 8→32 改动不触碰热改语义。
 func (h *Handler) SetMaxBodyBytes(n int64) {
 	if n <= 0 {
-		n = 8 << 20
+		n = DefaultMaxBodyBytes
 	}
 	h.maxBodyBytes.Store(n)
 }
@@ -166,6 +170,14 @@ func (h *Handler) SetMaxRotate(n int) {
 	}
 	h.maxRotate.Store(int64(n))
 }
+
+// DefaultMaxBodyBytes 聊天请求体上限的兜底值（与 config 侧 Default() 同口径，32MB）。
+// 单一来源供 handler 与 cmd 两侧共用，避免"配置默认 32、handler 兜底 8"这类漂移
+// （与 DefaultReadTimeout 同一处理风格）。
+//
+// 这是**网关侧内存护栏**，不是上游限制：上游没有可观测的 body 上限，本值只防
+// "单请求把进程内存吃爆"。32MB 的取舍见 cmd/server/config.go 的 MaxBodyMB 字段注释。
+const DefaultMaxBodyBytes = 32 << 20
 
 // DefaultReadTimeout 入站 body 读取窗口的兜底值（与 config 侧 Default() 同口径）。
 // 单一来源供 handler 与 cmd 两侧共用，避免"配置默认 300、handler 兜底 60"这类漂移。
@@ -258,7 +270,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	if cfg.MaxBodyBytes <= 0 {
-		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
+		cfg.MaxBodyBytes = DefaultMaxBodyBytes // 请求体上限兜底 32MB（与 config 侧 Default() 同口径）
 	}
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = DefaultReadTimeout // 入站读窗口兜底 300s
@@ -658,6 +670,25 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 	return dynamicModelsCache.ids
 }
 
+// bodyTooLargeMsg 413 的客户端文案（独立函数便于测试直接盯住口径，不必构造
+// 超限请求体）。
+//
+// 口径（v1.9.17 修正）：旧文案「请求体超过 N MB 上限」容易被读成**上游**的限制，
+// 用户据此去压图片或以为模型不支持，方向全错。本项自始至终是网关侧的内存护栏
+// ——上游没有可观测的 body 上限，这个值只防"单请求把进程内存吃爆"。故文案明确
+// 三点：①网关侧护栏、非上游限制；②默认 32 MB 且可调（面板即时生效）；③常见
+// 成因（多图会话每轮 base64 重发历史图片）。
+//
+// 注意 "37%%" 的转义：本串是 fmt 格式串，字面百分号必须写成 %%，否则 "%），" 会被
+// 当成动词渲染成 "%!)(MISSING)"（go vet 会报 unknown verb，但 go build 不报——
+// 改文案时务必跑 vet）。
+//
+// 「默认 32 MB」的数值与 handler 侧兜底同源（DefaultMaxBodyBytes），与 config 侧
+// Default() 的一致性由 config_test.go 的漂移断言盯住。
+func bodyTooLargeMsg(limit int64) string {
+	return fmt.Sprintf("请求体超过网关内存护栏 %d MB：这是网关侧上限（防止单请求吃爆进程内存），不是上游限制；默认 32 MB，可在面板「请求体上限」或 server.max_body_mb 调大（保存即时生效）。多图会话易触发：历史图片每轮以 base64 重发（膨胀约 37%%），请压缩图片或调大上限后重试", limit>>20)
+}
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 入站 body 读窗口按**当前**配置值逐请求重设（面板改 server.read_timeout_seconds
 	// 后无需重启即生效；慢链路大上下文不再被启动时的静态值掐断）。必须在读 body 之前。
@@ -668,7 +699,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
 	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
 	// unmarshal 报 unexpected EOF，网关却罚号轮空）。
-	// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。
+	// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。文案口径见 bodyTooLargeMsg。
 	limit := h.maxBodyBytes.Load()
 	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
@@ -676,8 +707,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if int64(len(body)) > limit {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
-			fmt.Sprintf("请求体超过 %d MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（面板修改即时生效）后重试", limit>>20))
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", bodyTooLargeMsg(limit))
 		return
 	}
 	var peek struct {

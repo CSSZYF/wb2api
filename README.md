@@ -373,7 +373,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
-| `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。**面板在线修改即时生效** |
+| `server.max_body_mb` | `32` | **网关侧内存护栏**（MB，0 / 负数启动报错），**不是上游限制**——上游没有可观测的 body 上限，此值只防单请求把进程内存吃爆。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。默认 32 而非更小：多图会话每轮 base64 重发历史图片（膨胀约 37%），8MB 常态误伤。**面板在线修改即时生效** |
 | `server.max_rotate` | `3` | 单请求最多换号次数（0 / 负数回落默认 3）。池内账号多时（如 4-8 个）默认 3 次试不满所有号，可调大让单请求覆盖更多账号；上限大于池内账号数时试遍即止。**面板在线修改即时生效** |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
@@ -464,7 +464,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
-请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。请求体的网关侧截断已由 `server.max_body_mb` 的 413 消灭，剩余的 `11101` 只可能是客户端发来的畸形 JSON。
+请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。请求体的网关侧截断已由 `server.max_body_mb`（默认 32MB）的 413 消灭，剩余的 `11101` 只可能是客户端发来的畸形 JSON。
 
 **熔断器**：所有冷却入口与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
@@ -592,7 +592,7 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 32 MiB（网关内存护栏，可配） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）；每模型带 `supported_efforts`/`default_effort` 实际思考档位（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -770,16 +770,18 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 多图会话请求体超限怎么办？
 
-请求体超过 `server.max_body_mb`（默认 8 MB）时网关直接返回 `413 request_body_too_large`：
+请求体超过 `server.max_body_mb`（默认 32 MB）时网关直接返回 `413 request_body_too_large`：
 
 ```json
-{"error":{"message":"请求体超过 8 MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（面板修改即时生效）后重试","type":"api_error","code":"request_body_too_large"}}
+{"error":{"message":"请求体超过网关内存护栏 32 MB：这是网关侧上限（防止单请求吃爆进程内存），不是上游限制；默认 32 MB，可在面板「请求体上限」或 server.max_body_mb 调大（保存即时生效）。多图会话易触发：历史图片每轮以 base64 重发（膨胀约 37%），请压缩图片或调大上限后重试","type":"api_error","code":"request_body_too_large"}}
 ```
 
-- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身的默认上限
-- 为什么多图容易触发：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体（编码再膨胀约 37%），几张 MB 级截图叠两三轮就会破 8 MB
+- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身的内存护栏（上游没有可观测的 body 上限，此值只防单请求把进程内存吃爆）
+- 为什么多图容易触发：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体（编码再膨胀约 37%），几张 MB 级截图叠两三轮就会破默认值
 - 收到 `413` 即表示是请求体本身超限：面板「配置 → 请求体上限」在线调大**保存后即时生效，无需重启**（issue #17）；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
-- 上游真实上限未实测（8 MB 以上的请求从未穿过网关），建议按需调大（如 16 / 32），若上游回 413 再回调
+- 为什么默认是 32 MB 而不是更大：网关没有入站并发闸门，实测单请求峰值内存约为 body 的 **5 倍**，护栏放得越宽越容易 OOM；同时 32 MB 已远高于常规多图会话（含 base64 膨胀后）的实际占用
+- 为什么不是「交给上游报错就行」：上游对超大 body 不返回可用的 413（表现为连接被掐断 / 上游 unmarshal 报 `unexpected EOF`），而网关此时已经把请求算到账号头上——旧版因此**罚了无辜账号**。预拦截是为了「要么放行要么明确 413」，不让截断的请求喂给上游
+- 上游真实上限未实测（32 MB 以上的请求从未穿过网关），建议按需调大，若上游回 413 再回调
 - 要么放行要么明确 `413`，网关不再把半截请求体喂给上游
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
@@ -824,7 +826,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 断言 | 出处 |
 |---|---|
 | `prompt.mode` 默认 `passthrough` | `cmd/server/config.go` 的 `Default()`（`c.Prompt.Mode = "passthrough"`）|
-| 请求体上限默认 8 MB | `cmd/server/config.go:132`；413 判定与返回 `internal/server/handler.go:246-254` |
+| 请求体上限默认 32 MB（网关内存护栏，非上游限制） | `cmd/server/config.go:295`（`Default()`，取自 `server.DefaultMaxBodyBytes`）；413 判定 `internal/server/handler.go:710`、文案 `internal/server/handler.go:688`（`bodyTooLargeMsg`） |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |

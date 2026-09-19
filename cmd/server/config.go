@@ -25,10 +25,16 @@ type Config struct {
 	StateFile string `json:"state_file"` // ./data/state.json
 
 	Server struct {
-		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 8）。
+		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 32）。
 		// 请求体超过该值直接返回 413 request_body_too_large，不再静默截断后喂给上游
 		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
-		// 0/负数视为非法 → normalize 回落默认并记录。
+		//
+		// 这是**网关侧内存护栏**，不是上游限制：上游本身没有可观测的 body 上限，
+		// 这个值只用来挡住"单请求把进程内存吃爆"。默认 32 而非更小，是因为多图
+		// 会话每轮重发历史图片（base64 再膨胀约 37%），8MB 常态误伤；也不用更大，
+		// 因为无入站并发闸门时实测单请求峰值内存约为 body 的 5 倍。
+		// 0/负数视为非法 → normalize fail fast 报错（刻意不回落默认：0 会被误读成
+		// "不限"，静默回落反而让用户以为配置生效了）。
 		MaxBodyMB int `json:"max_body_mb"`
 
 		// MaxRotate 单请求最多换号次数（默认 3）。
@@ -49,6 +55,10 @@ type Config struct {
 		// 对话被拦腰截断（invalid_request）。300s 下 8MB 只需 27KB/s 上行，跨境链路
 		// 可满足，同时远小于慢速攻击所需的时间尺度（ReadHeaderTimeout=30s 仍是慢速
 		// 头的有效闸门）。
+		//
+		// 与 max_body_mb 默认提到 32MB（v1.9.17）的关系：同窗口下 32MB 需要约
+		// 109KB/s 稳定上行，跨境慢链路未必给得出——慢链路用户应同步调大本项，
+		// 否则大 body 会在传完之前被读窗口掐断（表现为 invalid_request 而非 413）。
 		//
 		// 0/负数回落默认 300（与 max_rotate 同风格）。注意这里**刻意不采用**
 		// http.Server 的「0 = 不限」语义：0 在配置文件里更可能被当成"没填/用默认"，
@@ -277,7 +287,12 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
-	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
+	// 请求体上限默认 32MB：**网关侧内存护栏，非上游限制**（见字段注释）。32 的取舍：
+	// 旧值 8MB 在多图会话下常态误伤（历史图片每轮 base64 重发，膨胀约 37%）；也不宜
+	// 更大——无入站并发闸门时实测单请求峰值内存约为 body 的 5 倍。
+	// 值取自 server.DefaultMaxBodyBytes（handler 侧兜底同一常量），避免"配置默认一个数、
+	// handler 兜底另一个数"的静默漂移（与下面 ReadTimeoutSeconds 同一处理风格）。
+	c.Server.MaxBodyMB = int(server.DefaultMaxBodyBytes >> 20)
 	c.Server.MaxRotate = 3 // 单请求最多换号次数默认 3（与 handler 侧兜底口径一致）
 	// 入站 body 读取窗口默认 300s：8MB/5min 只需 27KB/s 上行，跨境慢链路可满足；
 	// 旧写死值 60s 是生产 503 事故根因（见字段注释）。
@@ -561,8 +576,9 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
-	// max_body_mb 非法（0/负数）直接报错：0 若被静默当成默认 8MB，用户以为"不限"，
+	// max_body_mb 非法（0/负数）直接报错：0 若被静默当成默认 32MB，用户以为"不限"，
 	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
+	// 语义与默认值无关（默认 8 还是 32 都 fail fast），v1.9.17 只动默认值，未动此处。
 	if c.Server.MaxBodyMB <= 0 {
 		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
 	}

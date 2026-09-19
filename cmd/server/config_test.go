@@ -702,33 +702,60 @@ func TestBalanceRefreshDefaults(t *testing.T) {
 	}
 }
 
-// TestMaxBodyDefault 默认 max_body_mb=8。
+// TestMaxBodyDefault 默认 max_body_mb=32（v1.9.17 从 8 提到 32）。
+//
+// 为什么是 32：本项是**网关侧内存护栏**（非上游限制），旧值 8MB 在多图会话下常态
+// 误伤（历史图片每轮 base64 重发，膨胀约 37%）；也不宜更大——无入站并发闸门时
+// 实测单请求峰值内存约为 body 的 5 倍。改这个数须同步 README 与 413 文案口径。
 func TestMaxBodyDefault(t *testing.T) {
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if c.Server.MaxBodyMB != 8 {
-		t.Errorf("max_body_mb=%d want 8", c.Server.MaxBodyMB)
+	if c.Server.MaxBodyMB != 32 {
+		t.Errorf("max_body_mb=%d want 32", c.Server.MaxBodyMB)
+	}
+	// 与 handler 侧兜底同源（Default() 取自 server.DefaultMaxBodyBytes）：两处各写一个
+	// 数字时，"配置默认 32、handler 兜底 8"这类漂移不会有任何测试报错，只会在裸构造
+	// handler 的路径上表现为"配置写着 32，实际按 8 拦截"——与 TestReadTimeoutDefault
+	// 盯 read_timeout 漂移同一形态。
+	if want := int(server.DefaultMaxBodyBytes >> 20); c.Server.MaxBodyMB != want {
+		t.Errorf("config 默认 %d 与 handler.DefaultMaxBodyBytes(%dMB) 漂移",
+			c.Server.MaxBodyMB, want)
+	}
+	if server.DefaultMaxBodyBytes != 32<<20 {
+		t.Errorf("DefaultMaxBodyBytes=%d want 32MB", server.DefaultMaxBodyBytes)
 	}
 }
 
-// TestMaxBodyExplicit 显式设置 max_body_mb。
+// TestMaxBodyExplicit 显式设置 max_body_mb 覆盖默认（含显式 8——证明"默认提到 32"
+// 不是把配置写死成 32：老用户配的 8 仍原样生效，不受默认值变更影响）。
 func TestMaxBodyExplicit(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":16}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Server.MaxBodyMB != 16 {
-		t.Errorf("max_body_mb=%d want 16", c.Server.MaxBodyMB)
+	for _, tc := range []struct {
+		json string
+		want int
+	}{
+		{`{"server":{"max_body_mb":8}}`, 8},   // 反向断言：显式 8 仍生效（可覆盖）
+		{`{"server":{"max_body_mb":16}}`, 16}, // 旧用例
+		{`{"server":{"max_body_mb":32}}`, 32},
+		{`{"server":{"max_body_mb":128}}`, 128},
+	} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(tc.json), 0o600)
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Server.MaxBodyMB != tc.want {
+			t.Errorf("%s → max_body_mb=%d want %d", tc.json, c.Server.MaxBodyMB, tc.want)
+		}
 	}
 }
 
-// TestMaxBodyInvalid 非法值（0/负数）normalize 报错：0 想表达"不限"会被静默当成 8MB，
+// TestMaxBodyInvalid 非法值（0/负数）normalize 报错：0 想表达"不限"会被静默当成默认，
 // 与其误导不如 fail fast 提示显式配大上限。
+// v1.9.17 只动默认值（8→32），**刻意不动**这里的 fail-fast 语义。
 func TestMaxBodyInvalid(t *testing.T) {
 	for _, v := range []string{"0", "-1"} {
 		dir := t.TempDir()
@@ -741,6 +768,30 @@ func TestMaxBodyInvalid(t *testing.T) {
 		if !strings.Contains(err.Error(), "server.max_body_mb") {
 			t.Errorf("error should name config key server.max_body_mb: %v", err)
 		}
+	}
+}
+
+// TestConfigExampleMaxBodyMatchesDefault config.example.json 的 max_body_mb 必须与
+// Default() 一致：示例是用户复制起步的模板，值不同步会让"最全样例"反过来误导
+// （用户以为默认是示例里的数）。风格同 TestMachineIDHeadersInExampleConfig。
+func TestConfigExampleMaxBodyMatchesDefault(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Server map[string]any `json:"server"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("config.example.json 非法 JSON: %v", err)
+	}
+	v, ok := doc.Server["max_body_mb"]
+	if !ok {
+		t.Fatal("config.example.json server 段缺 max_body_mb 键")
+	}
+	want := float64(Default().Server.MaxBodyMB)
+	if got, isNum := v.(float64); !isNum || got != want {
+		t.Errorf("config.example.json 的 max_body_mb = %v，want %v（与 Default() 一致）", v, want)
 	}
 }
 

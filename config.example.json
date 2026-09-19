@@ -4,7 +4,7 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
-    "max_body_mb": 8,
+    "max_body_mb": 32,
     "max_rotate": 3,
     "read_timeout_seconds": 300
   },

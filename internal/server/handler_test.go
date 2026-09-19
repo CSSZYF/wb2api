@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -161,8 +162,16 @@ func TestChatOversizedBodyReturns413(t *testing.T) {
 	if !strings.Contains(body, "request_body_too_large") {
 		t.Errorf("body should carry request_body_too_large: %s", body)
 	}
+	// code 不变（客户端可能依赖它做分支），只改 message 口径。
+	if !strings.Contains(body, `"code":"request_body_too_large"`) {
+		t.Errorf("code 字段必须保持 request_body_too_large 原值: %s", body)
+	}
 	if !strings.Contains(body, "server.max_body_mb") {
 		t.Errorf("413 message should name config key server.max_body_mb: %s", body)
+	}
+	// 口径防回退（详见 TestBodyTooLargeMsgWording）：明确网关护栏、非上游限制。
+	if !strings.Contains(body, "网关") || !strings.Contains(body, "不是上游限制") {
+		t.Errorf("413 文案须明确网关护栏、非上游限制: %s", body)
 	}
 	if calls != 0 {
 		t.Errorf("upstream must not be called on 413, got %d", calls)
@@ -176,8 +185,10 @@ func TestChatOversizedBodyReturns413(t *testing.T) {
 	}
 }
 
-// TestChatOversizedBodyDefaultLimitHeader 未显式设置 MaxBodyBytes 时兜底 8MB：
-// 8MB+1 的请求体必须 413（不再静默截断喂给上游，issue #41 根因）。
+// TestChatOversizedBodyDefaultLimit 未显式设置 MaxBodyBytes 时兜底
+// DefaultMaxBodyBytes（32MB）：32MB+1 的请求体必须 413（不再静默截断喂给上游，
+// issue #41 根因）。8MB+1 在本用例中**必须放行**——这正是 v1.9.17 把默认从 8 提到
+// 32 的行为差异（旧默认下它会 413），也是"默认值真的改了"最直接的证据。
 func TestChatOversizedBodyDefaultLimit(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -185,23 +196,101 @@ func TestChatOversizedBodyDefaultLimit(t *testing.T) {
 		return 200, sseOK, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 MaxBodyBytes → 默认 8MB
+	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 MaxBodyBytes → 默认 32MB
 
-	body := make([]byte, 8<<20+1) // 8MB+1
-	copy(body, `{"model":"glm-5.2","messages":[]}`)
+	// 兜底常量本身：8→32 是 v1.9.17 的口径变更，锁住它不被回退。
+	if DefaultMaxBodyBytes != 32<<20 {
+		t.Errorf("DefaultMaxBodyBytes=%d want 32MB（与 config 侧 Default() 同口径）", DefaultMaxBodyBytes)
+	}
+	// 8MB+1：旧默认（8MB）下必 413，新默认（32MB）下必须放行。
+	// 单请求分配 8MB 而非 32MB，避免与同包其它用例叠加占用测试进程内存。
+	oldDefault := make([]byte, 8<<20+1)
+	copy(oldDefault, `{"model":"glm-5.2","messages":[]}`)
 	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(oldDefault)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (8MB+1 在 32MB 默认下必须放行)", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1", calls)
+	}
+
+	// 32MB+1 必须 413。
+	calls = 0
+	body := make([]byte, DefaultMaxBodyBytes+1)
+	copy(body, `{"model":"glm-5.2","messages":[]}`)
+	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
 	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d want 413 (8MB+1 must be rejected)", rec.Code)
+		t.Fatalf("code=%d want 413 (32MB+1 must be rejected)", rec.Code)
 	}
 	if calls != 0 {
 		t.Errorf("upstream must not be called, got %d", calls)
 	}
 }
 
+// TestBodyTooLargeMsgWording 413 文案口径（v1.9.17 语义修正）：
+// 必须明确是**网关侧内存护栏、非上游限制**，并给出默认值与可调入口。
+//
+// 为什么值得单独立一条测试：旧文案「请求体超过 N MB 上限」被读成上游限制（用户据此
+// 去压图片/以为模型不支持，方向全错）。口径是易回退项——重写文案时顺手改回
+// "上游限制"的表述不会有任何编译/行为错误，只有这条断言能拦住。
+func TestBodyTooLargeMsgWording(t *testing.T) {
+	msg := bodyTooLargeMsg(32 << 20)
+	// ① 网关侧 + 非上游限制（核心口径，防回退）。
+	for _, want := range []string{"网关", "不是上游限制"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("413 文案必须含 %q（明确网关护栏、非上游限制）：%s", want, msg)
+		}
+	}
+	// ② 默认值与可调入口（用户拿到 413 后要知道怎么解）。
+	for _, want := range []string{"默认 32 MB", "server.max_body_mb", "面板"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("413 文案必须含 %q：%s", want, msg)
+		}
+	}
+	// ③ 常见成因（多图 base64 重发）。
+	if !strings.Contains(msg, "base64") {
+		t.Errorf("413 文案应提示多图 base64 重发的成因：%s", msg)
+	}
+	// 限值按实际注入值渲染（不是写死 32——用户调大后文案要跟着变）。
+	if m := bodyTooLargeMsg(8 << 20); !strings.Contains(m, "8 MB") {
+		t.Errorf("文案的限值应跟随实际值渲染（8MB）: %s", m)
+	}
+	// ④ 不得残留 fmt 动词渲染残渣：文案里的字面百分号（"37%"）若漏转义成 "%%"，
+	// Sprintf 会把它当动词渲染出 "%!)(MISSING)" 之类的垃圾。go build 不报错、
+	// go vet 才报（unknown verb），故这里再做一道运行期兜底（本函数上线前踩过一次）。
+	for _, bad := range []string{"%!", "(MISSING)", "EXTRA"} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("413 文案含 fmt 渲染残渣 %q（字面百分号需写成 %%）：%s", bad, msg)
+		}
+	}
+	if !strings.Contains(msg, "37%") {
+		t.Errorf("413 文案应保留「膨胀约 37%%」的原始百分号：%s", msg)
+	}
+}
+
+// TestBodyTooLargeMsgMatchesREADME README 的 FAQ 示例 JSON 必须与代码实际输出一致。
+//
+// README 里贴的是「用户会照抄去排查」的样本：示例 message 与真实 413 不一致时，
+// 用户拿样本去 grep/对比会以为收到的是别的错误（且这类漂移不会有任何编译错误）。
+// 断言方式：README 的示例行必须包含本进程渲染出的完整 message。
+func TestBodyTooLargeMsgMatchesREADME(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme := string(raw)
+	msg := bodyTooLargeMsg(DefaultMaxBodyBytes) // 默认上限下的真实文案
+	if !strings.Contains(readme, msg) {
+		t.Errorf("README 的 413 示例与代码实际输出不一致。\n代码输出：%s\n（README 中未找到该串；"+
+			"FAQ 示例 JSON 需原样同步 bodyTooLargeMsg 的输出）", msg)
+	}
+}
+
 // TestSetMaxBodyBytesHotApply 面板在线改 server.max_body_mb 必须即时生效（issue #17：
 // 改了配置却静默不生效，用户仍被旧上限 413）。同一请求体：调小后 413、调大后放行，
-// 全程不重建 handler。另覆盖 setter 的 <=0 兜底（回落 8MB）。
+// 全程不重建 handler。另覆盖 setter 的 <=0 兜底（回落 DefaultMaxBodyBytes）。
 func TestSetMaxBodyBytesHotApply(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -230,13 +319,14 @@ func TestSetMaxBodyBytesHotApply(t *testing.T) {
 		t.Errorf("upstream calls = %d, want 1（放行后应恰好打一次）", calls)
 	}
 
-	// <=0 兜底回落 8MB：8MB+1 仍拒，8MB-1 放行。
+	// <=0 兜底回落 DefaultMaxBodyBytes（32MB）：32MB+1 仍拒。
+	// 热改路径与默认值无关（本项是运行期注入），但兜底口径必须与 NewHandler 同源。
 	h.SetMaxBodyBytes(0)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		bytes.NewReader(append(body, make([]byte, 8<<20)...))))
+		bytes.NewReader(append(body, make([]byte, DefaultMaxBodyBytes)...))))
 	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d want 413 (fallback 8MB, body > 8MB)", rec.Code)
+		t.Fatalf("code=%d want 413 (fallback 32MB, body > 32MB)", rec.Code)
 	}
 }
 
