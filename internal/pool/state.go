@@ -58,22 +58,75 @@ func (p *Pool) ClearSessionDead(uid string) {
 // 账号回到池子（若无其他冷却/熔断则立即可选，健康检查自然接管）。
 // **不改** Disabled 在选号/状态端点的既有语义：disabled 号依然不参与选号，
 // 直到被本方法复活。不存在的 uid 为空操作。
-func (p *Pool) ReviveDisabled(uid string) {
+//
+// 注意：**不动** manualDisabled——永久禁用（系统判定）与临时停用（运维意图）是独立的
+// 两位，本方法只解系统判定；运维意图要由 ClearManualDisabled 单独解除。否则一次
+// revive 会把运维明确摘除的号悄悄放回选号池。
+// 返回 true 表示本次确实清除了自动禁用位。
+func (p *Pool) ReviveDisabled(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok && e.disabled {
-		e.disabled = false
-		e.reason = ""
-		e.sessionDeadFails = 0
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok || !e.disabled {
+		return false
 	}
+	e.disabled = false
+	e.reason = ""
+	e.sessionDeadFails = 0
+	p.dirty.Store(true)
+	return true
+}
+
+// SetManualDisabled 运维临时停用/恢复（上游 a20d06f / issue #138/#118）：置位时只摘除
+// 选号流量，账号仍在池里——签到、token 保活、排程任务照常执行，凭证与积分是活的。
+//
+// 与永久禁用（Disable）互相独立：本方法不清 disabled，也不清冷却/熔断/连败降权维度；
+// 恢复时同理只清 manualDisabled。两位都清空后账号自然回到选号池。
+// 幂等：重复置位/清除不报错，重复操作只更新原因文案（面板重试友好）。
+// 返回 (found, changed)：uid 不存在 → (false,false)；状态无变化 → (true,false)。
+func (p *Pool) SetManualDisabled(uid string, disabled bool, reason string) (found, changed bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false, false
+	}
+	if e.manualDisabled == disabled && (!disabled || e.manualReason == reason) {
+		return true, false
+	}
+	p.setManualDisabledLocked(e, disabled, reason)
+	return true, true
+}
+
+// ClearManualDisabled 解除临时停用（面板「恢复」按钮入口）。等价于
+// SetManualDisabled(uid, false, "")，单独命名是为了让调用点语义自明
+// （恢复运维意图 vs 复活系统判定是两件不同的事）。
+func (p *Pool) ClearManualDisabled(uid string) (found, changed bool) {
+	return p.SetManualDisabled(uid, false, "")
+}
+
+// ManualDisabledState 读单个账号的临时停用态（供端点回显）。uid 不存在时 ok=false。
+func (p *Pool) ManualDisabledState(uid string) (disabled bool, reason string, ok bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, found := p.byUID[uid]
+	if !found {
+		return false, "", false
+	}
+	return e.manualDisabled, e.manualReason, true
 }
 
 // Revive 运维口径的"无条件恢复"：清禁用、冷却（含软退避计数）、熔断运行态与
 // 连败降权（consecutiveFails/degradeUntil）。
 // 与 ReviveDisabled（只清禁用）和 ReenableIfCredits（只清冷却、不动熔断）的区别：
-// 本方法清除全部惩罚状态，供管理面板"解冻"按钮使用——人工判断该号可用时一键恢复。
+// 本方法清除全部**惩罚**状态，供管理面板"解冻"按钮使用——人工判断该号可用时一键恢复。
 // uid 不存在返回 false（供调用方区分"账号不存在"与"已复活"）。
+//
+// **不清** manualDisabled（临时停用）：惩罚态是系统判定（坏号该修），临时停用是运维
+// 意图（我想让它歇着）——解冻一个"坏了"的号不等于取消"我主动摘掉它"的决定。两者语义
+// 正交、各自解除（与上游 a20d06f 的 enable/revive 分工一致）：要让它回池，先解冻
+// （本方法）再恢复（ClearManualDisabled），或直接用面板「恢复」按钮。
+// 这一条同样保护 login.go 的「重新登录即复活」路径——换凭证不构成取消停用的理由。
 func (p *Pool) Revive(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -356,7 +409,11 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 		}
 		total++
 		switch {
-		case e.disabled:
+		// 临时停用与永久禁用同归 disabled 计数：对「多少号不参与选号」这个运维问题
+		// 二者等价，分开会让 total/healthy/cooling/disabled 不闭合。
+		// 具体是哪一种看 /status 账号级的 manual_disabled/disabled 两位（面板据此区分
+		// 「临时停用」与「已禁用」标签）。
+		case e.disabled || e.manualDisabled:
 			disabled++
 		case !e.healthy(now):
 			cooling++
@@ -438,6 +495,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
 		Reason:           reason,
 		Disabled:         e.disabled,
+		ManualDisabled:   e.manualDisabled,
 		SuccessCount:     e.successCount,
 		ErrTotal:         e.errTotal,
 		TokenUsage:       e.tokenUsage,
@@ -454,6 +512,11 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		st.DisabledReason = e.reason
+	}
+	if st.ManualDisabled {
+		// 临时停用原因。与 DisabledReason 分开两个字段：叠加态下运维要能同时看到
+		//「我为什么摘它」和「系统为什么判它坏」，合并成一个字段会互相覆盖。
+		st.ManualReason = e.manualReason
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。口径与 Cooling 判定一致：

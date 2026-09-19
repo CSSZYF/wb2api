@@ -345,7 +345,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 # 模型列表
 curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
 
-# 账号状态（汇总 + 每账号详情，disabled 账号透出 disabled_reason）
+# 账号状态（汇总 + 每账号详情，含 disabled / manual_disabled 两位及各自原因）
 curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
 
 # 流式聊天
@@ -564,7 +564,7 @@ http://127.0.0.1:7863/panel/
 
 | 视图 | 功能 |
 |---|---|
-| **账号池** | 统计条（总数/可用/冷却/禁用/可用积分合计/粘性会话）+ 账号表：状态标签（可用/限流冷却/积分冷却/熔断/已禁用）、积分量条、成功失败计数、在途、单号操作（签到/余额/任务/**测试**/解冻/禁用/移除）；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」 |
+| **账号池** | 统计条（总数/可用/冷却/不可选（禁用+停用）/可用积分合计/粘性会话）+ 账号表：状态标签（可用/限流冷却/积分冷却/熔断/**已禁用**/**临时停用**）、积分量条、成功失败计数、在途、单号操作（签到/余额/任务/**测试**/**解冻**/**禁用**/**停用**/**恢复**/移除）；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」 |
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
@@ -727,6 +727,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 - 多账号复制 `auths/workbuddy-<uid>.json` 即可，池启动时自动对齐目录
 - Session 失效账号被禁用（`disabled_reason` 透出在 `/status`）后，可用 `./login.sh` 重新登录覆盖凭证；已持久化 `disabled=true` 的账号可在源码侧调用 `Pool.ReviveDisabled(uid)` 复活（`state.json` 中清除 `disabled` 标志）
+- **临时停用 / 恢复**（面板行内「停用」「恢复」按钮，`POST /panel/api/accounts/{uid}/{suspend,resume}`）：把某个号临时摘出选号池观察，不必删凭证。语义是「**对话流量摘除**」而非「账号冻结」——停用期间签到 / token 保活 / 排程任务照常执行，冷却与熔断状态继续按各自规律演进（恢复后拿到的是这段时间真实发生过的状态，不是被清空的一刀切）。与系统自动禁用是**两个独立状态位**（`manual_disabled` / `disabled`，`/status` 各自透出 `manual_reason` / `disabled_reason`），各自解除、都清空才回到选号池：点「解冻」只清惩罚态（禁用/冷却/熔断/降权），点「恢复」只清运维停用位；叠加态下两个按钮都要点。停用状态随池状态落盘，重启保留。详见[账号临时停用](#账号临时停用与永久禁用) 
 - 备份 = `auths/`（凭证）+ `data/state.json`（池状态：积分 / 冷却 / 计数）；配置 Upstash 后状态另镜像至 Redis（7 天 TTL）
 
 ## 安全与合规
@@ -809,7 +810,25 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 ### 账号被 Disable 后如何恢复？
 
 - **用 `./login.sh` 重新登录**覆盖凭证，重启后自动回池；
-- 或源码侧调用 `Pool.ReviveDisabled(uid)` 清除 `disabled` 状态（`state.json` 同步刷新）。
+- 或源码侧调用 `Pool.ReviveDisabled(uid)` 清除 `disabled` 状态（`state.json` 同步刷新）；
+- 或面板行内点「**解冻**」（`POST /panel/api/accounts/{uid}/revive`）：清禁用 + 冷却 + 熔断 + 降权（运维口径无条件恢复）。注意它**不**解除「临时停用」——见下节。
+
+### 账号临时停用与永久禁用
+
+两套语义、两个独立状态位，面板上分开呈现（`已禁用` / `临时停用`），**可叠加**：
+
+| | 临时停用 `manual_disabled` | 永久禁用 `disabled` |
+|---|---|---|
+| 谁触发的 | **运维主动**（面板「停用」按钮） | **系统判定**（连续 3 次 12153、上游 11140 封号、refresh session dead） |
+| 语义 | 对话流量摘除——账号仍在池里，凭证与积分都是活的 | 账号视为坏号，退出选号 |
+| 签到 / token 保活 / 排程 | **照常执行**（`scheduler` 只跳过 `disabled`） | 跳过 |
+| 惩罚维度（冷却 / 熔断 / 降权） | **原样保留**，停用期间继续按各自规律演进 | `disableLocked` 清冷却域（熔断与降权保留） |
+| 怎么解除 | 面板「**恢复**」→ `POST .../resume` → `Pool.ClearManualDisabled` | 面板「**解冻**」→ `POST .../revive` → `Pool.Revive`；或重新登录（`login.go` 走 `Revive`） |
+| 会被自动路径解除吗 | **不会**——重新登录 / 签到解冻 / 任意成功都不清运维意图 | 会——重新登录、`ReviveDisabled` 等路径可清 |
+
+**为什么必须是两个位**：我们的 `disabled` 会被自动路径撤销（重新登录即 `Revive`、`NoteSuccess` 清惩罚态）。运维意图若寄居在同一字段上，会被这些路径无声解除——「我主动摘的号」与「系统判它坏了」是两件不同的事，恢复动作也不同。两位各自独立清除，**都清空才回到选号池**（叠加态下先点「解冻」再点「恢复」）。
+
+实现要点（`internal/pool/`）：迁移原语 `setManualDisabledLocked`（transition.go）只置位、不碰任何惩罚维度；四条旁路谓词 `healthy` / `healthyForModel` / `modelExempt` / `pickEarliestExpiryLocked` 以及冷却探活目标选择全部排除停用号；`/status` 的汇总 `disabled` 计数把两者同归一类（保证 total/healthy/cooling/disabled 闭合），账号级用两位区分。
 
 ### 系统提示词被内容策略误杀怎么办？
 
@@ -837,6 +856,9 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |
 | `ReviveDisabled` 人工复活 | `internal/pool/pool.go:951` |
 | disabled 账号透出 `disabled_reason` | `internal/pool/pool.go:1162-1165` |
+| 临时停用与永久禁用是两个独立状态位 | `internal/pool/entry.go`（`manualDisabled`）；迁移原语 `internal/pool/transition.go`（`setManualDisabledLocked`） |
+| 临时停用号仍参与签到 / 保活（只摘对话流量） | `internal/scheduler/scheduler.go:412/469/536/570`（判据只看 `st.Disabled`）；回归锚 `TestCheckinAndKeepaliveIncludeManualDisabled` |
+| 四条旁路谓词均排除临时停用号 | `internal/pool/entry.go`（`healthy`/`healthyForModel`/`modelExempt`）、`internal/pool/pick.go`（`pickEarliestExpiryLocked`）、`internal/pool/probe.go`（探活目标选择） |
 | 硬冷却至次日 04:00 | `internal/pool/pool.go:882`（`CooldownUntilTomorrow4AM`） |
 | 软冷却退避封顶 2h | `internal/pool/pool.go:247`（`defaultSoftRateMax`） |
 | Top-5 候选短名单 | `internal/pool/pool.go:584` |

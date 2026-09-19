@@ -1,14 +1,16 @@
 // 账号状态机迁移的唯一权威实现。
 //
-// entry 的「可选择性」由五个正交维度决定：禁用(disabled)、账号级冷却(until/coolKind)、
-// 模型级冷却(modelCooldowns)、熔断(breakerUntil)、连败降权(degradeUntil)。
-// 维度之间以「迁移原语」收拢，禁止在其他文件散写这些字段——所有入口（applyErrorPolicy / refresh / keepalive /
-// 签到 / 选号）对状态的改动都必须经本文件的原语或经 Cooldown/NoteError/NoteSuccess 等
-// 封装（它们在持锁下调用本文件原语）。
+// entry 的「可选择性」由六个正交维度决定：禁用(disabled)、临时停用(manualDisabled)、
+// 账号级冷却(until/coolKind)、模型级冷却(modelCooldowns)、熔断(breakerUntil)、
+// 连败降权(degradeUntil)。维度之间以「迁移原语」收拢，禁止在其他文件散写这些字段——
+// 所有入口（applyErrorPolicy / refresh / keepalive / 签到 / 选号 / 面板运维）对状态的
+// 改动都必须经本文件的原语或经 Cooldown/NoteError/NoteSuccess 等封装（它们在持锁下
+// 调用本文件原语）。
 //
 // 迁移矩阵（事件 → 动作 → 字段）：
 //
 //	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
+//	manualDisabled     ← setManualDisabledLocked（面板运维端点；只置位不清其他维度）
 //	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked（整域）清，
 //	                     单模型提前解冻走 clearModelCooldownLocked（ClearModelCooldown）
@@ -26,6 +28,11 @@
 //     （ErrClient/传输层这类「不罚号」失败），不读不写 fails/softStreak/until；
 //     clearCoolingLocked 不清它（禁用/余额解冻都不构成「连败根因已消失」的证据），
 //     只有 NoteSuccess（成功即回池）与 Revive（人工无条件恢复）清。
+//   - 临时停用（manualDisabled）与永久禁用（disabled）各自独立：前者是**运维意图**
+//     （只能由面板运维入口清除），后者是**系统判定**（可被重新登录/成功路径撤销）。
+//     二者都不清对方，并存时 /status 分别透出（见 entry.go Status.manual_disabled /
+//     disabled 注释）。禁用/停用都不碰冷却与熔断维度——解除后拿到的是这段时间里
+//     真实发生过的状态，而不是被清空的一刀切。
 //   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked、Revive 与
 //     reviveCoolingLocked（余额恢复解冻，issue #199 收窄后仅硬冷却）共用，
 //     对冷却域的处置因此永远一致。
@@ -129,10 +136,37 @@ func (p *Pool) ClearModelCooldown(uid, model string) bool {
 // 连败降权（consecutiveFails/degradeUntil）同样保留：它是「ErrClient/传输层连败」
 // 信号，与授权/会话无关；禁用期间计数继续累计（keepalive 跳过 disabled 号，
 // 实际几乎不会增长），复活后若根因未消失应立即按既有进度继续判罚，而不是重新学。
+// 临时停用位（manualDisabled）也不动：本原语表达的是**系统判定**，运维意图不属于
+// 它的清理域——那要由面板运维入口显式解除。
 func (p *Pool) disableLocked(e *entry, reason string) {
 	e.clearCoolingLocked()
 	e.disabled = true
 	e.reason = reason
+	p.dirty.Store(true)
+}
+
+// setManualDisabledLocked 临时停用迁移（面板运维入口）：只置 manualDisabled + 原因，
+// **不清冷却域、不动熔断器、不动连败降权、不碰 disabled**。
+//
+// 与 disableLocked（永久禁用）的关键差异——临时停用是「**对话流量摘除**」而非
+// 「账号冻结」：签到、token 保活、排程任务照常执行（scheduler 只判 Status.Disabled，
+// 见 internal/scheduler/scheduler.go:412/469/536/570），账号凭证与积分状态都是活的。
+// 因此刻意不碰 until/coolKind/modelCooldowns/breakerUntil/degradeUntil：停用期间这些
+// 维度继续按各自规律演进（冷却自然到期、熔断计数继续累计），恢复时拿到的是「停用期间
+// 真实发生过什么」的完整状态，而不是被清空的一刀切。
+//
+// 为什么用独立状态位而非复用 disabled：我们的 disabled 会被自动路径撤销（重新登录
+// 走 Revive，见 internal/panel/login.go:242；任意成功走 NoteSuccess 清惩罚态），
+// 运维意图若复用同一字段会被这些路径意外解除——这正是上游引入独立位的理由。
+// 两位独立、各自清除，都清空才回到选号池。
+// 调用方必须已持有 p.mu。
+func (p *Pool) setManualDisabledLocked(e *entry, disabled bool, reason string) {
+	e.manualDisabled = disabled
+	if disabled {
+		e.manualReason = reason
+	} else {
+		e.manualReason = ""
+	}
 	p.dirty.Store(true)
 }
 

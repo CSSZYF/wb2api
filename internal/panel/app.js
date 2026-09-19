@@ -195,9 +195,19 @@ function renderAccounts(list) {
   tb.innerHTML = list.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0);
+    // 两种「不可选」要分开呈现（上游 a20d06f 的语义分离）：
+    //   disabled        = 系统判定的坏号（永久禁用）→ 需「解冻」清惩罚态
+    //   manual_disabled = 运维主动摘除（临时停用）→ 需「恢复」清运维意图
+    // 两者独立、可叠加，叠加时都要显示（都清空才回选号池）。
+    const broken = !!s.disabled;
+    const suspended = !!s.manual_disabled;
     let cls = '', tag;
-    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
-    else if (cool > 0) {
+    if (broken || suspended) {
+      // 色条：永久禁用红（坏号）优先于临时停用黄（只是摘了）——一眼区分严重度。
+      cls = broken ? 'off' : 'susp';
+      tag = (broken ? '<span class="tag bad">已禁用</span>' : '') +
+            (suspended ? '<span class="tag warn" title="临时停用：签到/保活/任务照常，随时可恢复">临时停用</span>' : '');
+    } else if (cool > 0) {
       cls = 'cool';
       // 三态优先序：熔断（最远截止是 breaker_until）→ 连败降权（cool_kind=degrade，
       // 后端在无生效冷却时下发的合成 kind）→ 硬冷却/软冷却。
@@ -206,14 +216,20 @@ function renderAccounts(list) {
         : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却');
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
-    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    // 备注两行分开：惩罚原因（reason）与临时停用原因（manual_reason）是两件事，
+    // 叠加态下都要看得见（合并成一个字段会互相覆盖）。
+    const noteLines = [];
+    if (s.reason) noteLines.push(esc(s.reason));
+    if (s.manual_reason) noteLines.push('停用：' + esc(s.manual_reason));
+    const note = noteLines.length ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + noteLines.join('<br>') + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
       ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
       : Math.round((s.credits || 0) / maxCred * 100);
     const credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
-    const frozen = s.disabled || cool > 0;
+    // 「解冻」只针对惩罚态（禁用/冷却/熔断/降权）；临时停用不属惩罚态，用「恢复」。
+    const frozen = broken || cool > 0;
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -240,8 +256,12 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
         '<button class="xs ghost" data-a="testchat" data-u="' + esc(s.uid) + '" title="用该账号发一条消息，验证模型可用性">测试</button>' +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
+        // 「解冻」= 清惩罚态（禁用/冷却/熔断/降权），「恢复」= 解除临时停用。两套独立：
+        // 按钮文案与 tooltip 必须说清差异，否则运维分不清该点哪个。
+        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '" title="清除禁用/冷却/熔断/降权等全部惩罚状态（不解除「临时停用」）">解冻</button>'
+                : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '" title="永久禁用：视为坏号退出选号，需「解冻」才能恢复（会清冷却/熔断）">禁用</button>') +
+        (suspended ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '" title="解除临时停用，回到选号池（若仍被禁用需再「解冻」）">恢复</button>'
+                   : '<button class="xs ghost" data-a="suspend" data-u="' + esc(s.uid) + '" title="临时停用：只摘除对话流量，签到/保活/任务照常；随时可「恢复」，不动冷却/熔断状态">停用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
@@ -280,7 +300,8 @@ $('accBody').addEventListener('click', async ev => {
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
-  if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
+  if (a === 'disable' && !confirm('永久禁用：该账号不再参与选号，且会清除其冷却/熔断状态，需点「解冻」才能恢复。\n若只是想临时摘出选号池（保留冷却/熔断观测、签到保活照常），请改用「停用」。确认禁用？')) return;
+  if (a === 'suspend' && !confirm('临时停用：该账号不再参与选号，但仍在池里——签到/保活/任务照常执行，冷却与熔断状态保留，随时可点「恢复」放回。确认停用？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -290,11 +311,18 @@ $('accBody').addEventListener('click', async ev => {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
     } else if (a === 'revive') {
-      await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
-      toast('已解冻', 'ok');
+      const r = await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
+      // 解冻只清惩罚态，不动临时停用位——仍是临时停用时必须说清「为什么还不能用」。
+      toast(r && r.manual_disabled ? '已解冻（仍处临时停用，需再点「恢复」才回选号池）' : '已解冻', 'ok');
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
+    } else if (a === 'suspend') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/suspend', { method: 'POST' });
+      toast('已临时停用（签到/保活/任务照常' + (r && r.disabled ? '；该号同时被永久禁用，恢复后需再解冻' : '') + '）', 'ok');
+    } else if (a === 'resume') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
+      toast(r && r.disabled ? '已解除临时停用（仍被永久禁用，需点「解冻」才回选号池）' : '已恢复', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'testchat') {

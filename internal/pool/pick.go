@@ -218,8 +218,9 @@ func (p *Pool) pickHealthyLocked(tried map[string]bool, now time.Time, reqModel,
 	return e.a
 }
 
-// pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
-// 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
+// pickEarliestExpiryLocked 全冷却兜底：在非禁用/非临时停用的软冷却/熔断账号中选截止最早的一个。
+// 分级：disabled 与 manualDisabled 永不参与（前者系统判死、后者运维摘除，都不该被兜底放行）；
+// CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
@@ -231,8 +232,8 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if realm != "" && e.a.Realm() != realm {
 			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
 		}
-		if e.disabled {
-			continue // 禁用的账号永不参与兜底
+		if e.disabled || e.manualDisabled {
+			continue // 禁用/临时停用的账号永不参与兜底
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
