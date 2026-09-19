@@ -518,6 +518,7 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   zerowidth_sanitize: ['features', 'zerowidth_sanitize'],
+  reasoning_history: ['features', 'reasoning_history'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
 };
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1790,5 +1792,152 @@ func TestConfigExampleHasCooldownProbeKeys(t *testing.T) {
 	if !c.Schedule.CooldownProbeEnabled || c.Schedule.CooldownProbeMinutes != 10 {
 		t.Errorf("example 的 cooldown_probe 口径=%v/%d want true/10",
 			c.Schedule.CooldownProbeEnabled, c.Schedule.CooldownProbeMinutes)
+	}
+}
+
+// TestReasoningHistoryConfig features.reasoning_history 三档解析：默认 full（零回归）、
+// 合法值大小写/空白归一、非法值（空串/未知）回落 full 并记 warn（fail-safe，不 fail fast）。
+func TestReasoningHistoryConfig(t *testing.T) {
+	// 默认（Default() 与「JSON 缺键」两条路径都必须落 full）。
+	if c := Default(); c.Features.ReasoningHistory != "full" {
+		t.Errorf("Default() 档位 = %q want full", c.Features.ReasoningHistory)
+	}
+	c, err := ParseConfig([]byte(`{"listen":":7863"}`))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if c.Features.ReasoningHistory != "full" {
+		t.Errorf("键缺席时档位 = %q want full", c.Features.ReasoningHistory)
+	}
+
+	// 合法档位：原样 / 大小写与首尾空白归一。
+	for _, tc := range []struct{ in, want string }{
+		{"full", "full"},
+		{"last", "last"},
+		{"blank", "blank"},
+		{" LAST ", "last"},
+		{"Blank", "blank"},
+		{"FULL", "full"},
+	} {
+		c, err := ParseConfig([]byte(`{"features":{"reasoning_history":` + jsonQuoteLiteral(tc.in) + `}}`))
+		if err != nil {
+			t.Fatalf("ParseConfig(%q): %v", tc.in, err)
+		}
+		if c.Features.ReasoningHistory != tc.want {
+			t.Errorf("reasoning_history=%q 归一化后 = %q want %q", tc.in, c.Features.ReasoningHistory, tc.want)
+		}
+	}
+
+	// 非法档位：回落 full 且必须有一条 warn（用户能从日志看出配置没生效）。
+	for _, in := range []string{"", "bogus", "off", "none", "true"} {
+		var buf bytes.Buffer
+		old := log.Writer()
+		log.SetOutput(&buf)
+		c, err := ParseConfig([]byte(`{"features":{"reasoning_history":` + jsonQuoteLiteral(in) + `}}`))
+		log.SetOutput(old)
+		if err != nil {
+			t.Fatalf("非法档位 %q 不该报错（fail-safe）：%v", in, err)
+		}
+		if c.Features.ReasoningHistory != "full" {
+			t.Errorf("非法档位 %q 应回落 full，实际 %q", in, c.Features.ReasoningHistory)
+		}
+		if !strings.Contains(buf.String(), "reasoning_history") {
+			t.Errorf("非法档位 %q 应记一条含 reasoning_history 的 warn，实际日志 %q", in, buf.String())
+		}
+	}
+
+	// env 覆盖与 JSON 同口径（非法值同样回落 full）。
+	t.Setenv("WB2A_REASONING_HISTORY", "blank")
+	c = Default()
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.ReasoningHistory != "blank" {
+		t.Errorf("WB2A_REASONING_HISTORY=blank 后 = %q want blank", c.Features.ReasoningHistory)
+	}
+	t.Setenv("WB2A_REASONING_HISTORY", "nope")
+	c = Default()
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.ReasoningHistory != "full" {
+		t.Errorf("env 非法值应回落 full，实际 %q", c.Features.ReasoningHistory)
+	}
+}
+
+// TestReasoningHistoryInGeneratedConfig WriteDefault 生成的配置必须显式含该键且为
+// "full"（模板缺键时用户不知道有这个开关存在），且缺省加载即 full。
+func TestReasoningHistoryInGeneratedConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if _, err := WriteDefault(path); err != nil {
+		t.Fatalf("WriteDefault: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gen struct {
+		Features map[string]any `json:"features"`
+	}
+	if err := json.Unmarshal(raw, &gen); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := gen.Features["reasoning_history"]
+	if !ok {
+		t.Errorf("生成的配置缺少 features.reasoning_history 键：%v", gen.Features)
+	} else if v != "full" {
+		t.Errorf("reasoning_history 默认应为 full，实际 %v", v)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.ReasoningHistory != "full" {
+		t.Errorf("缺省加载档位 = %q want full", c.Features.ReasoningHistory)
+	}
+}
+
+// TestReasoningHistoryHotApplied 面板「需重启」清单：档位是热改项（SetReasoningHistory
+// 原子生效），不得出现在清单里误导用户。
+func TestReasoningHistoryHotApplied(t *testing.T) {
+	c := Default()
+	c.Features.ReasoningHistory = "blank"
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "reasoning_history") {
+			t.Errorf("restartRequiredFields 含 %q：档位是热改项，不该提示重启", f)
+		}
+	}
+}
+
+// jsonQuoteLiteral 把字符串转成可嵌进 JSON 的引号字面量（测试内构造 body 用）。
+func jsonQuoteLiteral(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// TestConfigExampleHasReasoningHistoryKey config.example.json 必须带上新键
+// （且能被启动路径原样解析）——模板缺键时用户不知道有这个开关存在。
+func TestConfigExampleHasReasoningHistoryKey(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 无法解析: %v", err)
+	}
+	if c.Features.ReasoningHistory != "full" {
+		t.Errorf("example 的 reasoning_history = %q want full（默认档）", c.Features.ReasoningHistory)
+	}
+	var gen struct {
+		Features map[string]any `json:"features"`
+	}
+	if err := json.Unmarshal(raw, &gen); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gen.Features["reasoning_history"]; !ok {
+		t.Errorf("config.example.json 缺 features.reasoning_history 键：%v", gen.Features)
 	}
 }

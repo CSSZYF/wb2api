@@ -161,11 +161,12 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
-	// 脱敏两开关经 Client 的 atomic setter 写入（面板保存配置会在请求期并发热改，
-	// 裸字段赋值是数据竞争）。此处为启动装配期，与请求路径无并发，但走同一 API
-	// 保持唯一写入口。
+	// 脱敏两开关 + 历史推理裁剪档位经 Client 的 atomic setter 写入（面板保存配置会在
+	// 请求期并发热改，裸字段赋值是数据竞争）。此处为启动装配期，与请求路径无并发，
+	// 但走同一 API 保持唯一写入口。
 	up.SetSanitizeFingerprints(cfg.Features.SanitizeBlacklistFingerprints)
 	up.SetZeroWidthSanitize(cfg.Features.ZeroWidthSanitize)
+	up.SetReasoningHistory(cfg.Features.ReasoningHistory)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -586,6 +587,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 数据竞争（-race 实证）。zeroWidth 面板勾选后即时生效，无需重启。
 	up.SetSanitizeFingerprints(newCfg.Features.SanitizeBlacklistFingerprints)
 	up.SetZeroWidthSanitize(newCfg.Features.ZeroWidthSanitize)
+	// 历史推理裁剪档位同为热改项（features.reasoning_history）：下一次出站请求即按新档
+	// 组装 body，无需重启；已发出的请求不受影响（不追溯改写在途 body）。
+	up.SetReasoningHistory(newCfg.Features.ReasoningHistory)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal) // global 域在途分档（面板改完即时生效）

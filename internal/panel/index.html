@@ -863,6 +863,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">需重启</span></label>
             </div>
             <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">历史推理文本裁剪</span>
+                <select name="reasoning_history">
+                  <option value="full">full — 保留全部推理原文（默认）</option>
+                  <option value="last">last — 只留最后一条推理原文，其余置空</option>
+                  <option value="blank">blank — 全部置空（省 token 最多）</option>
+                </select>
+                <span class="hint">只裁剪出站历史里的 assistant 推理文本（上游仅对带 tool_calls 的 assistant 消息计推理 token：实测 4 万字符≈9000 token，置空后≈0）。即时生效；选 last/blank 后模型看不到历史思考过程（当前轮的思考不受影响）</span></label>
+            </div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints">
               <span class="hint">改写/删除已知模板句（默认开）</span></div>
