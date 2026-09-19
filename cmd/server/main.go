@@ -10,10 +10,13 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -375,15 +378,137 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
+	// 启动握手：先 bind、成功后才宣告 listening（见 startupListen 注释）。
+	// bind 失败时 startupListen 已打印可读诊断（含端口占用排查建议），这里直接退出。
+	ln, err := startupListen(cfg)
+	if err != nil {
+		os.Exit(1)
+	}
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("http: %v", err)
+	}
+	log.Printf("bye")
+}
+
+// startupListen 启动握手：先 bind（net.Listen），**成功后才**打 "listening on ..." 日志，
+// 返回可直接交给 srv.Serve 的 listener；bind 失败时打印可读诊断并返回该错误。
+//
+// 为什么先 bind 后打日志：旧实现先打 "listening on ..." 再 ListenAndServe，端口被占时
+// 日志自相矛盾——先宣称「正在监听」、紧接着 Fatal 退出，且错误只有裸 Go 错误串
+// （Windows 上是 "listen tcp :7863: bind: Only one usage of each socket address
+// (protocol/network address/port) is normally permitted."），既没有「端口被占用」这个
+// 结论，也没有下一步该敲什么命令；脚本侧（start-wb2api.cmd 的 2 秒存活自检）只能笼统
+// 提示「端口已被占用 / 配置非法 / 目录不可写」三种可能，用户仍需自己猜。
+//
+// 与 srv.ListenAndServe() 的等价性：标准库 ListenAndServe 本身就是
+// net.Listen("tcp", s.Addr) + s.Serve(ln) 两步（见 net/http/server.go），这里只是把它们
+// 拆开，让「bind 成功」与「宣告 listening」的先后可控。Serve 的错误语义与旧路径逐字一致
+// ——正常关闭（含 srv.Shutdown 触发的优雅停机）同样返回 http.ErrServerClosed，故 main 里
+// `err != http.ErrServerClosed` 的判断与优雅停机路径均不需改动。
+func startupListen(cfg *Config) (net.Listener, error) {
+	addr := listenAddr(cfg.Listen)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		for _, line := range bindFailLines(addr, err) {
+			log.Print(line)
+		}
+		return nil, err
+	}
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	// 入站读窗口透出：慢链路上传大上下文被掐断时，这一行是排查起点
 	// （server.read_timeout_seconds，面板可热改）。
 	log.Printf("[server] 入站请求体读取窗口 %ds（server.read_timeout_seconds，面板修改即时生效）；请求头上限 30s；请求体上限 %dMB",
 		cfg.Server.ReadTimeoutSeconds, cfg.Server.MaxBodyMB)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+	return ln, nil
+}
+
+// listenAddr 返回实际用于 bind 的地址，逐字对齐标准库的空地址回落：
+// net/http 的 ListenAndServe 在 s.Addr == "" 时改用 ":http"（即 80 端口）。
+// 正常路径下 cfg.Listen 非空（config.normalize 会把裸端口补成 ":7863"，Default() 给
+// ":7863"），此分支是为「把 ListenAndServe 拆成两步」不引入任何行为差异而保留，
+// 不依赖调用方的不变量。
+func listenAddr(listen string) string {
+	if listen == "" {
+		return ":http"
 	}
-	log.Printf("bye")
+	return listen
+}
+
+// wsaEADDRINUSE Windows Winsock「地址已在使用」错误码（10048）。
+//
+// 为何要单独写一个常量：Go 的 syscall.EADDRINUSE 在 Windows 上是 APPLICATION_ERROR
+// 域的伪 errno（实测值 536870914 = 0x20000002），而 Winsock 实际返回的是 10048，
+// 二者不相等——实测 errors.Is(bindErr, syscall.EADDRINUSE) 在 Windows 上恒为 false。
+// 只认 syscall.EADDRINUSE 会让 Windows 上的「端口被占用」全部落进未知错误分支，
+// 友好提示形同虚设。数值取自 Winsock 官方常量，非 Windows 平台 errno 均 < 200，
+// 不会误命中。
+const wsaEADDRINUSE = 10048
+
+// isAddrInUse 判定 bind 失败是否由「地址/端口已被占用」引起（跨平台）。
+// Unix（Linux/macOS 容器部署）走 syscall.EADDRINUSE；Windows 比对 Winsock 10048。
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return int(errno) == wsaEADDRINUSE
+	}
+	return false
+}
+
+// bindFailLines 把 bind 失败翻译成可读诊断（逐行返回，调用方逐行 log）。
+// 结论与「下一步敲什么」在前，原始 Go 错误串只作末行补充，不再是唯一信息。
+func bindFailLines(listen string, err error) []string {
+	port := listenPort(listen)
+	lines := []string{fmt.Sprintf("[server] 启动失败：无法监听 %s，本服务未启动。", listen)}
+	if isAddrInUse(err) {
+		lines = append(lines,
+			"        原因：该端口已被其它程序占用（bind 被系统拒绝）。",
+		)
+		if port != "" {
+			lines = append(lines, fmt.Sprintf("        排查：netstat -ano | findstr :%s（末列 PID 可在任务管理器对照进程名）", port))
+		} else {
+			lines = append(lines, "        排查：netstat -ano 找到占用该端口的 PID，再在任务管理器对照进程名")
+		}
+		lines = append(lines,
+			fmt.Sprintf("        处理：1) 结束占用该端口的程序后重试；2) 或改用其它端口——把 config.json 的 \"listen\" 改为 %q，", ":"+nextPort(port)),
+			"              或设环境变量 WB2A_LISTEN=:新端口（env 优先级高于 config.json）；",
+			"        提示：若本服务其实已在运行（重复启动），跑 status-wb2api.cmd 查看即可，无需再启一份；",
+			"              /healthz 响应体的 service 字段可确认该端口上是否为 workbuddy2api。",
+		)
+	} else {
+		lines = append(lines,
+			"        原因：监听地址不可用（非端口占用，多为 listen 配置写法有误）。",
+			"        处理：确认 config.json 的 \"listen\" 形如 \":7863\"（主机可省略、端口 1-65535），改后重试。",
+		)
+	}
+	return append(lines, fmt.Sprintf("        原始错误：%v", err))
+}
+
+// nextPort 返回「当前端口 +1」的字符串，供占用提示给出可直接照抄的替代端口；
+// port 为空或不可解析时返回 "7864"（默认端口 7863 的下一个，与上游 launcher 同款做法）。
+func nextPort(port string) string {
+	if n, err := strconv.Atoi(port); err == nil && n > 0 && n < 65535 {
+		return strconv.Itoa(n + 1)
+	}
+	return "7864"
+}
+
+// listenPort 从 listen 地址提取纯端口数字（":7863" / "0.0.0.0:7863" / "127.0.0.1:7863"
+// → "7863"），供 netstat 提示拼接；无法解析（空串、非数字端口）时返回空串，
+// 调用方据此退回不带端口的通用提示。
+func listenPort(listen string) string {
+	p := strings.TrimPrefix(panelListenPath(listen), ":")
+	if p == "" {
+		return ""
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < '0' || p[i] > '9' {
+			return ""
+		}
+	}
+	return p
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
