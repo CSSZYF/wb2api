@@ -1093,15 +1093,37 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}))
-			if upstream.IsEmptyStreamError(sErr) {
-				// 上游 200 但空流（0 有效帧）：Stream 已写 error 帧 + [DONE] 兜底
-				// （HTTP 头已发出只能 200），但这是上游缺陷不是成功——日志/状态收敛到
-				// 502 观测，与非流式 Aggregate 空流→502 upstream_parse 同语义
-				// （此前 `_ =` 吞错把失败流记成 200 假成功，运维看到假成功）。
-				// 只认 IsEmptyStreamError：客户端断连的写失败不误标（人已走，
-				// 502 观测没有意义）。
+			// 流式观测收敛（上游缺陷 → 502）：两种上游缺陷哨兵共用同一口径，
+			// 与「客户端已走」严格区分——两道闸门，缺一不可：
+			//   1) 哨兵闸：终结帧（error 帧/[DONE]）写失败时 Stream 返回**写错误**
+			//      而不是哨兵（见 upstream.StreamHint 尾部），此处天然不命中；
+			//   2) ctx 闸：客户端断连会取消入站 r.Context()，出站请求随之取消
+			//      （ChatStreamContext 从 r.Context() 派生），底流 Read 返回
+			//      context.Canceled——形态与「上游静默被 IdleTimeout 掐流」**同形**。
+			//      仅靠写失败分辨不够（断开未被探测到时，终结帧写进内核缓冲会"成功"），
+			//      故以入站 ctx 是否已取消作为权威判据：人已走 → 不标 502。
+			//      注意 IdleTimeout 取消的是**出站派生 ctx**，入站 r.Context() 不受影响，
+			//      所以真正的上游掐流仍照常收敛（这正是本项要抓的形态）。
+			//   - IsEmptyStreamError：上游 200 但空流（0 有效帧）；
+			//   - IsStreamAbortedError：上游中途断流（空闲超时掐流/半截读/连接重置），
+			//     Stream 已补 error 帧 + [DONE] 终结（此前既不写终结帧也不收敛状态，
+			//     客户端拿着半截流不知道结束了，运维看到假 200）。
+			// 两种都在 Stream 内写完了终结帧，HTTP 头已发出只能 200；此处只收敛
+			// **观测**（日志/状态列 502），与非流式 Aggregate 失败→502 upstream_parse
+			// 同语义。不罚账号：流中断多是上游静默/链路问题，空流路径既有口径亦不罚
+			// （与 4xx/5xx 信封错误走 applyErrorPolicy 的路径不同）。
+			switch {
+			case upstream.IsEmptyStreamError(sErr):
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream uid=%s model=%s: empty upstream stream (200+0 frames)", uidPrefix(acct.UID), bareModel)
+			case upstream.IsStreamAbortedError(sErr):
+				if r.Context().Err() != nil {
+					// 客户端已走：中断是下游取消引起，不是上游缺陷——不误标 502。
+					log.Printf("INFO: [server] stream uid=%s model=%s: stream aborted by client disconnect (no 502)", uidPrefix(acct.UID), bareModel)
+					break
+				}
+				st.status = http.StatusBadGateway
+				log.Printf("WARN: [server] stream uid=%s model=%s: %v (200+partial frames)", uidPrefix(acct.UID), bareModel, sErr)
 			}
 			// 流式观测一并带出：缓存三段 / 真实扣费 / 首字延迟（供 /v1/stats）。
 			// 与成本账本、pool 账本同源同口径（都读末帧 usage），不二次解析。

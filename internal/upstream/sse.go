@@ -25,6 +25,19 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// errStreamAborted 上游流**中途**异常终止（非 EOF 读错误：空闲超时掐流 /
+// 半截读 / 连接重置）。与 errEmptyStream 同为「上游缺陷」哨兵，语义不同：
+// 空流是 200 却一帧都没吐，中断流是吐了若干帧后断——两者都必须给客户端终结
+// （error 帧 + [DONE]），并让调用方把观测收敛为失败。
+// 客户端断连的写失败是另一类：Stream 在终结帧写失败时优先返回那个写错误，
+// 不返回本哨兵，handler 据此区分「上游缺陷」与「人已走」（人已走不标 502）。
+var errStreamAborted = errors.New("upstream stream aborted mid-way")
+
+// IsStreamAbortedError 报告错误是否为「上游流中途断流」——供 handler 在流式路径
+// 把中断流记为失败观测（HTTP 头已发出只能 200，日志/状态收敛到 502，此前是
+// 假 200），与 IsEmptyStreamError 同口径：只认上游缺陷，不认客户端已走。
+func IsStreamAbortedError(err error) bool { return errors.Is(err, errStreamAborted) }
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
@@ -536,6 +549,20 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 		return nil
 	}
 
+	// writeLocal 写出一帧**网关本地兜底** error 帧（不参与 gateway_hint 判定）并 flush。
+	// 与 writeRaw 的唯一差别是跳过 hintFn：本地帧没有上游原文，是网关自产的故障形态
+	// （空流 / 中途断流），hint 纪律要求「未覆盖形态不带字段、不编造」——结构上直接
+	// 不走判定，比依赖「固定文案恰好判不出 hint」更稳（后者会被将来改文案破坏）。
+	writeLocal := func(payload string) error {
+		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+			return werr
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
+
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
 	writeFrame := func(payload string) (int, error) {
@@ -581,6 +608,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+	// aborted 非 EOF 读错误（上游中途断流）的原因：循环内只记录、不返回，
+	// 由循环后的统一终结路径补 error 帧 + [DONE]（见下方注释）。
+	var aborted error
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -589,6 +619,8 @@ readLoop:
 		case strings.HasPrefix(trimmed, "data: [DONE]"):
 			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
+			// 判在 err 之前：末行带 [DONE] 与读错误同时返回时（半截读的常见形态），
+			// 上游已给出终结标记 = 正常收尾，不按中断处理。
 			break readLoop
 		case strings.HasPrefix(trimmed, "data: "):
 			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
@@ -610,16 +642,38 @@ readLoop:
 			if err == io.EOF {
 				break
 			}
-			return err
+			// 上游中途断流（空闲超时掐流 / 半截读 / 连接重置）：**不裸返回**——此前
+			// 既不写 error 帧也不写 [DONE]，客户端拿着半截流不知道结束了，运维只看到
+			// 假 200（上游 hub aaeefc4 的对应修复：catch 后补终结标记）。
+			// 注意 err 常为 context.Canceled：空闲监控 cancel 出站 ctx 时底流 Read 即
+			// 返回它（见 idle.go），此时上游确实不再吐数据，仍按上游缺陷终结。
+			// 已写出的帧照常留在客户端（透传语义：已到字节不回收），只在末尾补终结。
+			aborted = err
+			break readLoop
+		}
+	}
+	// 终结帧（error 帧 + [DONE]）的写出顺序与归属：
+	//   - 中断流优先于空流：上游连第一帧都没吐就断时，读错误比「空流」更具体
+	//     （空流分支留给上游正常 EOF 却 0 帧的形态），两者互斥不叠加。
+	//   - 帧文案固定，不透传底层错误原文（避免把内网地址/超时细节写给客户端）；
+	//     真实原因随返回错误带给调用方（日志/观测），见下方 errStreamAborted 包装。
+	//   - 帧走 writeLocal：网关本地兜底形态没有上游原文，不参与 gateway_hint 判定
+	//     （不编造 hint）。
+	//   - 写失败 = 客户端已走：返回那个写错误而**不返回哨兵**，调用方据此区分
+	//     「上游缺陷」（收敛 502 观测）与「人已走」（不误标）。
+	if aborted != nil {
+		if werr := writeLocal(`{"error":{"message":"upstream stream aborted","type":"upstream_error","code":"upstream_aborted"}}`); werr != nil {
+			return werr
 		}
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
-	// 网关本地空流兜底帧是**未覆盖形态**（无上游原文，不编造 hint）：其固定文案
-	// 经 GatewayHint 判定恒为空串（ErrClient/ErrNone 无 hint），故 writeRaw 的
-	// hintFn 路径对本帧天然不附加字段（测试断言该帧无 gateway_hint 键）。
-	if validFrames == 0 {
-		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
+	// 网关本地空流兜底帧同样是**未覆盖形态**（无上游原文，不编造 hint），
+	// 经 writeLocal 写出即天然不附加 gateway_hint（测试断言该帧无 gateway_hint 键）。
+	// 本帧写失败与随后的 [DONE] 同因（客户端已走），由下方 [DONE] 的写错误统一暴露，
+	// 故此处不重复判错——空流观测口径（errEmptyStream → 502）保持不变。
+	if aborted == nil && validFrames == 0 {
+		_ = writeLocal(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
@@ -627,6 +681,9 @@ readLoop:
 	}
 	if fl != nil {
 		fl.Flush()
+	}
+	if aborted != nil {
+		return fmt.Errorf("%w: %v", errStreamAborted, aborted)
 	}
 	if validFrames == 0 {
 		return errEmptyStream
