@@ -802,23 +802,87 @@ func runCreateCanvas(p *Panel, a *auth.Auth) (string, error) {
 }
 
 // expertSummonGap 专家召唤链的间隔（真实使用节奏，v11 实测 8s 成功率 100%）。
-const expertSummonGap = 6 * time.Second
+// 变量而非常量：测试里缩短为毫秒级（同 reportGap / acceptBatchGap 口径）。
+var expertSummonGap = 6 * time.Second
 
 // runExpertUse 完成 expert_5（使用 5 个平台专家）。
 // 2026-09-12 三账号实测公式：真实专家列表（id 必须真实存在）→ 召唤链
 // （summon_click/summoned）→ 真实 chat 拿服务端 requestId → expert_actual_use。
 // 自造专家 id 或自造 requestId 均不计数。
 func runExpertUse(p *Panel, a *auth.Auth) (string, error) {
-	return runExpertBatch(p, a, "agent", 5)
+	return runExpertBatch(p, a, "agent", "expert_5", 5)
 }
 
 // runExpertTeamUse 完成 Expert_team_use_3（使用 3 个专家团，expertType=team）。
 func runExpertTeamUse(p *Panel, a *auth.Auth) (string, error) {
-	return runExpertBatch(p, a, "team", 3)
+	return runExpertBatch(p, a, "team", "Expert_team_use_3", 3)
+}
+
+// expertBatchPlan 专家批量动作的本轮选取计划（按任务当前进度算出，纯值）。
+type expertBatchPlan struct {
+	cur        int                     // 任务当前进度（偏移量来源）
+	target     int                     // 任务目标次数
+	need       int                     // 本轮仍需成功的次数
+	candidates []upstream.MarketExpert // 候选顺序（进度偏移 + 轮内 id 去重）
+}
+
+// planExpertBatch 按任务当前进度算出本轮要召唤的专家候选顺序。
+//
+// 为什么需要按进度偏移：上游对 expert_actual_use 按 (eventCode, id) 去重
+// （hub PR #21 实测：重复发同一个专家 id 进度永远不动；桌面端 appendGrowthEvent
+// 同款去重），而 MarketExpertList 恒按 reco_rank 排序返回**同一个列表**——
+// 不偏移时每次运行都从列表头部重发同一批专家 id：半途失败重跑、或任务已部分
+// 完成（如 3/5）时，已计过数的 id 被重放，进度卡住不推进。
+// 偏移量取当前进度 cur：进度 k 对应候选顺序第 k 项，续跑正好落在尚未计数的窗口
+// 上（同一进度重跑 = 重试同一批，幂等且不重放已计 id）。
+//
+// 参数 cur/target 来自 ListTasks 的 current/target；读不到进度时调用方传
+// (0, count)，此时候选顺序 = 市场列表原序，与改动前逐字一致（可回退验证）。
+// count 是动作设计的单轮上限（expert_5=5 / Expert_team_use_3=3）。
+//
+// 返回空候选表示无需再上报：进度已达标（cur >= target）或列表为空。
+// 同一轮内按 expert_id 去重——市场列表可能含重复条目，重复 id 只会白跑一次
+// 召唤 + 真实对话（上游只计一次）。
+func planExpertBatch(experts []upstream.MarketExpert, cur, target, count int) expertBatchPlan {
+	if cur < 0 {
+		cur = 0 // 防御：负偏移会让取模落负下标
+	}
+	pl := expertBatchPlan{cur: cur, target: target}
+	if len(experts) == 0 {
+		return pl
+	}
+	if target > 0 && cur >= target {
+		return pl // 已达标：不再选（领奖由调用方走 claim 路径）
+	}
+	need := count
+	if target > 0 {
+		need = target - cur
+	}
+	if need > count {
+		need = count // 单轮上限
+	}
+	if need <= 0 {
+		return pl
+	}
+	pl.need = need
+	pl.candidates = make([]upstream.MarketExpert, 0, len(experts))
+	seen := make(map[string]bool, len(experts))
+	for i := 0; i < len(experts); i++ {
+		e := experts[(cur+i)%len(experts)]
+		if e.ExpertID == "" || seen[e.ExpertID] {
+			continue // 空 id / 轮内重复：跳过，顺延到下一个候选
+		}
+		seen[e.ExpertID] = true
+		pl.candidates = append(pl.candidates, e)
+	}
+	return pl
 }
 
 // runExpertBatch 专家召唤+使用的公共实现。失败逐个继续，返回汇总信息。
-func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (string, error) {
+//
+// code 用于读任务当前进度（进度偏移的偏移量来源，见 planExpertBatch），
+// expertType 是市场列表口径（agent / team）。
+func runExpertBatch(p *Panel, a *auth.Auth, expertType, code string, count int) (string, error) {
 	experts, err := p.cfg.Upstream.MarketExpertList(a, expertType)
 	if err != nil {
 		return "", fmt.Errorf("拉取专家列表: %w", err)
@@ -826,9 +890,24 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 	if len(experts) == 0 {
 		return "", fmt.Errorf("专家市场列表为空")
 	}
+	// 进度偏移：偏移量取任务当前进度，避免半途重跑重放已计过数的专家 id。
+	// 读不到进度（列表请求失败 / 账号无此任务 / target 缺省）时退回 (0, count)
+	// —— 与改动前行为一致（恒从列表头部取）。代价是多一次只读 GET，相对
+	// 后续 count×(召唤+真实对话) 的调用量可忽略。
+	cur, target := 0, count
+	if t, terr := p.taskByCode(a, code); terr == nil && t != nil && t.Target > 0 {
+		cur, target = int(t.Current), int(t.Target)
+	}
+	plan := planExpertBatch(experts, cur, target, count)
+	if plan.need == 0 {
+		return fmt.Sprintf("进度 %d/%d 已达标，无需再召唤专家（类型 %s）", cur, target, expertType), nil
+	}
+	if len(plan.candidates) == 0 {
+		return "", fmt.Errorf("专家市场列表无可用的专家 id（类型 %s）", expertType)
+	}
 	ok, fail := 0, 0
-	for i, e := range experts {
-		if ok >= count {
+	for i, e := range plan.candidates {
+		if ok >= plan.need {
 			break
 		}
 		// 召唤链（web_element_click + summon_click + summoned）。
@@ -851,7 +930,7 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 			continue
 		}
 		ok++
-		if i < len(experts)-1 {
+		if i < len(plan.candidates)-1 {
 			time.Sleep(expertSummonGap)
 		}
 	}
