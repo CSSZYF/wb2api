@@ -683,3 +683,33 @@ func TestPanelOverviewExposesManualDisable(t *testing.T) {
 		t.Error("u2 不应被停用")
 	}
 }
+
+// TestAppJSReasoningHistoryWiring features.reasoning_history 的面板接线必须齐全：
+// CFG_MAP 映射（否则表单值与后端对不上，下拉选了也存不进去）+ index.html 的三档
+// 下拉项存在。app.js/index.html 是 go:embed 静态资源，Go 编译器不校验其内容——
+// 少一处映射，用户改了「历史推理文本裁剪」保存后后端收不到该键，静默不生效
+// （与 TestAppJSMaxRotateWiring 同因，把接线完整性前移）。
+func TestAppJSReasoningHistoryWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(js), `reasoning_history: ['features', 'reasoning_history']`) {
+		t.Error("app.js 缺 reasoning_history 的 CFG_MAP 映射（表单值无法读写 features.reasoning_history）")
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 三档 option 必须都在（缺一档 = 用户无法选到该档）。
+	for _, want := range []string{
+		`name="reasoning_history"`,
+		`value="full"`,
+		`value="last"`,
+		`value="blank"`,
+	} {
+		if !strings.Contains(string(html), want) {
+			t.Errorf("index.html 缺配置表单项 %s", want)
+		}
+	}
+}

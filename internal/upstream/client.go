@@ -675,6 +675,13 @@ type Client struct {
 	// zeroWidthSanitize 零宽字符脱敏开关（默认 false）：在 system 消息的指纹词内部
 	// 插入 U+200B，破坏上游逐字匹配。与 sanitizeFingerprints 独立，可各自开关。
 	zeroWidthSanitize atomic.Bool
+	// reasoningHistory 出站历史推理文本裁剪档位（features.reasoning_history，
+	// 默认 full；见 reasoning_history.go）。存的是**已归一化**的档位字符串
+	// （SetReasoningHistory 内归一，非法值落 full）。与上面两个开关同理：面板保存
+	// 配置的热改与请求路径 prepareBody 的读分属不同 goroutine，必须走 atomic。
+	// 用 atomic.Value（而非 atomic.Pointer[string]）是为了零值可用：未 Store 时
+	// Load 返回 nil，ReasoningHistoryMode 回落 full。
+	reasoningHistory atomic.Value
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -810,6 +817,23 @@ func (c *Client) SanitizeFingerprintsOn() bool { return c.sanitizeFingerprints.L
 // ZeroWidthSanitizeOn 报告零宽脱敏当前是否开启。
 func (c *Client) ZeroWidthSanitizeOn() bool { return c.zeroWidthSanitize.Load() }
 
+// SetReasoningHistory 热改出站历史推理文本裁剪档位（面板保存配置路径调用）。
+// 写入前归一化（大小写/空白不敏感；空串与未知值落 full）：Client 是档位的运行时载体，
+// 不留未归一化字符串在内部（加载期的 warn 日志在 cmd/server 的 config.normalize，
+// 与本 setter 各司其职）。并发安全：请求路径 prepareBody 走 atomic 读。
+func (c *Client) SetReasoningHistory(mode string) {
+	m, _ := NormalizeReasoningHistoryMode(mode)
+	c.reasoningHistory.Store(m)
+}
+
+// ReasoningHistoryMode 返回当前裁剪档位；未设置（零值/非 string）回落 full。
+func (c *Client) ReasoningHistoryMode() string {
+	if v, ok := c.reasoningHistory.Load().(string); ok && v != "" {
+		return v
+	}
+	return ReasoningHistoryFull
+}
+
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
 func (c *Client) chatHTTP() *http.Client {
 	if c.ChatHTTP != nil {
@@ -902,8 +926,9 @@ func (c *Client) chatBase(a *auth.Auth) string {
 	return c.ChatBaseCN
 }
 
-// prepareBody 组装出站请求体（脱敏开关由 Client.sanitizeFingerprints/zeroWidthSanitize
-// 控制，均经 atomic 读取——本函数在请求 goroutine 内被调，与面板保存配置并发）。
+// prepareBody 组装出站请求体（脱敏/裁剪开关由 Client.sanitizeFingerprints /
+// zeroWidthSanitize / reasoningHistory 控制，均经 atomic 读取——本函数在请求 goroutine
+// 内被调，与面板保存配置并发）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染），
 // 并决定是否做 CN 专属的 reasoning content-part 转换（见 reasoning_parts.go）。
 //
@@ -914,11 +939,12 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	efforts := c.effortsSnapshot(realm)
 	defaults := c.defaultEffortsSnapshot(realm)
 	logReasoning("in ", body, efforts, defaults)
-	// 两个开关各读一次并就地使用：读点与写点（Set*）成对走 atomic，消除数据竞争。
+	// 三个开关各读一次并就地使用：读点与写点（Set*）成对走 atomic，消除数据竞争。
 	// 不缓存到局部再跨阶段复用——避免把"一次读到的旧值"错当成当前配置。
 	// realm 一并传入：CN 域在管线内做 reasoning part → reasoning_content 转换，
 	// global 域原样透传（上游接受该 part 类型，改它反而引入风险）。
-	body = PrepareBodyOptRealm(body, realm, c.SanitizeFingerprintsOn(), c.ZeroWidthSanitizeOn(), efforts, defaults)
+	body = PrepareBodyOptRealmHistory(body, realm, c.SanitizeFingerprintsOn(), c.ZeroWidthSanitizeOn(),
+		c.ReasoningHistoryMode(), efforts, defaults)
 	logReasoning("out", body, efforts, defaults)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。

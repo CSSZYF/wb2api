@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -193,6 +194,23 @@ type Config struct {
 		// 与上面那个独立：上面是"改写/删除"（默认开、覆盖面窄），这里是"插入不可见字符"
 		// （默认关、覆盖面广）。两者叠加不冲突，开启顺序固定为先改写后插零宽。
 		ZeroWidthSanitize bool `json:"zerowidth_sanitize"`
+		// ReasoningHistory 出站历史推理文本裁剪档位（默认 "full"）：
+		//   "full"  — 全量保留推理原文（行为与加本键前逐字节一致）；
+		//   "last"  — 只保留最后一条带推理文本的 assistant 消息的原文，其余置单个空格；
+		//   "blank" — 所有 assistant 推理字段一律置单个空格（省 token 最多）。
+		//
+		// 为什么值得配（实测 2026-09-19，真实请求打 deepseek-v4.1-flash / global 域）：
+		// 上游只对「带 tool_calls 的 assistant 消息」计算推理文本 token——40000 字符的
+		// reasoning_content 让 prompt_tokens 从 346 涨到 9234，换成单个空格则回到 346；
+		// 而真实客户端（ZCode 3.11.2）给每条 assistant 挂完整推理文本，长会话里推理约占
+		// **总 token 的一半**（887 条消息实测 376 条带推理、合计 178 万字符），是用户撞上
+		// 1,048,576 上下文上限、被客户端强制压缩的主因。三档语义与占位口径见
+		// internal/upstream/reasoning_history.go。
+		//
+		// 非法值（空串/未知）回落 "full" 并记 warn（fail-safe，不改变既有行为）——
+		// 不像 prompt.mode 那样 fail fast：这是个默认关闭的性能开关，拼错一个词就让
+		// 网关起不来，代价远大于收益。
+		ReasoningHistory string `json:"reasoning_history"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -346,6 +364,9 @@ func Default() *Config {
 	// 零宽脱敏默认关：它改动的是"看不见的字节"，出问题时表现为两个看起来一样的字符串对不上，
 	// 排查成本高。由使用者在面板显式开启（与上游 codebuddy2api 的默认关闭口径一致）。
 	c.Features.ZeroWidthSanitize = false
+	// 历史推理裁剪默认 full（零回归）：这是"改写出站历史"的开关，与上面两个脱敏开关
+	// 同类——默认必须与加本键前逐字节一致，由用户按需在面板/配置里显式切档。
+	c.Features.ReasoningHistory = upstream.ReasoningHistoryFull
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403
@@ -551,6 +572,10 @@ func applyEnv(c *Config) {
 			c.Features.ZeroWidthSanitize = b
 		}
 	}
+	// 档位字符串直接覆盖（归一化在 normalize()，与 JSON 同口径）。
+	if v := os.Getenv("WB2A_REASONING_HISTORY"); v != "" {
+		c.Features.ReasoningHistory = v
+	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
 	}
@@ -733,6 +758,16 @@ func (c *Config) normalize() error {
 		c.Models.RealmPrecedence = "cn"
 	default:
 		c.Models.RealmPrecedence = "global"
+	}
+	// features.reasoning_history：三档字符串（full/last/blank）。合法值归一化
+	// （大小写/首尾空白不敏感）；非法值（空串/未知）**回落 full 并记 warn**，
+	// 不 fail fast——理由见字段注释（默认关闭的性能开关，回落 full = 行为与改动前
+	// 逐字节一致，静默失败的方向是"没省到 token"而不是"改坏了请求"）。
+	if mode, ok := upstream.NormalizeReasoningHistoryMode(c.Features.ReasoningHistory); ok {
+		c.Features.ReasoningHistory = mode
+	} else {
+		log.Printf("features.reasoning_history: %q 不是合法档位（full/last/blank），已按 full 处理", c.Features.ReasoningHistory)
+		c.Features.ReasoningHistory = upstream.ReasoningHistoryFull
 	}
 	return c.normalizePrompt()
 }

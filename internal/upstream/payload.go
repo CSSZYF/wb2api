@@ -48,6 +48,17 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize, zeroWidth bool, e
 // 请求体），加参数等于全量改签名、把「realm 感知」扩散到与域无关的用例里；
 // 新变体只改出站主路径一个调用点，其余调用点零改动。
 func PrepareBodyOptRealm(src []byte, realm string, sanitize, zeroWidth bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	return PrepareBodyOptRealmHistory(src, realm, sanitize, zeroWidth, ReasoningHistoryFull, efforts, defaultEfforts)
+}
+
+// PrepareBodyOptRealmHistory 同 PrepareBodyOptRealm，但多一个出站历史推理文本裁剪档位
+// （features.reasoning_history，见 reasoning_history.go 的三档语义与实测依据）。
+// 空串/未知档位与 full 等价（trimReasoningHistory 入口即 return）——fail-safe 零回归。
+//
+// 为什么又是新变体而不是给 PrepareBodyOptRealm 加参数：同当年加 PrepareBodyOptRealm
+// 的取舍（见上方注释）——既有入口有 20+ 处调用点（含大量直接构造请求体的测试），
+// 加参数等于全量改签名；新变体只改出站主路径（client.prepareBody）一个调用点。
+func PrepareBodyOptRealmHistory(src []byte, realm string, sanitize, zeroWidth bool, reasoningHistory string, efforts map[string][]string, defaultEfforts map[string]string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -118,6 +129,15 @@ func PrepareBodyOptRealm(src []byte, realm string, sanitize, zeroWidth bool, eff
 			sanitizeMessages(msgs)
 		}
 	}
+	// 出站历史推理文本裁剪（见 reasoning_history.go）：**必须晚于 sanitizeMessages**——
+	// sanitize 会把纯指纹块的 rc 整段删除成空串（sanitize.go 记录的「已知残余」：
+	// rc 净化后为空 → 租户 len>0 校验 400），裁剪步在其后即可把空串补成 " "，
+	// 顺带修掉这条路径；反过来（先裁剪后净化）占位没有净化需求（无害），但被清空的
+	// rc 会永远停在空串、无人补位（有害），且 keeper 会选中「净化前看着有文本」的
+	// 指纹块消息、净化后只剩空串（既丢真原文又留空串，最坏组合）。
+	// 与 zeroWidth 无耦合（后者只处理 system 消息的 content，见 zerowidth.go），
+	// 放在它前面只是顺路。档位默认 full 时本步入口即 return（无任何 map 写入）。
+	trimReasoningHistory(obj, reasoningHistory)
 	// 零宽脱敏必须在 sanitize 之后：sanitize 依赖**整句子符串相等**来定位并改写模板句，
 	// 若先插了零宽字符，句子中间多出 U+200B，字符串匹配随即失效、改写全部落空。
 	// 反过来则不冲突：零宽按"独立词"匹配，改写后的新句子（…CLI tool for Claude.）里
