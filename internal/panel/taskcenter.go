@@ -92,7 +92,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			if a.IsGlobal() {
 				return
 			}
-			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
+			if tasks, err := p.listAllTasks(a); err != nil {
 				it.GrowthErr = err.Error()
 			} else {
 				for _, t := range tasks {
@@ -211,7 +211,7 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if body.Growth {
-				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+				if tasks, err := p.listAllTasks(a); err == nil {
 					for _, t := range tasks {
 						if growthPending(t) {
 							one.grow = append(one.grow, t)
@@ -365,25 +365,19 @@ func (p *Panel) queueSet(q *queueState, uid string, fn func(*queueItem)) {
 
 // acceptPendingTasks 批量接受该账号未接受的任务，返回**确认登记**的个数（失败返回 0 不阻塞）。
 // 走 acceptVerified：上游可能 200+OK 但未落账，验证通过才计数。
+// 按口径分两批提交（见 acceptSplit）：mp 限定任务在默认口径下 accept 返回 task not found。
 func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
-	tasks, err := p.cfg.Upstream.ListTasks(a)
+	tasks, err := p.listAllTasks(a)
 	if err != nil {
 		return 0
 	}
-	var codes []string
-	for _, t := range tasks {
-		if !t.Claimed && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
-			codes = append(codes, t.TaskCode)
-		}
-	}
-	if len(codes) == 0 {
-		return 0
-	}
-	accepted, failed := p.acceptVerified(a, codes)
+	accepted, failed := p.acceptSplit(a, tasks)
 	if len(failed) > 0 {
 		log.Printf("panel: 队列 accept uid=%s 未登记 %d 个（不阻塞）: %v", a.UID, len(failed), failed)
 	}
-	log.Printf("panel: 队列 accept uid=%s: 已接受 %d 个任务", a.UID, len(accepted))
+	if len(accepted) > 0 {
+		log.Printf("panel: 队列 accept uid=%s: 已接受 %d 个任务", a.UID, len(accepted))
+	}
 	return len(accepted)
 }
 
@@ -410,7 +404,7 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	}
 	after, _ := p.taskByCodeWaiting(a, code)
 	if after != nil && after.Claimable {
-		if credit, energy, cerr := p.cfg.Upstream.ClaimReward(a, code); cerr == nil && (credit > 0 || energy > 0) {
+		if credit, energy, cerr := p.claimRewardFor(a, code); cerr == nil && (credit > 0 || energy > 0) {
 			msg += fmt.Sprintf("；自动领奖 +%d 分 +%d 能", credit, energy)
 		}
 	}

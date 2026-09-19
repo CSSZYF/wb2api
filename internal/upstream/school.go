@@ -129,6 +129,12 @@ func (c *Client) SchoolDraw(a *auth.Auth) (string, error) {
 
 const mpReportPath = "/v2/report"
 
+// mpReportPlatformValue 埋点域（/v2/report）的 X-Client-Platform 取值。
+// 与 growth 域的 mpPlatformValue（miniprogram）**刻意不同值**：两者都是上游实测
+// 原值（埋点域=微信注入的小程序 UA 族口径，growth 域=web 小程序 H5 拦截器口径），
+// 统一成任一个都会让另一半链路失效。由 TestMPPlatformHeaderValuesDiffer 锁死。
+const mpReportPlatformValue = "mp-weixin"
+
 // mpEventBase 小程序埋点公共指纹（appservice wQ()+Ao() 对齐）。
 func mpEventBase(a *auth.Auth) map[string]any {
 	return map[string]any{
@@ -183,7 +189,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	}
 	req.Header.Set("X-Client-Product", "workbuddy-mp")
 	req.Header.Set("X-Client-Version", "2.4.0")
-	req.Header.Set("X-Client-Platform", "mp-weixin")
+	req.Header.Set("X-Client-Platform", mpReportPlatformValue)
 	req.Header.Set("X-Platform", "wechatmp")
 	_, err = c.doJSON(req)
 	return err
@@ -244,6 +250,33 @@ func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[st
 			"codebuddy.conversation_request_id": rid,
 		},
 	}
+}
+
+// ---- 校园日（growth 域 school_season，2026-09-17 接入）----
+//
+// 判据实证（上游 e45f39f，账号 0ceb9c7c/f8657995）：
+//   - school_season 是 **growth 域**任务码，但只在 X-Client-Platform: miniprogram
+//     口径下下发（默认 18 项列表里无此 code）；accept/claim 同样要求该头。
+//   - 完成判据**走 school 域 activityId 关联**：一条 mini 指纹 chat_request_send
+//     + activityId=school_open_day_2026 即点亮（无 activityId 的事件不点亮）。
+//     判据载体与 school 域 chat_3_times 同形，故直接复用 SchoolChatTimesEvents
+//     （单一事实源），只补 activityId。
+//   - 奖励与 mp 任务同档：100c + 5e；claim 幂等（already_claimed 不算失败）。
+
+// schoolActivityID 开学季活动 code（事件 activityId 字段值，与 school 域同一活动）。
+// 上游为硬编码常量（school_open_day_2026.py: ACTIVITY_ID），/config 的响应里
+// **不返回**该值，故无法从接口获取，只能同为常量。
+const schoolActivityID = "school_open_day_2026"
+
+// SchoolSeasonChatEvents 构造点亮 growth 域 school_season（校园日）的事件。
+//
+// 复用 SchoolChatTimesEvents 的事件形状（同一 mini 指纹 + chat_request_send），
+// 仅叠加 activityId=school_open_day_2026——判据关联键就是它，缺失即不点亮。
+// 返回单元素切片（一条即点亮，与上游 need=max(1,target-cur) 的 target=1 一致）。
+func SchoolSeasonChatEvents(conversationID string) []map[string]any {
+	ev := SchoolChatTimesEvents(conversationID)
+	ev["activityId"] = schoolActivityID
+	return []map[string]any{ev}
 }
 
 // ---- 我的券码（#/prizes?tab=vouchers，2026-09-16 接入）----

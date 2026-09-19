@@ -41,9 +41,26 @@ type TravelState struct {
 	RewardCredit      int64  `json:"reward_credit"`       // 到站可领奖励积分
 }
 
+// 小程序口径标记（growth 域）：小程序限定任务（school_season 等）的列表/accept/claim
+// 均要求该头，缺头时任务不下发、accept 返回 task not found（上游实测）。
+//
+// 注意与 school.go 的 /v2/report 头**不同值**：埋点域用 `mp-weixin`（微信注入的
+// 小程序 UA 族），growth 域用 `miniprogram`（web 小程序 H5 请求拦截器注入值）。
+// 两者都是上游实测原值，勿"统一"成同一个常量。
+const (
+	mpPlatformHeader = "X-Client-Platform"
+	mpPlatformValue  = "miniprogram"
+)
+
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.growthJSONMP(a, method, path, body, false)
+}
+
+// growthJSONMP growthJSON 的**小程序口径**变体：mp=true 时在既有头族（chatBase +
+// BillingHeaders）之上加 X-Client-Platform: miniprogram，其余逐字相同。
+func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any, mp bool) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -57,6 +74,9 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
+	if mp {
+		req.Header.Set(mpPlatformHeader, mpPlatformValue)
+	}
 	return c.doJSON(req)
 }
 

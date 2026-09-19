@@ -40,10 +40,26 @@ func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
 // 未通过的码重试一次（批间节流同款 gap），仍未通过即进 failed 由调用方下次重试
 // ——回读本身失败同样按"未确认"处理（与上游 Python 侧一致：宁可下轮重试，
 // 不谎报登记成功）。
+//
+// mp 标记走小程序口径（请求与回读都带 X-Client-Platform: miniprogram）：
+// mp 限定任务在默认口径下不可见，用默认口径回读会恒判"未登记"从而空转重试。
+// 需要 mp 口径的调用方显式走 acceptVerifiedMP（**不要**在本函数里按码自动判口径：
+// 混批会把普通任务带进 mp 列表，而那批任务在 mp 口径下的 accept 语义未经验证）。
 func (p *Panel) acceptVerified(a *auth.Auth, codes []string) (accepted, failed []string) {
+	return p.acceptVerifiedMP(a, codes, false)
+}
+
+// acceptVerifiedMP acceptVerified 的口径变体：mp=true 时请求与回读都走小程序口径。
+func (p *Panel) acceptVerifiedMP(a *auth.Auth, codes []string, mp bool) (accepted, failed []string) {
 	pending := append([]string(nil), codes...)
 	for attempt := 1; attempt <= 2 && len(pending) > 0; attempt++ {
-		results, err := p.cfg.Upstream.AcceptTasks(a, pending)
+		var results []upstream.AcceptResult
+		var err error
+		if mp {
+			results, err = p.cfg.Upstream.AcceptTasksMP(a, pending)
+		} else {
+			results, err = p.cfg.Upstream.AcceptTasks(a, pending)
+		}
 		if err != nil {
 			log.Printf("panel: accept uid=%s codes=%v 第 %d 次请求失败: %v", a.UID, pending, attempt, err)
 			if attempt < 2 {
@@ -66,9 +82,18 @@ func (p *Panel) acceptVerified(a *auth.Auth, codes []string) (accepted, failed [
 		// 批量一次 ListTasks 后本地扫描，避免每码一次回读。
 		registered := make(map[string]bool, len(pending))
 		if len(pending) == 1 {
-			registered[pending[0]] = p.cfg.Upstream.VerifyAccepted(a, pending[0])
+			if mp {
+				registered[pending[0]] = p.cfg.Upstream.VerifyAcceptedMP(a, pending[0])
+			} else {
+				registered[pending[0]] = p.cfg.Upstream.VerifyAccepted(a, pending[0])
+			}
 		} else {
-			tasks, err := p.cfg.Upstream.ListTasks(a)
+			var tasks []upstream.Task
+			if mp {
+				tasks, err = p.cfg.Upstream.ListTasksMP(a)
+			} else {
+				tasks, err = p.cfg.Upstream.ListTasks(a)
+			}
 			if err != nil {
 				log.Printf("panel: accept 回读失败 uid=%s: %v（按未确认处理，可重试）", a.UID, err)
 			}
@@ -105,13 +130,15 @@ func taskRegistered(tasks []upstream.Task, code string) bool {
 }
 
 // accountTasks 查询单账号全量任务（进度/状态/可领取）。
+// 走 listAllTasks（默认口径 + 小程序口径并集）：mp 限定任务（school_season）不在
+// 默认列表里，只查默认口径会让它在任务表里**不可见**，也就点不到「一键完成」。
 func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
 		return
 	}
-	tasks, err := p.cfg.Upstream.ListTasks(a)
+	tasks, err := p.listAllTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
@@ -160,20 +187,15 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	tasks, err := p.cfg.Upstream.ListTasks(a)
+	tasks, err := p.listAllTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
-	var codes []string
-	for _, t := range tasks {
-		// 跳过已完成/已领取/已接受的；locked 的也不碰（上游未开放）。
-		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
-			continue
-		}
-		codes = append(codes, t.TaskCode)
-	}
-	if len(codes) == 0 {
+	// 按口径分两批提交（见 splitAcceptCodes）：mp 限定码必须走 mp 口径，
+	// 否则默认口径 accept 返回 task not found。
+	codes, mpCodes := splitAcceptCodes(tasks)
+	if len(codes) == 0 && len(mpCodes) == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accepted": 0, "message": "所有任务均已接受"})
 		return
 	}
@@ -189,6 +211,11 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 		accepted = append(accepted, ok...)
 		failed = append(failed, bad...)
 		time.Sleep(acceptBatchGap) // 批间节流（对齐脚本 1.05s 口径）
+	}
+	if len(mpCodes) > 0 {
+		ok, bad := p.acceptVerifiedMP(a, mpCodes, true)
+		accepted = append(accepted, ok...)
+		failed = append(failed, bad...)
 	}
 	log.Printf("panel: 全部接受 uid=%s 登记=%d 未登记=%d", uid, len(accepted), len(failed))
 	resp := map[string]any{"ok": true, "accepted": len(accepted), "failed": failed}
@@ -212,7 +239,7 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
-	credit, energy, err := p.cfg.Upstream.ClaimReward(a, body.TaskCode)
+	credit, energy, err := p.claimRewardFor(a, body.TaskCode)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "claim: "+err.Error())
 		return

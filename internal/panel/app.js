@@ -697,8 +697,13 @@ const AUTO_TASKS = {
   'Hp_Appearance': '设置主题 API + 皮肤生效事件（两账号实测点亮）',
   'black_cat': '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
-  'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）'
+  'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）',
+  'school_season': '校园日：小程序口径 accept → mini 对话事件（带 activityId）→ 回读 → 领奖（100 分 + 5 能）'
 };
+
+// 小程序口径限定任务（后端 mpTaskCode 同名单）：任务表/队列里打「小程序」tag。
+// 这些 code 只在 X-Client-Platform: miniprogram 口径下发，默认口径列表里没有。
+const MP_TASKS = { 'school_season': true };
 
 function openTasks(uid) {
   taskUID = uid;
@@ -783,8 +788,11 @@ async function loadTasks() {
         : '<button class="xs" data-t="accept" data-c="' + esc(t.task_code) + '">接受</button>';
       // 操作指引（description/task_desc）挂 title 提示：如何完成交给用户看
       const tip = [t.title, t.task_desc || t.description, t.jump_url ? '跳转：' + t.jump_url : ''].filter(Boolean).join('\n');
+      // 小程序限定任务（school_season「校园日」）：只在 X-Client-Platform: miniprogram
+      // 口径下发，默认列表里看不到——标一个 tag，避免用户以为"任务丢了"。
+      const mpTag = MP_TASKS[t.task_code] ? '<span class="tag mute">小程序</span>' : '';
       return '<tr title="' + esc(tip) + '"><td class="mark" aria-hidden="true"><i></i></td>' +
-        '<td class="who"><div class="nm">' + esc(t.title || t.task_code) + '</div><div class="id">' + esc(t.task_code) + (t.tag ? ' · ' + esc(t.tag) : '') + '</div></td>' +
+        '<td class="who"><div class="nm">' + esc(t.title || t.task_code) + mpTag + '</div><div class="id">' + esc(t.task_code) + (t.tag ? ' · ' + esc(t.tag) : '') + '</div></td>' +
         '<td class="num">' + esc(prog) + '</td>' +
         '<td class="num">' + esc(reward) + '</td>' +
         '<td>' + badge + '</td>' +
@@ -1328,9 +1336,12 @@ function qrowHTML(it) {
   const title = isSchool ? '开学季闭环' : (GROWTH_TITLES[it.code] || it.code);
   const dotCls = it.status === 'scan' ? 'wait' : it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : it.status === 'skipped' ? 'skip' : it.status === 'done' ? 'done' : 'wait';
   const stWord = it.status === 'scan' ? '待执行' : (ST_WORDS[it.status] || it.status);
+  // 小程序限定任务（school_season）在队列里也要标出来：默认口径看不到它，
+  // 不标注的话用户会以为这条待办是别的任务串了。
+  const mpTag = MP_TASKS[it.code] ? '<span class="tag mute">小程序</span>' : '';
   return '<div class="qrow" title="' + esc(it.message || '') + '">' +
     '<span class="code">' + esc(it.code) + '</span>' +
-    '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + '</span>' +
+    '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + mpTag + '</span>' +
     '<span class="prog">' + esc(it.prog || '') + '</span>' +
     '<span class="st"><span class="qdot ' + dotCls + '"></span>' + stWord + '</span>' +
     '<span class="msg">' + esc(it.message || '') + '</span>' +
