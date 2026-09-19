@@ -48,19 +48,6 @@ func isDeepSeekModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
 }
 
-// backfillReasoningContent DeepSeek 多轮一致性：历史 assistant 消息带 reasoning 痕迹时，
-// 上游要求后续请求所有 assistant 消息都带 reasoning_content 字段（string，可为空串）
-// ——即 requiresReasoningContentOnAssistantMessages（官方客户端 matches 规则）。
-//
-// 规则（对齐官方客户端逻辑）：
-//   - 会话内任一 assistant 消息带非空 reasoning（string）或已有 reasoning_content 字段
-//     → 所有 assistant 消息确保有 reasoning_content（string）：
-//   - reasoning 非空且无 reasoning_content → 复制 reasoning 值
-//   - 已有 reasoning_content → 原样保留（不覆盖）
-//   - 两者皆无 → 补空串 ""
-//   - 任何 assistant 均无 reasoning 痕迹 → 零改动（不白白加字段）。
-//
-// 仅 deepseek 模型生效（thinkingFormat:deepseek + requiresReasoningContent）。
 func backfillReasoningContent(obj map[string]any) {
 	model, _ := obj["model"].(string)
 	if !isDeepSeekModel(model) {
@@ -70,7 +57,14 @@ func backfillReasoningContent(obj map[string]any) {
 	if !ok || len(msgs) == 0 {
 		return
 	}
-	// 第一遍：检测是否有任何 reasoning 痕迹（非空 reasoning 或已有 reasoning_content）。
+	// thinkingEnabled 半边：读注入后的 thinking.type（与官方 el.thinkingEnabled 对应）。
+	thinkingEnabled := false
+	if th, ok := obj["thinking"].(map[string]any); ok {
+		if typ, _ := th["type"].(string); strings.EqualFold(strings.TrimSpace(typ), "enabled") {
+			thinkingEnabled = true
+		}
+	}
+	// hasTrace 半边：检测是否有任何 reasoning 痕迹（非空 reasoning 或已有 reasoning_content）。
 	hasTrace := false
 	for _, mm := range msgs {
 		msg, ok := mm.(map[string]any)
@@ -86,10 +80,13 @@ func backfillReasoningContent(obj map[string]any) {
 			break
 		}
 	}
-	if !hasTrace {
+	if !thinkingEnabled && !hasTrace {
 		return
 	}
-	// 第二遍：所有 assistant 消息补/复制 reasoning_content 字段。
+	// 第二遍：所有 assistant 消息补/复制 reasoning_content，并镜像保证
+	// reasoning 字段存在且非空（issue #165 追评：部分租户校验 len(reasoning)>0）。
+	//
+	// 跳过条件只认 string（官方 "string"!=typeof 才动手）：null/数字归一化。
 	for _, mm := range msgs {
 		msg, ok := mm.(map[string]any)
 		if !ok {
@@ -99,27 +96,33 @@ func backfillReasoningContent(obj map[string]any) {
 		if role != "assistant" {
 			continue
 		}
-		if _, ok := msg["reasoning_content"]; ok {
-			continue // 已有 → 不覆盖
+		// 第一段：rc 归一化（已有 string → 不覆盖；否则复制 reasoning；
+		// 两者皆无 → 补空串）。本次用于 rc 的来源文本记进局部
+		// 变量 rc，只作镜像来源用——两字段同源（不各自独立判定，
+		// 避免「rc 补空串、reasoning 却复制出旧值」这类错配）。
+		rc, hasRC := msg["reasoning_content"].(string)
+		if !hasRC {
+			if r, ok := msg["reasoning"].(string); ok {
+				rc = r
+			} else {
+				rc = ""
+			}
+			msg["reasoning_content"] = rc
 		}
-		if r, ok := msg["reasoning"].(string); ok {
-			msg["reasoning_content"] = r
+		// 第二段：镜像写 reasoning。已非空 string → 不覆盖（客户端显式给的
+		// reasoning 优先，与 rc 的「不覆盖」同口径）；否则用上面确定的 rc 来源补齐，
+		// 两者皆空时补单个空格 " "——上游 len>0 不 trim（空白串过闸、
+		// 空串 400），该字段是透传校验位非内容消费位。
+		if r, ok := msg["reasoning"].(string); ok && r != "" {
+			continue // 已非空 → 不覆盖
+		}
+		if rc != "" {
+			msg["reasoning"] = rc
 		} else {
-			msg["reasoning_content"] = ""
+			msg["reasoning"] = " "
 		}
 	}
 }
-
-// injectThinking 按 DeepSeek 思维链开关规则改写请求体。非 deepseek 零改动。
-//
-// 核心逻辑（对齐官方客户端）：
-//   - 「开思考」必须 thinking.type=enabled + 有 effort 档位（Hermes #43 打回证据）。
-//   - 显式 thinking.type 非空 → 客户端显式控制：enabled 缺 effort 时补默认档；
-//     disabled 尊重并删 reasoning_effort（snake/camel 双字段）。
-//   - 无 thinking / type 空 / 已有 effort → 注入 enabled 并补默认档（已有 effort 不覆盖）。
-//
-// defaultEffort 为该模型声明的默认档（来自 FetchModels 缓存 reasoning.defaultEffort）；
-// 空串时回退硬编码 defaultDeepSeekEffort（向后兼容）。
 func injectThinking(obj map[string]any, defaultEffort string) {
 	model, _ := obj["model"].(string)
 	if !isDeepSeekModel(model) {

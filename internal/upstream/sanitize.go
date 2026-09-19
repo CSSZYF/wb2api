@@ -191,6 +191,16 @@ func sanitizeMessages(messages []any) bool {
 				changed = true
 			}
 		}
+		// reasoning（顶层镜像字段，见 thinking.go 的镜像写）与 reasoning_content
+		// **完全同口径**净化：backfill 把 rc 的值复制进 reasoning，若只洗 rc 不洗
+		// reasoning，指纹文本就经这个新字段原样出站——等于给指纹开了个不受净化的
+		// 新通道（11128 类误杀的新来源面）。两字段同源同口径，净化后保持一致。
+		if r, ok := m["reasoning"].(string); ok {
+			if s := sanitizeText(r); s != r {
+				m["reasoning"] = s
+				changed = true
+			}
+		}
 	}
 	return changed
 }
