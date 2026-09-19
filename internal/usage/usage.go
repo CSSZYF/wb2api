@@ -11,7 +11,8 @@
 //   - 更早：折叠为日桶，**永久保留**（看长期趋势）
 //
 // 落盘：data/usage.json，原子替换 + 防抖刷新（默认 30s），重启不丢。
-// 桶数上界 ≈ 账号数 × 模型数 × (hourlyKeep + 已过天数)，实测单桶约 90 字节。
+// 桶数上界 ≈ 账号数 × 模型数 × (hourlyKeep + 已过天数)，单桶约百字节（字段一律
+// 短名落盘，因为桶数量会随时间增长）。
 package usage
 
 import (
@@ -57,6 +58,19 @@ type bucket struct {
 	LatN  int64   `json:"ln"` // 延迟样本数
 	TPS   float64 `json:"v"`  // 吐字速率累计
 	TPSN  int64   `json:"vn"` // 速率样本数
+
+	// 缓存三段与首字延迟（供 /v1/stats；字段名同 pool.TokenUsageDelta 的语义）。
+	// 旧落盘文件缺这些字段时读入即零值，聚合侧不做除法（分母为 0 不出命中率），
+	// 因此升级不改变既有视图的任何数值。
+	CH     int64   `json:"ch"` // 缓存命中 tokens（prompt_cache_hit_tokens）
+	CM     int64   `json:"cm"` // 缓存未命中 tokens
+	CW     int64   `json:"cw"` // 缓存写入 tokens
+	Cr     float64 `json:"cr"` // 真实扣费累计（上游 usage.credit，缺观测时恒 0）
+	Str    int64   `json:"st"` // 流式请求数
+	TtfbMs int64   `json:"fm"` // 首字延迟累计（ms，仅流式有观测）
+	TtfbN  int64   `json:"fn"` // 首字延迟样本数
+	GenMs  int64   `json:"gm"` // 生成时长累计（ms，端到端减去首字），供吞吐折算
+	Last   int64   `json:"ls"` // 最近一次请求的 unix 秒（供 /v1/stats 的 last_seen）
 }
 
 // file 落盘结构。
@@ -134,6 +148,9 @@ func (r *Recorder) Stop() {
 }
 
 // Delta 一次请求尝试的用量增量（与 pool.TokenUsageDelta 同形，避免包间依赖）。
+//
+// Has* 字段的纪律与 pool 侧一致：区分「上游没给该字段」与「上游显式给了 0」。
+// 统计口径只采信上游 usage，不做 rune 估算（缺失即不累加，不伪造观测）。
 type Delta struct {
 	PromptTokens     int64
 	HasPromptTokens  bool
@@ -145,6 +162,20 @@ type Delta struct {
 	HasLatency       bool
 	TokensPerSecond  float64
 	HasTPS           bool
+
+	// 缓存三段（上游 usage.prompt_cache_*_tokens）。命中率分母 = 命中 + 未命中，
+	// 不含写入——写入是「为后续命中付的费」，计入分母会把首次请求的命中率压低。
+	CacheHit        int64
+	CacheMiss       int64
+	CacheWrite      int64
+	HasCache        bool // 上游末帧带了任一缓存字段
+	Credit          float64
+	HasCredit       bool
+	Stream          bool  // 本次尝试是流式
+	TTFBMs          int64 // 首字延迟（仅流式有观测）
+	HasTTFB         bool
+	GenerationMs    int64 // 生成时长（端到端 − 首字），供 tokens/s 折算
+	HasGenerationMs bool
 }
 
 // Add 记录一次请求尝试。
@@ -196,6 +227,32 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
 	}
+	// 缓存三段只在有观测时累加（缺失 ≠ 0；分母因此不会把「没观测」算成未命中）。
+	if d.HasCache {
+		b.CH += d.CacheHit
+		b.CM += d.CacheMiss
+		b.CW += d.CacheWrite
+	}
+	if d.HasCredit {
+		b.Cr += d.Credit
+	}
+	if d.Stream {
+		b.Str++
+	}
+	// 首字延迟只在有观测时累加：非流式没有「首帧」概念（恒 0），计入会把均值
+	// 拉低失真——分母用 TtfbN 而非请求数，正是为此。
+	if d.HasTTFB {
+		b.TtfbMs += d.TTFBMs
+		b.TtfbN++
+	}
+	if d.HasGenerationMs && d.GenerationMs > 0 {
+		b.GenMs += d.GenerationMs
+	}
+	// 最近活跃时间取本桶内最大值：折叠（小时→日）时取 max 而非覆盖，否则
+	// last_seen 会退回到被折叠的那个小时，看起来像「很久没流量」。
+	if ts := now.Unix(); ts > b.Last {
+		b.Last = ts
+	}
 	r.dirty = true
 }
 
@@ -244,6 +301,18 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.LatN += src.LatN
 			dst.TPS += src.TPS
 			dst.TPSN += src.TPSN
+			// 新增字段同样要折叠，否则小时桶转日桶时缓存/首字观测被静默丢弃。
+			dst.CH += src.CH
+			dst.CM += src.CM
+			dst.CW += src.CW
+			dst.Cr += src.Cr
+			dst.Str += src.Str
+			dst.TtfbMs += src.TtfbMs
+			dst.TtfbN += src.TtfbN
+			dst.GenMs += src.GenMs
+			if src.Last > dst.Last {
+				dst.Last = src.Last
+			}
 		}
 		delete(r.buckets, m.from)
 	}

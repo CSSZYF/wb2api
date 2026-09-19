@@ -278,6 +278,7 @@ func NewHandler(cfg Config) *Handler {
 	h.readTimeout.Store(int64(cfg.ReadTimeout))
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
@@ -758,7 +759,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time) {
+	// recordAttempt 记录一次实际发起的账号尝试（唯一汇聚点）。
+	//
+	// obs 携带统计端点专用的观测（缓存三段 / 真实扣费 / 首字延迟 / 是否流式），
+	// 与 delta 一样来自上游 usage，但目标字段集不同：delta 喂 pool 的账号级账本
+	// （token/延迟/吞吐），obs 喂 usage 记录器的模型级统计。
+	//
+	// 单一埋点：成功、各类错误、传输失败、解析失败全都汇到这里，因此 /v1/stats
+	// 天然覆盖全路径（含失败尝试——重试放大只能靠这一列看出来），不需要在每个
+	// return 前重复记账（那反而会漏分支或双计）。
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, obs attemptObs, started time.Time) {
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -781,6 +791,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
 				realm = a.Realm
 			}
+			// 生成时长 = 端到端 − 首字（纯生成时间），供 tokens/s 折算。首字缺失
+			// （非流式）时退回端到端：那本来就是「整段耗时」，不该凭空扣一个 0。
+			// 只在有 completion 观测时计入分母——失败尝试的耗时不该摊薄吞吐
+			// （分母涨、分子不涨，算出来的 tokens/s 会系统性偏低）。
+			genMs := latencyMs
+			if obs.HasTTFB && obs.TTFB > 0 {
+				if g := latencyMs - obs.TTFB.Milliseconds(); g > 0 {
+					genMs = g
+				}
+			}
 			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
 				PromptTokens:     delta.PromptTokens,
 				HasPromptTokens:  delta.HasPromptTokens,
@@ -792,6 +812,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
+				CacheHit:         obs.CacheHit,
+				CacheMiss:        obs.CacheMiss,
+				CacheWrite:       obs.CacheWrite,
+				HasCache:         obs.HasCache,
+				Credit:           obs.Credit,
+				HasCredit:        obs.HasCredit,
+				Stream:           obs.Stream,
+				TTFBMs:           obs.TTFB.Milliseconds(),
+				HasTTFB:          obs.HasTTFB,
+				GenerationMs:     genMs,
+				HasGenerationMs:  delta.HasCompletionTokens && delta.CompletionTokens > 0,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
 	}
@@ -931,7 +962,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptObs{Stream: peek.Stream}, attemptStarted)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
@@ -942,7 +973,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			// 失败尝试没有 usage：只记「这次尝试发生过（含流式与否）」，token/缓存
+			// 一律不累加——缺失 ≠ 0，累加零值会把失败伪装成「测得 0 token」。
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptObs{Stream: peek.Stream}, attemptStarted)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -1040,7 +1073,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream uid=%s model=%s: empty upstream stream (200+0 frames)", uidPrefix(acct.UID), bareModel)
 			}
-			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
+			// 流式观测一并带出：缓存三段 / 真实扣费 / 首字延迟（供 /v1/stats）。
+			// 与成本账本、pool 账本同源同口径（都读末帧 usage），不二次解析。
+			ch, cm, cw, hasCache := stats.CacheTokens()
+			cr, hasCredit := stats.Credit()
+			recordAttempt(acct.UID, stats.Usage(), attemptObs{
+				Stream:     true,
+				TTFB:       stats.TTFB(),
+				HasTTFB:    stats.HasTTFB(),
+				CacheHit:   int64(ch),
+				CacheMiss:  int64(cm),
+				CacheWrite: int64(cw),
+				HasCache:   hasCache,
+				Credit:     cr,
+				HasCredit:  hasCredit,
+			}, attemptStarted)
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1054,13 +1101,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptObs{Stream: peek.Stream}, attemptStarted)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted)
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), obsFromResponse(resp), attemptStarted)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)

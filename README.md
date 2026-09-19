@@ -171,6 +171,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **auths 目录热加载** | `schedule.auth_watch_seconds`（默认 30）周期扫描 `auth_dir`，手工上传/删除凭证文件免重启生效；写入中的半截文件跳过重试，账号不会因上传中间态出池 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
+| **请求统计端点** | `GET /v1/stats` 按模型聚合 token / 缓存（命中·未命中·写入·命中率）/ 延迟（首字·端到端·吞吐）/ 真实扣费；字段名对齐上游 schema（社区面板依赖），数据取既有用量记录器的只读投影，不打上游 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 
@@ -594,10 +595,58 @@ http://127.0.0.1:7863/panel/
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）；每模型带 `supported_efforts`/`default_effort` 实际思考档位（上游有返回时） |
+| `GET /v1/stats` | Bearer（`api_key` 非空时） | 请求统计：按模型聚合 token / 缓存 / 延迟（可选 `?hours=N` 窗口）。只读本地用量快照，不打上游 |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+
+#### `GET /v1/stats` 请求统计
+
+按模型聚合的请求统计（字段名与上游 `/v1/stats` schema 一致，社区面板 `287775856/workbuddy2api-gui` 按此解析）：
+
+```bash
+curl -s "http://localhost:7863/v1/stats" -H "Authorization: Bearer your-api-key"
+curl -s "http://localhost:7863/v1/stats?hours=24" -H "Authorization: Bearer your-api-key"   # 只看最近 24 小时
+```
+
+响应示例（`total` 与 `models[]` 同结构，为省篇幅只列部分字段；实际每个对象都带全 18 个字段）：
+
+```json
+{
+  "enabled": true,
+  "since": "2026-09-01T10:00:00+08:00",
+  "now": "2026-09-19T09:30:00+08:00",
+  "uptime_sec": 1546200,
+  "total": { "model": "total", "requests": 128, "prompt_tokens": 6227695, "cache_hit_tokens": 6180000 },
+  "models": [
+    {
+      "model": "deepseek-v4.1-flash",
+      "requests": 128, "success": 126, "failed": 2, "streaming": 128,
+      "avg_ttfb_ms": 812.5, "avg_latency_ms": 9420.3, "tokens_per_sec": 33.3,
+      "prompt_tokens": 6227695, "completion_tokens": 9755, "total_tokens": 6237450,
+      "cache_hit_tokens": 6180000, "cache_miss_tokens": 47695, "cache_write_tokens": 0,
+      "cache_hit_rate": 0.9923, "credit": 2.56, "credit_per_req": 0.02,
+      "last_seen": "2026-09-19T09:29:41+08:00"
+    }
+  ]
+}
+```
+
+口径说明：
+
+| 项 | 口径 |
+|---|---|
+| 数据来源 | 既有用量记录器（`data/usage.json`）的**只读投影**，与面板「用量」视图同源。不新建计数器、不落盘、**不打上游**（面板高频轮询不会给上游加压） |
+| `success` / `failed` | 按「这次尝试是否拿到上游 usage」判定：传输错误 / 上游 ≥400 / 无 usage 一律记 `failed`（**失败也计入 `requests`**——重试放大只能靠这一列看出来） |
+| `since` / `uptime_sec` | 数据覆盖区间起点与时长（**跨重启**，因为用量桶落盘）；无数据时 `since = now`、`uptime_sec = 0` |
+| `avg_ttfb_ms` | 首字延迟均值，**分母只含真正观测到首帧的流式请求**：非流式没有「首帧」概念，计入会把均值拉低失真 |
+| `cache_hit_rate` | 分母 = 命中 + 未命中，**不含 write**（写入是「为后续命中付的费」，计入会把首次请求的命中率压低） |
+| `tokens_per_sec` | 按生成时长折算（端到端 − 首字）；旧数据无该列时退回逐请求速率样本均值，不编造 |
+| token / 缓存 / credit | 一律来自上游 usage，缺失即不累加（缺失 ≠ 0），不做 rune 估算 |
+| `?hours=N` | 可选窗口（1..1440，缺省 0 = 全量累计）。按分片覆盖区间过滤，当前小时桶不会被误丢 |
+| 无 `POST /v1/stats/reset` | 与上游的差异：我们的桶是**长期落盘账**，与面板用量视图共用；清空等于永久删历史。需要看增量用 `?hours=` 取窗口 |
+| 未装配记录器 | 仍返回 200 + `enabled:false` + `message`（不返回 404/501，消费方不必特判） |
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
