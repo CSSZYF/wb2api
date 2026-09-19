@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -1181,6 +1182,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 前缀）；空体（WAF 拦截页常见形态）才用本地可读文案兜底。单号偶发 403（IP 门
 	// 未激活）保持 no_healthy_account 通用文案不变。
 	var ue *upstream.Error
+	wafTerminal := false
 	if errors.As(lastErr, &ue) {
 		// 上游错误：hint 按 Kind + 上游原文 + 请求形态判定（upstream.GatewayHint
 		// 单一事实来源）。11133/11135 形态判定在 hint 层自带，ErrClient 家族也
@@ -1188,6 +1190,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 返回空串 → 字段缺席（不编造）。
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
 		if ue.Kind == upstream.ErrWafBlock && h.wafIP.active() {
+			wafTerminal = true
 			code = "waf_ip_blocked"
 			if s := strings.TrimSpace(ue.Msg); s != "" {
 				msg = s
@@ -1196,8 +1199,55 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeOpenAIErrorHint(w, http.StatusServiceUnavailable, code, msg, hint)
-	st.status = http.StatusServiceUnavailable
+	// 末端 429 + Retry-After（上游 da22a92 语义，本 fork 收窄实现）：轮转耗尽且池内
+	// **所有候选都因该模型的限流冷却而出局**时，回 429 + Retry-After，而不是 503
+	// no_healthy_account——「模型被限流」与「池子空了」是两回事，OpenAI 生态客户端对
+	// 429 的退避更规范（503 通常被当成服务端故障，会触发不恰当的重试/熔断）。
+	//
+	// 判定与取值全在 pool.ModelRateLimitExhausted（单一事实来源，含 11102 排除与
+	// 池真空反向判据）；此处只做出口映射。scope 选择：显式 "cn:"/"global:" 前缀是
+	// 用户强指定（选号走硬过滤、不跨域），按该域判定；裸名归属时网关自己会在本域
+	// 无候选时跨域回落（PickExcludingForRealmFallback），故按全池判定——否则会把
+	// 「另一域同样被限」错报成「本域不可用」而漏掉 429。
+	//
+	// WAF IP 级 fail-fast 优先：那是更具体的终态信号（换号/重试都无意义，等窗口），
+	// 语义上不该被 429 覆盖（账号级冷却本就不会写出模型级条目，此处只是显式排他）。
+	status := http.StatusServiceUnavailable
+	retryAfter := 0
+	if !wafTerminal && h.cfg.Pool != nil {
+		scope := realm
+		if !realmExplicit {
+			scope = "" // 裸名归属：回落允许跨域 → 判定范围是全池
+		}
+		if wait, ok := h.cfg.Pool.ModelRateLimitExhausted(bareModel, scope); ok {
+			status = http.StatusTooManyRequests
+			code = "model_rate_limited"
+			hint = upstream.ModelRateLimitedHint()
+			// 向上取整到整数秒（不足 1 秒的余量也计 1 秒）：HTTP 标准头只认秒，
+			// 截断成 0 等于告诉客户端「立刻重试」，与退避语义正好相反。
+			retryAfter = int(wait / time.Second)
+			if wait%time.Second != 0 {
+				retryAfter++
+			}
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			if lastErr == nil {
+				// 无上游原文可透传（选号阶段就无候选，一次上游都没打）：既有本地文案
+				// 「all accounts unavailable (cooling/disabled)」在 429 语境下会被读成
+				// 服务端故障，补一句限定说明「是模型被限流、不是池子坏了」。有上游
+				// 原文时 message 一个字节都不动（透传纪律优先，原文自带语义）。
+				msg = "all accounts unavailable for this model (rate limited upstream, retry after the reset window)"
+			}
+		}
+	}
+	if retryAfter > 0 {
+		// Retry-After 是 HTTP 标准头（秒数）：429 之外不发——503 的既有契约
+		// （no_healthy_account/waf_ip_blocked 文案 + gateway_hint）保持原样不动。
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	}
+	writeOpenAIErrorHint(w, status, code, msg, hint)
+	st.status = status
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。

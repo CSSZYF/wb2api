@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+// modelBlockedReasonPrefix 11102「该后端无此模型」条目在 modelCooldowns[].Reason 上的
+// 判别前缀（写入方 upstream.ModelBlockReason 以 "11102" 开头）。与 6004 条目
+// （"6004 model rate limit"）共用同一 map 承载，凡需要区分二者语义的读取侧一律
+// 以本常量判定，不散落字面量（BlockModelClear 与 modelRateLimitUntil 同一口径）。
+const modelBlockedReasonPrefix = "11102"
+
 // BlockModelBackoff 11102「该后端无此模型」的 (账号, 模型) 负缓存入口（handler.applyErrorPolicy
 // 调用）。复用 modelCooldowns 机制（不新建平行状态）：写 modelCooldowns[model]，Until 为指数退避
 // TTL，选号侧 healthyForModel 自动对该账号避开该模型。
@@ -72,7 +78,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 		return
 	}
 	mc, exists := e.modelCooldowns[model]
-	if !exists || !strings.HasPrefix(mc.Reason, "11102") {
+	if !exists || !strings.HasPrefix(mc.Reason, modelBlockedReasonPrefix) {
 		return
 	}
 	delete(e.modelCooldowns, model)

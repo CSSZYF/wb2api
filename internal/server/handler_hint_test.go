@@ -8,8 +8,11 @@
 //     —— 上游原文逐字出现在 message 里（本批不改 message 一个字节，见
 //     TestChatHintMessageUnchangedAnchor 的锚定断言）；上游 fork 的 message 是裸
 //     body，两边 message 形态差异是既有分歧，**不属于本批范围**（本批只加并列字段）。
-//   - 本 fork 末端状态码恒 503（上游 fork 把 ErrSoftRate 映射 429）；本批不动状态码，
-//     故 hint 用例断言 503 + hint 文案，不照抄上游的 429 断言。
+//   - 本 fork 末端状态码默认 503；**唯一例外**是 v1.9.19 起的「模型级冷却耗尽」
+//     窄分支（池内候选全因该模型的 6004 冷却出局 → 429 + Retry-After，对齐上游
+//     da22a92 的 realm_model_throttled 语义，见 rateexhaust_test.go）。本文件的
+//     6004 锚定用例 body **不带**重置墙钟 → 该 fork 走账号级 CooldownSoftRate
+//     （不写 modelCooldowns），因此仍是 503，断言不变。
 //   - ErrContentBlocked 本 fork 有「不泄露上游 11128」的既有口径
 //     （handler_test.go TestContentBlockedCustomModeDoesNotDegrade），故
 //     content_blocked 的 message 用网关防火墙文案、hint 措辞不含 "upstream"。
@@ -230,7 +233,10 @@ func TestChatHintMessageUnchangedAnchor(t *testing.T) {
 			wantHint: "upstream has no such model on this backend; switch model or retry on another account",
 		},
 		{
-			name:     "6004 软限流 末端出口",
+			// 无重置墙钟的 6004 → applyErrorPolicy 走**账号级** CooldownSoftRate
+			// （不写 modelCooldowns）→ 不构成「模型级冷却耗尽」，仍是 503。
+			// 带重置墙钟的 6004 才走模型级冷却（其耗尽出口是 429，见 rateexhaust_test.go）。
+			name:     "6004 软限流（无重置墙钟→账号级）末端出口",
 			status:   429,
 			body:     `{"code":6004,"msg":"您的使用量已超出频率限制","requestId":"r"}`,
 			wantCode: "no_healthy_account",
@@ -389,8 +395,8 @@ func TestChatContentBlockedHintNoUpstreamWordNo11128(t *testing.T) {
 	}
 }
 
-// TestChatSoftRateHint 软限流末端（本 fork 恒 503）→ rate limit hint + message
-// 逐字含上游原文。
+// TestChatSoftRateHint 软限流末端（无重置墙钟的 6004 → 账号级冷却，末端仍 503）
+// → rate limit hint + message 逐字含上游原文。
 func TestChatSoftRateHint(t *testing.T) {
 	const raw = `{"code":6004,"msg":"您的使用量已超出频率限制","requestId":"r"}`
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -400,9 +406,9 @@ func TestChatSoftRateHint(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
-	// 本 fork 末端恒 503（状态码映射是既有分歧，本批不动）。
+	// 无重置墙钟 → 账号级软冷却（非模型级）→ 末端保持 503（429 只给模型级冷却耗尽）。
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("code=%d want 503 (fork terminal status)", rec.Code)
+		t.Fatalf("code=%d want 503 (account-level cooling terminal)", rec.Code)
 	}
 	var e hintEnvelope
 	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
