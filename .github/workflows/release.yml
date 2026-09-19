@@ -1,0 +1,394 @@
+# 三平台二进制包发布：tag push（或对已存在的旧 tag 手工补发）→ GitHub Release。
+#
+# 与 docker.yml 的分工（两份文件别合并，它们的产物、权限、失败面都不一样）：
+#   docker.yml  → 容器镜像，推 GHCR，权限 contents:read + packages:write，不建 Release；
+#   release.yml → Windows / Linux / macOS 裸二进制压缩包，建 Release，需要 contents:write。
+# 共用同一条版本约定：唯一来源 = git tag，且**原样采用**（tag v1.9.19 → 版本 v1.9.19），
+# 手工触发又没有 tag 时明确标 v0.0.0-dev，绝不产出一个"看起来正式"的号。
+#
+# 归档名保留 v 前缀（wb2api_v1.9.19_linux_amd64.tar.gz）：归档名、Release 标题、
+# -X main.appVersion 注入值吃的是同一个字符串，保留 v 就不必再加一步"剥 v"的转换。
+# 少一次字符串变换，就少一处"文件名和二进制里版本号对不上"的机会。
+#
+# 用 gh CLI 建 Release 而不是 softprops/action-gh-release：本仓现有 workflow 只用了
+# actions/* 官方 action，引一个第三方 action 等于把仓库写权限交给它；gh 是 runner 自带的
+# 官方 CLI，--verify-tag / --clobber / --generate-notes 已覆盖全部所需，零新增供应链面。
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # 为什么要有带 tag 输入的 workflow_dispatch：本文件得先落在 main 上才可能被手工触发，
+  # 而历史 tag（v1.9.19 等）是在本文件之前打的，push 事件早过去了。
+  # 补发时 checkout 必须切到那个 tag —— 触发 ref 是 main，切到 main 会拿错源码，
+  # 发出去的包版本号和内容对不上，比不发更糟。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要补发 Release 的 tag（形如 v1.9.19）。留空则用当前触发 ref；分支 ref 不构成发布，见 resolve job 的提示。'
+        required: false
+        type: string
+
+# 建 Release + 传 asset 需要写 contents。docker.yml 只推 GHCR，所以那边是 contents:read。
+permissions:
+  contents: write
+
+# 同一个 tag 的两次发布（tag push 与补发 dispatch）并发跑会撞在 gh release create 上：
+# 后到者拿到 422 already_exists，而不是走幂等分支。排队执行即可各自走对分支。
+# cancel-in-progress 必须为 false —— 不能中途掐掉一次正在上传 asset 的发布。
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # 版本号解析单独成一个 job：build 矩阵（5 个 runner）与 release 都要用同一个字符串，
+  # 只在一处算出来，避免"归档名里是 A、二进制里是 B"这种漂移。
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      is_release: ${{ steps.v.outputs.is_release }}
+    steps:
+      - name: 解析版本号并校验 tag 真实存在
+        id: v
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          # 优先级：手工输入 > 触发 ref。都没有 = 在分支上试跑，不构成发布。
+          if [ -n "${INPUT_TAG:-}" ]; then
+            V="${INPUT_TAG}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            V="${GITHUB_REF_NAME}"
+          else
+            V="v0.0.0-dev"
+          fi
+
+          if [ "$V" = "v0.0.0-dev" ]; then
+            echo "version=$V" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::触发 ref 是 ${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}，没有可发布的 tag；版本号按约定标 ${V}，本次只产出 workflow artifact，不建 Release、不打 tag。要对已存在的 tag 补发，请用 workflow_dispatch 并在 tag 输入框填 v1.9.19。"
+            exit 0
+          fi
+
+          # tag 必须是 v*：push 触发那边由 tags: ["v*"] 兜住，手工输入这边得自己挡。
+          # 归档名与 Release 标题直接吃这个字符串，混进一个非版本 tag（如 backup-2026）
+          # 会产出 wb2api_backup-2026_linux_amd64.tar.gz 这种没法看的号。
+          case "$V" in
+            v*) ;;
+            *) echo "::error::tag '$V' 不以 v 开头，不符合本仓 v* 版本 tag 约定"; exit 1 ;;
+          esac
+
+          # 补发场景最容易错的不是构建而是 tag 名字打错（v1.9.1 / v1.9.19 / v1.9.9）。
+          # 不在这里挡，错误会散成 5 个 build job 各自的 "couldn't find remote ref"，
+          # 得翻 5 份日志才知道是同一个拼写问题。
+          if ! gh api "repos/${REPO}/git/ref/tags/${V}" >/dev/null 2>&1; then
+            echo "::error::远端不存在 tag ${V}；补发前先确认 tag 名，或先把 tag 推上去"; exit 1
+          fi
+
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "is_release=true" >> "$GITHUB_OUTPUT"
+          echo "resolved version: $V"
+
+  test:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 手工补发时要切到目标 tag，否则验的是 main 而不是待发布的代码
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet + test
+        run: |
+          go vet ./...
+          go test ./...
+
+  build:
+    # 先过 test 再编：5 个 runner 各自跑一遍交叉编译不算便宜，红树上没必要产出发布包
+    needs: [resolve, test]
+    runs-on: ubuntu-latest
+    strategy:
+      # fail-fast: false —— 一个平台挂掉不该连坐另外 4 个。需要的是"一次跑完看清
+      # 到底哪几个平台有问题"，而不是被第一个失败立刻掐断、剩下的连编都没编。
+      fail-fast: false
+      matrix:
+        os: [windows, linux, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          # windows/arm64 暂不发（本次范围只要 5 个目标）。要加就删掉这行，
+          # 下游打包 / 校验逻辑全部由矩阵驱动，不认平台数量。
+          - os: windows
+            goarch: arm64
+    env:
+      # GOOS/GOARCH 走 env 而不是写在命令行：-trimpath、CGO_ENABLED 一起给，交叉编译
+      # 不需要目标平台的工具链（CGO_ENABLED=0），所以 5 个目标全在 ubuntu 上编，
+      # 不用 macOS runner（其计费倍率是 Linux 的 10 倍）。
+      GOOS: ${{ matrix.os }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: "0"
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 编译主程序与三个工具
+        run: |
+          set -euo pipefail
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          PKG="wb2api_${VERSION}_${GOOS}_${GOARCH}"
+          echo "PKG=${PKG}" >> "$GITHUB_ENV"
+          echo "EXT=${EXT}" >> "$GITHUB_ENV"
+          mkdir -p "dist/${PKG}"
+          # -X main.appVersion：与 Dockerfile 完全同口径（版本号注入点只有一个）。
+          # 另外三个 cmd 没有 appVersion 变量，-X 对它们是无害空转 —— 保留是为了
+          # 四个二进制命令行完全一致，将来谁加了版本透出也不用回来改这里。
+          LDFLAGS="-s -w -X main.appVersion=${VERSION}"
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/${PKG}/wb2api${EXT}"     ./cmd/server
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/${PKG}/signin_bin${EXT}" ./cmd/signin
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/${PKG}/login${EXT}"      ./cmd/login
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/${PKG}/credit${EXT}"     ./cmd/credit
+          ls -l "dist/${PKG}"
+
+      - name: 构建期自检——核对产物架构与版本注入
+        run: |
+          # 故意不开 -e：要让 4 个二进制的问题一次全报出来，而不是第一个就退出。
+          set -uo pipefail
+          fail=0
+          for b in wb2api signin_bin login credit; do
+            bin="dist/${PKG}/${b}${EXT}"
+            if [ ! -f "$bin" ]; then
+              echo "::error::缺少产物 $bin"; fail=1; continue
+            fi
+            # buildinfo 里带 GOOS/GOARCH，用它断言，不依赖 file(1)。
+            # 这道检查是补 Dockerfile 里踩过的坑：那边只验了 manifest 里"层存在"，
+            # 没验层里的二进制是什么架构，于是 amd64 二进制进了 arm64 镜像，
+            # exec format error 一路漏到集群上。发布包同样不能只看"文件在不在"。
+            info="$(go version -m "$bin")"
+            if printf '%s\n' "$info" | grep -q "GOOS=${GOOS}$" \
+               && printf '%s\n' "$info" | grep -q "GOARCH=${GOARCH}$"; then
+              echo "  架构 OK   ${b}${EXT}  ->  ${GOOS}/${GOARCH}"
+            else
+              echo "::error::${b}${EXT} 的架构不是 ${GOOS}/${GOARCH}"
+              printf '%s\n' "$info"
+              fail=1
+            fi
+          done
+
+          # 版本注入自检只对 wb2api 做，而且是**按字节搜字符串**，两条都不是随手写的：
+          #  1) 只有 cmd/server 有 appVersion 这个变量，-X 对另外三个 cmd 是空转，
+          #     对它们搜版本号必然搜不到（实测：工具二进制里确实没有），搜了就是误报；
+          #  2) 不能用 buildinfo 查 -ldflags —— 加了 -trimpath 之后 Go 会把 -ldflags
+          #     从 build settings 里整条丢掉（本机实测：不带 -trimpath 有这行，
+          #     带上就没了），所以只能直接搜二进制里的版本字符串。
+          # 注入静默失效时（比如有人"顺手清理"了 LDFLAGS 变量）二进制不会报错，只会
+          # 悄悄带着源码里的旧 appVersion 发出去，面板显示的版本号就是假的——这正是
+          # "tag 版本 ≠ 源码默认版本"时唯一能挡住的检查点。
+          MAIN_BIN="dist/${PKG}/wb2api${EXT}"
+          if grep -qaF -- "${VERSION}" "$MAIN_BIN"; then
+            echo "  版本 OK   wb2api${EXT}  ->  ${VERSION}"
+          else
+            echo "::error::wb2api${EXT} 里找不到版本字符串 ${VERSION}（-X main.appVersion 没生效？）"
+            fail=1
+          fi
+          [ "$fail" = 0 ] || { echo "::error::产物自检未通过，中止发布"; exit 1; }
+
+      - name: 组包内容
+        run: |
+          set -euo pipefail
+          STAGE="dist/${PKG}"
+          cp config.example.json README.md LICENSE "$STAGE/"
+          cp login.sh signin.sh credit.sh "$STAGE/"
+          mkdir -p "$STAGE/scripts"
+          cp scripts/probe_active.py "$STAGE/scripts/"
+          if [ "$GOOS" = "windows" ]; then
+            # .cmd 只进 Windows 包：它们靠 cmd.exe + PowerShell 的 Start-Process 管进程、
+            # 写 wb2api.pid，在 Linux/macOS 上是死代码。反过来 shell 脚本三个平台都放，
+            # 是为了包内容跨平台一致（对照 README 排错时少一个变量）。
+            cp start-wb2api.cmd stop-wb2api.cmd status-wb2api.cmd "$STAGE/"
+          fi
+          # .gitattributes 已声明 * text=auto eol=lf，正常检出就是 LF；这里再 sed 一遍是
+          # 防"有人改了 .gitattributes / 加了个 CRLF 脚本"。CR 会让 Linux/macOS 上
+          # `./login.sh` 直接 `bad interpreter: No such file or directory`，
+          # 而且报错完全看不出是行尾问题。与 Dockerfile 同一手法、同一理由。
+          sed -i 's/\r$//' "$STAGE/login.sh" "$STAGE/signin.sh" "$STAGE/credit.sh" \
+                           "$STAGE/scripts/probe_active.py"
+          # 二进制也要显式给可执行位：tar 会原样保留权限位，Linux/macOS 上 wb2api 不是
+          # 755 的话用户解压后得先 chmod 才能跑，而 login.sh 内部是 `exec ./login`，
+          # 权限不对时报的是 "Permission denied"，与"包坏了"看起来一样。
+          # （go build 在 Linux 上本来就产出 755，这里是把它钉死，不受 runner umask 影响。）
+          chmod 755 "$STAGE/wb2api${EXT}" "$STAGE/signin_bin${EXT}" \
+                    "$STAGE/login${EXT}" "$STAGE/credit${EXT}"
+          chmod 755 "$STAGE/login.sh" "$STAGE/signin.sh" "$STAGE/credit.sh" \
+                    "$STAGE/scripts/probe_active.py"
+          # 行尾断言用 tr 数 CR 字节数，不用 grep：Git Bash 的 grep 按文本模式读文件，
+          # CR 被当行尾吃掉，`grep -q $'\r' CRLF文件` 在本地实测返回"不匹配"——
+          # 照搬这个写法会在本地得到与 CI（GNU grep）相反的结论，白折腾一轮。
+          # tr 是逐字节的，两个平台结论一致。
+          cr_count() { tr -cd '\r' < "$1" | wc -c; }
+          for f in "$STAGE/login.sh" "$STAGE/signin.sh" "$STAGE/credit.sh"; do
+            if [ "$(cr_count "$f")" != "0" ]; then
+              echo "::error::$f 里仍有 CR，LF 归一没生效"; exit 1
+            fi
+          done
+          # 反向断言：.cmd 必须仍是 CRLF —— cmd.exe 解析 LF-only 的 if 块 / goto 有边缘
+          # 风险（见 start-wb2api.cmd 头注释），.gitattributes 就是为这个才把 *.cmd 钉成
+          # eol=crlf。sed 手滑或检出配置被改，这里挡住。
+          if [ "$GOOS" = "windows" ]; then
+            for f in "$STAGE"/*.cmd; do
+              if [ "$(cr_count "$f")" = "0" ]; then
+                echo "::error::$f 不是 CRLF，cmd.exe 可能误解析 if 块"; exit 1
+              fi
+            done
+          fi
+          find "$STAGE" -type f | sort
+
+      - name: 归档 + 单包 sha256
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # 分格式的理由：
+          #  - Windows 用 zip：资源管理器双击即开，Windows 上大概率没有 tar；且 zip 不带
+          #    POSIX 权限位，Windows 侧本来也不看它（靠 .exe / .cmd 后缀识别可执行）。
+          #  - Linux / macOS 用 tar.gz：保留可执行位，`tar xzf` 出来 `./login.sh` 直接能跑；
+          #    这也是这两个平台的默认归档格式。
+          if [ "$GOOS" = "windows" ]; then
+            ART="${PKG}.zip"
+            zip -q -r -9 "$ART" "$PKG"
+          else
+            ART="${PKG}.tar.gz"
+            tar -czf "$ART" "$PKG"
+          fi
+          # 每个矩阵 job 只能算自己这一个包的 sha256（并行时别人的包还不存在），
+          # 全量 SHA256SUMS 由 release job 汇总。这里先落一个"一行清单"，
+          # 内容就是 sha256sum -c 认的格式，汇总时直接拼。
+          sha256sum "$ART" > "${ART}.sha256"
+          cat "${ART}.sha256"
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.os }}-${{ matrix.goarch }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, test, build]
+    # 只有解析出真 tag 才建 Release：分支上手工试跑（v0.0.0-dev）只留 workflow artifact。
+    # 少了这个 if，一次"跑着玩"的 dispatch 会凭空造出 v0.0.0-dev 这个 tag + Release。
+    if: needs.resolve.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # gh 认仓库有三条路：--repo / GH_REPO / 本地 remote。这里显式给 GH_REPO，
+      # 不让它去猜（下面的 checkout 只是保证 gh 需要本地上下文时也有）。
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # 5 个矩阵 job 各传了一个 artifact，摊平进同一个目录再汇总；
+          # 文件名自带 os/arch，不会撞名。
+          merge-multiple: true
+
+      - name: 汇总全量 SHA256SUMS 并自验
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          rm -f ./*.sha256
+          # 自验：拼出来的清单必须能验过全部包。少一行 / 截断 / 串了名字的话，
+          # 用户下载后 `sha256sum -c` 失败——而那时包已经发出去了，只能事后补救。
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 生成 Release 说明（版本号进标题也进正文）
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Windows 包名从实际产物取（保持"命名只有一处定义"），取不到时退回按约定拼一个，
+          # 免得 glob 空掉让这行说明静默变成 `Get-FileHash .\ -Algorithm SHA256`。
+          ZIP_NAME="$(ls ./*.zip 2>/dev/null | head -n1 | sed 's#^\./##' || true)"
+          ZIP_NAME="${ZIP_NAME:-wb2api_${VERSION}_windows_amd64.zip}"
+          {
+            printf '## wb2api %s\n\n' "$VERSION"
+            printf '解压即用。包内：主程序 `wb2api`（Windows 为 `wb2api.exe`）、工具 `signin_bin` / `login` / `credit`、'
+            printf '`config.example.json`、`README.md`、`LICENSE`、`login.sh` / `signin.sh` / `credit.sh`、'
+            printf '`scripts/probe_active.py`；Windows 包另含 `start-wb2api.cmd` / `stop-wb2api.cmd` / `status-wb2api.cmd`。\n\n'
+            printf '### 资产\n\n'
+            for f in *.zip *.tar.gz; do
+              printf -- '- `%s`\n' "$f"
+            done
+            printf '\n### 校验\n\n'
+            printf '```bash\n# Linux / macOS\nsha256sum -c SHA256SUMS\n```\n\n'
+            printf '```powershell\n# Windows\nGet-FileHash .\\%s -Algorithm SHA256\n```\n' "$ZIP_NAME"
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: 建 Release（已存在则只覆盖 asset）
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # 幂等策略：先看 Release 在不在，在就只覆盖同名 asset（--clobber），不在才 create。
+          # 不用"先删后建"：删掉会把已经写好的说明 / 评论 / 外部引用一起带走，且删除到重建
+          # 之间 Release 是 404；重复跑（改了 CI、补一个平台）不该有这种副作用。
+          # --verify-tag：只挂已存在的 tag，绝不顺手造一个新 tag（gh 默认会在 tag 缺失时
+          # 按 --target 现造一个，那正是这里要避免的）。
+          #
+          # 是否标 Latest 必须显式判断：补发旧 tag（v1.9.19 而 v1.10.0 已是 Latest）若把
+          # Latest 抢过来，仓库首页会指回旧版 —— 而"补发旧 tag"正是本 workflow 支持的场景。
+          # 判断依据取 /releases/latest（单对象接口）而不是"最高 tag"：后者要靠
+          # /git/refs/tags 列表，那个接口的分页行为不可靠（实测 cli/cli 这种上千 tag 的仓库，
+          # 带不带 --paginate 返回条数一模一样），一旦被截断就会把旧版当新版。
+          LATEST_ARGS=(--latest=false)
+          CUR_LATEST=""
+          if CUR_LATEST="$(gh api "repos/${GH_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null)"; then
+            # 只有比当前 Latest 更新才接手。版本比较用 sort -V（v1.10.0 > v1.9.19）。
+            if [ "$(printf '%s\n%s\n' "$CUR_LATEST" "$VERSION" | sort -V | tail -n1)" = "$VERSION" ]; then
+              LATEST_ARGS=(--latest)
+            fi
+          else
+            # 404：仓库还没有任何 Release，第一个发布就该是 Latest。
+            # （gh 在 404 时会把错误 JSON 打到 stdout，所以这里显式清掉，免得下面那行日志
+            #   打印出一坨 {"message":"Not Found"} 让人以为出错了。）
+            CUR_LATEST=""
+            LATEST_ARGS=(--latest)
+          fi
+          echo "当前 Latest=${CUR_LATEST:-（无 Release）}；本次 ${VERSION} -> ${LATEST_ARGS[*]}"
+
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release ${VERSION} 已存在，只覆盖同名 asset（说明与 tag 保持原样）"
+            gh release upload "$VERSION" --clobber ./*.zip ./*.tar.gz SHA256SUMS
+          else
+            # --notes-file 的内容会**前置**在 --generate-notes 自动生成的条目之前
+            # （GitHub 的 body + generate_release_notes 语义），所以版本号进正文、
+            # 变更列表照旧自动生成。
+            gh release create "$VERSION" \
+              --title "wb2api ${VERSION}" \
+              --verify-tag \
+              --generate-notes \
+              --notes-file release-notes.md \
+              "${LATEST_ARGS[@]}" \
+              ./*.zip ./*.tar.gz SHA256SUMS
+          fi
