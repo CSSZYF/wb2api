@@ -13,6 +13,8 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // TestAppJSSyntax app.js 必须能通过 JS 解析器语法校验。
@@ -242,6 +244,21 @@ func jsFuncBody(src, sig string) string {
 	return ""
 }
 
+// jsFuncFull 返回 src 中名为 sig 的函数的**完整文本**（含签名），用于在 node 里
+// 实跑纯函数（jsFuncBody 只给花括号体，拼起来不是合法语句）。找不到返回空串。
+func jsFuncFull(src, sig string) string {
+	body := jsFuncBody(src, sig)
+	if body == "" {
+		return ""
+	}
+	i := strings.Index(src, sig)
+	j := strings.Index(src[i:], body)
+	if j < 0 {
+		return ""
+	}
+	return src[i : i+j+len(body)]
+}
+
 // TestPanelOverviewExposesModelLimitLedger 面板 overview 必须把模型级冷却台账透出给前端
 // （app.js 读的就是这些键）：6004 条目带 reset_at（上游权威恢复墙钟），11102 条目
 // reset_at 为零值而 until 为退避 TTL——前端正是据此退回 until 显示恢复时间。
@@ -313,6 +330,227 @@ func TestPanelOverviewExposesModelLimitLedger(t *testing.T) {
 		if !strings.HasPrefix(r.Reason, "11102") {
 			t.Errorf("11102 条目 reason 前缀应可判别：%+v", r)
 		}
+	}
+}
+
+// TestPanelOverviewExposesCreditsExpiring 缺陷 B 的端到端回归：overview 的 accounts[]
+// 必须带 credits_expiring（面板积分列直接读它），且三态在 JSON 上可区分——
+// ① 有快过期 → 键带数值；② 无快过期但总额已知 → 键缺席 + credits_total 在场；
+// ③ 旧 state/未知 → 两者都缺席。② 与 ③ 不分会让前端把「没有」渲染成「0 分快过期」。
+func TestPanelOverviewExposesCreditsExpiring(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}) // ① 有快过期
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", ExpiresAt: 9999999999}) // ② 总额已知、无快过期
+	p.Add(&auth.Auth{UID: "u3", AccessToken: "at", ExpiresAt: 9999999999}) // ③ 旧 state
+	p.SetCreditsDetailed("u1", 1000, 2000, 300)
+	p.SetCreditsDetailed("u2", 500, 800, 0)
+	up := upstream.New()
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+
+	pn := New(Config{Version: "test", APIKey: "test-key", Pool: p, Upstream: up, Scheduler: sch})
+	req := httptest.NewRequest("GET", "/panel/api/overview", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	pn.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var got struct {
+		ExpiringSoonSec int64 `json:"expiring_soon_sec"`
+		Accounts        []struct {
+			UID             string `json:"uid"`
+			CreditsTotal    int64  `json:"credits_total"`
+			CreditsExpiring *int64 `json:"credits_expiring"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("overview JSON 解析失败：%v", err)
+	}
+	// 窗口随 overview 下发（前端提示文案据此说清依据，不写死 168h）。
+	if got.ExpiringSoonSec != int64((7 * 24 * time.Hour).Seconds()) {
+		t.Errorf("overview.expiring_soon_sec=%d want %d（pool.expiring_soon 解析值）",
+			got.ExpiringSoonSec, int64((7 * 24 * time.Hour).Seconds()))
+	}
+	byUID := map[string]struct {
+		CreditsTotal    int64  `json:"credits_total"`
+		CreditsExpiring *int64 `json:"credits_expiring"`
+	}{}
+	for _, a := range got.Accounts {
+		byUID[a.UID] = struct {
+			CreditsTotal    int64  `json:"credits_total"`
+			CreditsExpiring *int64 `json:"credits_expiring"`
+		}{a.CreditsTotal, a.CreditsExpiring}
+	}
+	if v := byUID["u1"].CreditsExpiring; v == nil || *v != 300 {
+		t.Errorf("① u1 credits_expiring=%v want 300（字段缺失即缺陷 B）", v)
+	}
+	if v := byUID["u2"].CreditsExpiring; v != nil {
+		t.Errorf("② u2 无快过期时不应出现 credits_expiring：%v", *v)
+	}
+	if byUID["u2"].CreditsTotal != 800 {
+		t.Errorf("② u2 必须有 credits_total（前端据此判定「窗口内没有」而非「未知」）：%d", byUID["u2"].CreditsTotal)
+	}
+	if v := byUID["u3"].CreditsExpiring; v != nil {
+		t.Errorf("③ u3（旧 state）不应有 credits_expiring：%v", *v)
+	}
+	if byUID["u3"].CreditsTotal != 0 {
+		t.Errorf("③ u3（旧 state）不应有 credits_total：%d", byUID["u3"].CreditsTotal)
+	}
+}
+
+// TestAppJSExpiringThreeStates 前端三态判定逻辑（纯 JS，用 node 实跑函数体）：
+// ① 有值 → 显示数值；② 字段缺席/0 且总额已知 → **不**显示成「快过期 0」；
+// ③ 旧 state/未知 → 与 ② 同处理（不显示数值），文案说明依据。
+//
+// 为什么在 Go 里跑 node：app.js 是 go:embed 静态资源（Go 编译器不校验其内容），
+// 本仓没有 JS 测试框架（frontend_test.go 的既有做法是 node --check 语法校验）。
+// 这里把 expiringWindowText/expiringNote 的函数体抽出来，在 node 里以真实入参调用，
+// 断言三态可区分且窗口文案来自参数（不写死 168h）；无 node 环境时跳过。
+func TestAppJSExpiringThreeStates(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping JS logic check")
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	winFn := jsFuncFull(src, "function expiringWindowText(")
+	noteFn := jsFuncFull(src, "function expiringNote(")
+	if winFn == "" || noteFn == "" {
+		t.Fatal("app.js 缺 expiringWindowText/expiringNote（快过期三态判定的纯函数）")
+	}
+	script := winFn + "\n" + noteFn + `
+const win7 = expiringWindowText(604800);   // 168h
+const win3 = expiringWindowText(259200);   // 72h
+const out = {
+  win: { w7: win7, w3: win3, w1h: expiringWindowText(3600), wOff: expiringWindowText(0) },
+  notes: {
+    some: expiringNote({ credits_expiring: 120, credits_total: 8406 }, win7),
+    some3: expiringNote({ credits_expiring: 120, credits_total: 8406 }, win3),
+    none: expiringNote({ credits_total: 8406 }, win7),   // omitempty：0 时字段缺席
+    zero: expiringNote({ credits_expiring: 0, credits_total: 8406 }, win7),
+    old: expiringNote({ credits: 500 }, win7),           // 旧 state：无总额
+    off: expiringNote({ credits_total: 8406 }, ''),      // 窗口未知/为 0：分桶未启用
+  },
+};
+console.log(JSON.stringify(out));
+`
+	fp := filepath.Join(t.TempDir(), "expiring_check.js")
+	if err := os.WriteFile(fp, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, fp).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node 运行失败: %v\n%s", err, out)
+	}
+	type noteCase struct {
+		Kind string `json:"kind"`
+		Text string `json:"text"`
+		Tip  string `json:"tip"`
+	}
+	var got struct {
+		Win   map[string]string   `json:"win"`
+		Notes map[string]noteCase `json:"notes"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("node 输出解析失败: %v\n%s", err, out)
+	}
+	// 窗口文案由秒数算出（不写死 168h/7 天）：同一函数在不同窗口给出不同文案。
+	if got.Win["w7"] != "7 天" || got.Win["w3"] != "3 天" {
+		t.Errorf("expiringWindowText 天数换算错误：%v", got.Win)
+	}
+	if got.Win["w1h"] != "1 小时" || got.Win["wOff"] != "" {
+		t.Errorf("expiringWindowText 小时/禁用窗口回落错误：%v", got.Win)
+	}
+	// ① 有值 → 明确显示数值 + 文案带窗口依据
+	if s := got.Notes["some"]; s.Kind != "some" || !strings.Contains(s.Text, "120") || !strings.Contains(s.Tip, "7 天") {
+		t.Errorf("① 有快过期应显示数值并带窗口依据：%+v", s)
+	}
+	// ② 无值（字段缺席或 0）→ 不显示成「快过期 0」，文案说清是窗口内没有
+	for _, k := range []string{"none", "zero"} {
+		s := got.Notes[k]
+		if s.Kind != "none" {
+			t.Errorf("② %s 应判为 none（无快过期但总额已知）：%+v", k, s)
+		}
+		if s.Text != "" {
+			t.Errorf("② %s 不得渲染任何数值标记（避免「0 分快过期」误导）：%+v", k, s)
+		}
+		if !strings.Contains(s.Tip, "7 天") {
+			t.Errorf("② %s 的提示必须说明依据窗口：%+v", k, s)
+		}
+	}
+	// ③ 旧 state/未知 → 与 ② 同处理（不显示数值），但 kind 可区分
+	if s := got.Notes["old"]; s.Kind != "unknown" || s.Text != "" {
+		t.Errorf("③ 旧 state 应判为 unknown 且不显示数值：%+v", s)
+	}
+	if got.Notes["none"].Kind == got.Notes["old"].Kind {
+		t.Error("②「无快过期」与 ③「未知」必须可区分（否则前端无法说明依据）")
+	}
+	// ④ 窗口未知/为 0（分桶未启用）→ 不得谎称「没有快过期」，与 ② 也必须可区分。
+	if s := got.Notes["off"]; s.Kind != "off" || s.Text != "" {
+		t.Errorf("④ 分桶未启用应判为 off 且不显示数值：%+v", s)
+	}
+	if got.Notes["off"].Kind == got.Notes["none"].Kind {
+		t.Error("④「分桶未启用」与 ②「窗口内没有」必须可区分（否则会谎报没有快过期积分）")
+	}
+	// 窗口参数化：3 天窗口下文案必须是 3 天（证明不是硬编码 168h/7 天）。
+	if !strings.Contains(got.Notes["some3"].Tip, "3 天") {
+		t.Errorf("窗口文案必须来自配置参数：%+v", got.Notes["some3"])
+	}
+}
+
+// TestAppJSCreditsExpiringWiring 前端接线完整性：overview 的 expiring_soon_sec 必须被
+// 读、积分列必须渲染快过期标记、手动刷新 toast 必须带上快过期信息（本 issue 的
+// 直接诉求是「到期积分不显示」，只修后端不接线等于没修）。
+func TestAppJSCreditsExpiringWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+	for _, want := range []string{
+		"expiring_soon_sec",            // 窗口来源（后端按 pool.expiring_soon 解析后下发）
+		"credits_expiring",             // 三态判据字段
+		"function expiringNote(",       // 三态判定
+		"function expiringWindowText(", // 窗口文案
+		"function expiringToast(",      // toast 后缀
+		"function expiringOf(",         // 账号行用的三态结果（窗口取自 overview）
+		"expiringOf(s)",                // renderAccounts 接线
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("app.js 缺快过期积分接线：%q", want)
+		}
+	}
+	body := jsFuncBody(s, "function renderAccounts(")
+	if body == "" {
+		t.Fatal("app.js 缺 renderAccounts")
+	}
+	if !strings.Contains(body, "expiringOf(") {
+		t.Error("renderAccounts 未渲染快过期标记（积分列）")
+	}
+	// toast 文案（签到 / 余额刷新两处）必须带快过期信息。
+	for _, sig := range []string{"accounts/' + encodeURIComponent(u) + '/checkin'", "accounts/' + encodeURIComponent(u) + '/balance'"} {
+		i := strings.Index(s, sig)
+		if i < 0 {
+			t.Fatalf("app.js 缺 %s 调用", sig)
+		}
+		tail := s[i:]
+		if end := strings.Index(tail, "} else"); end > 0 {
+			tail = tail[:end]
+		}
+		if !strings.Contains(tail, "expiringToast(") {
+			t.Errorf("%s 的 toast 未带快过期信息：%s", sig, tail)
+		}
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(html), ".cred .exp") {
+		t.Error("index.html 缺 .cred .exp 样式（快过期标记沿用积分列的既有样式体系）")
 	}
 }
 

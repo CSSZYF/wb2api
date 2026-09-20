@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -155,6 +156,25 @@ func New(cfg Config) *Scheduler {
 // expiringSoonWindow 返回当前生效的快过期窗口（原子读；<=0 = 禁用分桶）。
 func (s *Scheduler) expiringSoonWindow() time.Duration {
 	return time.Duration(s.expiringSoonNanos.Load())
+}
+
+// ExpiringSoonWindow 导出形态（面板手动签到/余额刷新按**同一窗口**分桶，避免面板与
+// 调度器给出两种答案）；语义同 expiringSoonWindow，热改后立即一致。
+func (s *Scheduler) ExpiringSoonWindow() time.Duration {
+	return s.expiringSoonWindow()
+}
+
+// logBalance 每个账号每轮一条余额分桶日志（签到/后台刷新共用，形如
+//
+//	balance uid=a1b2c3d4 剩余=8059/8406 快过期=0（窗口=168h，包裹数=3，可解析到期=2，最近到期=2026-09-25 00:00:00）
+//
+// 存在的理由：面板上「快过期=0」有两种完全不同的成因——**窗口内确实没有**到期积分
+// （正常，无需处理）与**根本没解析到任何 CycleEndTime**（上游字段变化/解析失败，
+// 需要排查）。只看数字分不出来，故把分桶依据（窗口/包裹数/可解析到期数/最近到期）
+// 一并打进日志，让运维能自证是哪种情况。uid 只打 8 位（logfmt 契约，全量 uid 不进日志）。
+// 频率：每账号每轮一条（后台余额刷新默认 5 分钟一轮），不刷屏。
+func logBalance(uid string, remain, total, expiring int64, diag upstream.ResourceDiag) {
+	log.Printf("balance uid=%s %s", logfmt.UID8(uid), upstream.BalanceLine(remain, total, expiring, diag))
 }
 
 // SetExpiringSoonWindow 热更新快过期积分窗口（面板保存 pool.expiring_soon 后调用）。
@@ -433,15 +453,18 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 		}
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.expiringSoonWindow())
+		remain, total, expiring, diag, err := s.cfg.Upstream.UserResourceDetailedDiag(a, s.expiringSoonWindow())
 		if err != nil {
 			log.Printf("user-resource %s: %v", st.UID, err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		if expiring > 0 {
-			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring)
-		}
+		// 分桶同步**无条件**执行（含 expiring==0）：零值同样是真值——积分到期/窗口缩小/
+		// 上游不再下发 CycleEndTime 后必须把上一轮的非零值复位，否则陈旧值永久留存
+		// （缺陷 A）。与 ReenableIfCredits 分工：那个写余额+解冻（带解冻语义，不可被
+		// 无解冻语义的入口替代），这个只写分桶观测量。
+		s.cfg.Pool.SetCreditsExpiring(st.UID, expiring)
+		logBalance(st.UID, remain, total, expiring, diag)
 	}
 	s.RunStreakBonusNow()
 	s.runSchool(ctx) // 开学季活动（活动期 9/13-9/24，结束自动跳过）
@@ -577,21 +600,23 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.expiringSoonWindow())
+			remain, total, expiring, diag, err := s.cfg.Upstream.UserResourceDetailedDiag(a, s.expiringSoonWindow())
 			if err != nil {
 				log.Printf("balance %s: %v", uid, err)
 				return
 			}
-			// 与 RunCheckinNow 同一形态（两分支语义统一）：解冻判定一律走
+			// 与 runCheckin 同一形态（两分支语义统一）：解冻判定一律走
 			// ReenableIfCredits（内部按收窄规则判定：仅有效硬冷却 CoolHard 解冻，
-			// 软冷却/模型级冷却只更新 credits），带分桶时再叠加 SetCreditsDetailed
-			// 记录快过架子集。旧实现把两件事塞进 if/else 二选一，导致「有快过期积分
-			// 的硬冷却账号」永不解冻（SetCreditsDetailed 不含解冻语义）——分支语义
-			// 分裂，同一账号是否解冻取决于上游是否返回 expiring 分桶。
+			// 软冷却/模型级冷却只更新 credits），随后**无条件**同步快过架子集
+			// （SetCreditsExpiring 含 expiring==0 的复位；它不含解冻语义，故不能替代
+			// ReenableIfCredits，两者是正交的两件事——旧实现把分桶塞进 if 分支，
+			// 导致 expiring==0 时陈旧值永久留存，即缺陷 A）。
+			// 历史教训（勿退回 if/else 二选一）：两件事塞进 if/else 时，「有快过期积分
+			// 的硬冷却账号」永不解冻——分支语义分裂，同一账号是否解冻取决于上游是否
+			// 返回 expiring 分桶。
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			if expiring > 0 {
-				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
-			}
+			s.cfg.Pool.SetCreditsExpiring(uid, expiring)
+			logBalance(uid, remain, total, expiring, diag)
 		}(a, st.UID)
 	}
 	wg.Wait()

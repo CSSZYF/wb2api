@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1792,6 +1793,74 @@ func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 // 与 softRateResetLoc 同口径）。响应侧到期字段与请求侧过滤串实测同格式，共用一个常量。
 const packageEndLayout = "2006-01-02 15:04:05"
 
+// ResourceDiag 一次余额查询的分桶诊断（只读，不参与任何判定）：回答「快过期=0 到底是
+// 窗口内确实没有，还是根本没解析到到期时间」——上游字段变化/解析失败时，只看 expiring=0
+// 无法区分这两件事，正是「快过期积分不显示」的排查盲区。
+type ResourceDiag struct {
+	// Soon 本次分桶使用的窗口（<=0 = 禁用分桶，全部归长期）。
+	Soon time.Duration
+	// Packages 上游返回的套餐条目数（billing meter Accounts 数组长度）。
+	Packages int
+	// WithEnd CycleEndTime 非空且解析成功的条目数。>0 说明「窗口内没有」是**可证的**
+	// （字段投递正常，只是都不在窗口内）；==0 且 Packages>0 说明上游没给/字段变了。
+	// 只看字段是否可解析，不看余额是否为 0（诊断的是字段投递，不是分桶结果）。
+	WithEnd int
+	// BadEnd CycleEndTime 非空但解析失败的条目数（>0 = 上游字段格式变了，不是"没有到期"）。
+	BadEnd int
+	// NearestEnd 最早的可解析到期时刻（含已过期的条目：上游按 PackageEndTimeRangeBegin=now
+	// 过滤，正常不该出现已过期的包，出现即上游数据异常，日志里直接可见）。
+	// 零值 = 一条都没解析到。
+	NearestEnd time.Time
+}
+
+// NearestEndText 最近到期时刻的可读文案（按上游墙钟 UTC+8 输出，与官网/面板展示同口径）；
+// 没有任何可解析到期时间时返回空串（调用方据此省略该段）。
+func (d ResourceDiag) NearestEndText() string {
+	if d.NearestEnd.IsZero() {
+		return ""
+	}
+	return d.NearestEnd.In(softRateResetLoc).Format(packageEndLayout)
+}
+
+// windowText 窗口的可读文案：<=0 显式标注「禁用分桶」——否则日志里的「快过期=0」
+// 会被读成"确实没有快过期积分"，而实际是分桶被配置关掉了（pool.expiring_soon=0）。
+// 整小时/整分钟窗口去掉 Duration.String 的 0m0s 尾巴（168h0m0s → 168h），与
+// pool.expiring_soon 配置值的写法一致（运维一眼对上配置）。
+func (d ResourceDiag) windowText() string {
+	if d.Soon <= 0 {
+		return "0s(禁用分桶)"
+	}
+	switch {
+	case d.Soon%time.Hour == 0:
+		return strconv.FormatInt(int64(d.Soon/time.Hour), 10) + "h"
+	case d.Soon%time.Minute == 0:
+		return strconv.FormatInt(int64(d.Soon/time.Hour), 10) + "h" +
+			strconv.FormatInt(int64(d.Soon/time.Minute)%60, 10) + "m"
+	default:
+		return d.Soon.String()
+	}
+}
+
+// BalanceLine 余额分桶的日志正文（调度器/面板共用同一口径，便于 grep 与对照），形如：
+//
+//	剩余=8059/8406 快过期=0（窗口=168h，包裹数=3，可解析到期=2，最近到期=2026-09-25 00:00:00）
+//
+// 括号内全是诊断：窗口（分桶是否被禁用）、包裹数、可解析到期数（0 = 上游没给/字段变了，
+// 与"窗口内没有"是两回事）、到期字段坏（仅在解析失败时出现）、最近到期（仅在可解析时出现）。
+func BalanceLine(remain, total, expiring int64, d ResourceDiag) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "剩余=%d/%d 快过期=%d（窗口=%s，包裹数=%d，可解析到期=%d",
+		remain, total, expiring, d.windowText(), d.Packages, d.WithEnd)
+	if d.BadEnd > 0 {
+		fmt.Fprintf(&b, "，到期字段坏=%d", d.BadEnd)
+	}
+	if t := d.NearestEndText(); t != "" {
+		fmt.Fprintf(&b, "，最近到期=%s", t)
+	}
+	b.WriteString("）")
+	return b.String()
+}
+
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
 // soon > 0 且套餐 CycleEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
 // （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
@@ -1804,7 +1873,22 @@ const packageEndLayout = "2006-01-02 15:04:05"
 //
 // 注意：请求体里的 PackageEndTimeRangeBegin/End 是**过滤参数**，与响应侧到期字段
 // 同名但无关，不得改动。
+//
+// 需要分桶诊断（「窗口内没有」vs「没解析到到期时间」）时用 UserResourceDetailedDiag，
+// 本函数即其薄封装（分桶语义只有一处实现，不存在两条路径漂移）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+	remain, total, expiring, _, err = c.UserResourceDetailedDiag(a, soon)
+	return remain, total, expiring, err
+}
+
+// UserResourceDetailedDiag 同 UserResourceDetailed，额外返回分桶诊断（ResourceDiag）：
+// 调用方（调度器/面板）据此把「窗口内确实没有快过期积分」与「根本没解析到任何
+// CycleEndTime」区分开并写进日志——前者不是故障，后者是上游字段变化/解析失败。
+//
+// 为什么是变体而不是给 UserResourceDetailed 加返回值：分桶语义被 6 个既有用例逐字锁定
+// （soon<=0 禁用分桶、忽略 PackageEndTime、缺/坏 EndTime 归长期），改签名等于改动全部
+// 调用点与断言；变体是纯增量，既有签名/用例逐字不变。
+func (c *Client) UserResourceDetailedDiag(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, diag ResourceDiag, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1816,7 +1900,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 	}
 	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, diag, err
 	}
 	var resp struct {
 		Response struct {
@@ -1835,8 +1919,9 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, diag, fmt.Errorf("resource parse: %w", err)
 	}
+	diag.Soon = soon
 	for _, acct := range resp.Response.Data.Accounts {
 		var r, size int64
 		switch {
@@ -1855,17 +1940,25 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		}
 		remain += r
 		total += size
+		diag.Packages++
 		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
-		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
+		if acct.CycleEndTime != "" {
 			// 上游时间为 UTC+8 墙钟（与 softRateResetLoc 同口径，官网展示时区）。
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil {
-				if !end.After(now.Add(soon)) {
+			end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc)
+			if perr != nil {
+				diag.BadEnd++ // 字段在但格式变了：诊断上必须与"字段缺失"分开
+			} else {
+				diag.WithEnd++
+				if diag.NearestEnd.IsZero() || end.Before(diag.NearestEnd) {
+					diag.NearestEnd = end
+				}
+				if soon > 0 && r > 0 && !end.After(now.Add(soon)) {
 					expiring += r
 				}
 			}
 		}
 	}
-	return remain, total, expiring, nil
+	return remain, total, expiring, diag, nil
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。

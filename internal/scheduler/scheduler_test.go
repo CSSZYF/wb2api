@@ -256,13 +256,12 @@ func creditsExpiringFromState(t *testing.T, fp, uid string) int64 {
 
 // TestSetExpiringSoonWindowHotApplies 热改快过期窗口（面板 pool.expiring_soon）后，
 // 下一轮余额刷新立即按**新窗口**分桶：窗口 1h 时"3 天后到期"的余额不计入，
-// 热改为 30d 后同一账号立即被计入。
+// 热改为 30d 后同一账号立即被计入，再缩回 1h 又复位为 0。
 //
-// 为什么以"放大窗口"为判据：pool 侧只在 expiring>0 时写入（SetCreditsDetailed），
-// 所以缩小窗口不会主动清掉陈旧分桶——但那是**既有语义**，重启也一样（creditsExpiring
-// 持久化在 state.json，恢复后同样只在下次分桶时被覆盖），故热改与重启严格等价。
-// 放大窗口则必然经过一次真实写入，能区分"读到新窗口"与"仍读启动初值"：
-// 若读取点仍读 cfg.ExpiringSoonWindow（本用例注入的 1h），第二次断言必失败。
+// 两个方向都要断言：放大窗口必然经过一次真实写入，能区分"读到新窗口"与"仍读启动初值"
+// （若读取点仍读 cfg.ExpiringSoonWindow 这个启动初值，放大后的断言必失败）；缩回窗口
+// 则验证 expiring==0 的复位（缺陷 A：旧实现在 expiring>0 才写分桶，缩小窗口后陈旧值
+// 永久留存——热改与重启都不该让旧分桶残留）。
 func TestSetExpiringSoonWindowHotApplies(t *testing.T) {
 	// 到期时间 = UTC+8 的 3 天后（30d 窗口内、1h 窗口外）。
 	cst := time.FixedZone("CST", 8*3600)
@@ -296,11 +295,15 @@ func TestSetExpiringSoonWindowHotApplies(t *testing.T) {
 		t.Fatalf("热改为 30d 窗口后 creditsExpiring=%d want 100（应在窗口内）", got)
 	}
 
-	// 再缩回 1h：不主动清旧分桶（与重启行为一致——见用例注释），但新账号不再分桶。
+	// 再缩回 1h：本轮上游仍报"3 天后到期"，但已不在窗口内 → 必须复位为 0
+	// （缺陷 A：旧实现只在 expiring>0 时写分桶，此处会残留 100）；新账号同样为 0。
 	s.SetExpiringSoonWindow(time.Hour)
 	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	s.RunBalanceRefreshNow()
 	p.Flush()
+	if got := creditsExpiringFromState(t, fp, "u1"); got != 0 {
+		t.Fatalf("缩回 1h 后 u1 creditsExpiring=%d want 0（陈旧分桶必须复位）", got)
+	}
 	if got := creditsExpiringFromState(t, fp, "u2"); got != 0 {
 		t.Fatalf("缩回 1h 后新账号 u2 creditsExpiring=%d want 0", got)
 	}
@@ -593,5 +596,194 @@ func TestCheckinAndKeepaliveIncludeManualDisabled(t *testing.T) {
 	// 仍不参与选号（活性照常 ≠ 可用）。
 	if got := p.Pick(); got != nil {
 		t.Fatalf("停用号仍不应被选中, got %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 快过期积分（缺陷 A：expiring==0 时陈旧值永不复位）
+//
+// 旧形态（runCheckin / RunBalanceRefreshNow 两处同形）：
+//
+//	ReenableIfCredits(uid, remain, total)
+//	if expiring > 0 { SetCreditsDetailed(uid, remain, total, expiring) }
+//
+// expiring==0 时分支不进入 → creditsExpiring 保持上一轮的非零值（积分到期/窗口缩小/
+// 上游不再下发到期字段后，选号权重与面板都还在按陈旧值行事）。
+// ---------------------------------------------------------------------------
+
+// mutableExpiringStub 到期时间可运行期改口的 get-user-resource 桩（余额固定 100）：
+// 用于构造「先分桶为非零、再刷新为 0」的序列（缺陷 A 的核心回归形态）。
+// end 为空串 = 响应**不带** CycleEndTime 字段（模拟上游不给到期时间）。
+type mutableExpiringStub struct{ end atomic.Value }
+
+func newMutableExpiringStub(end string) *mutableExpiringStub {
+	s := &mutableExpiringStub{}
+	s.end.Store(end)
+	return s
+}
+
+func (m *mutableExpiringStub) set(end string) { m.end.Store(end) }
+
+func (m *mutableExpiringStub) server() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/get-user-resource") {
+			http.Error(w, "not found", 404)
+			return
+		}
+		acct := `{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0}`
+		if end, _ := m.end.Load().(string); end != "" {
+			acct = `{"PackageName":"p","CycleEndTime":"` + end + `","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0}`
+		}
+		w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[` + acct + `]}}}}`))
+	}))
+}
+
+// cstWallClock 把时刻格式化成上游 CycleEndTime 的墙钟串（UTC+8，与 softRateResetLoc 同口径）。
+func cstWallClock(tt time.Time) string {
+	return tt.In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05")
+}
+
+// TestRunBalanceRefreshResetsExpiringToZero 余额刷新路径的核心回归：expiring==0 时
+// 必须把 creditsExpiring 复位为 0（旧实现只在 expiring>0 时写分桶）。
+func TestRunBalanceRefreshResetsExpiringToZero(t *testing.T) {
+	stub := newMutableExpiringStub(cstWallClock(time.Now().Add(72 * time.Hour)))
+	srv := stub.server()
+	defer srv.Close()
+
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := pool.New(fp)
+	defer p.Close()
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+
+	s.RunBalanceRefreshNow()
+	if st, _ := p.Status("u1"); st.CreditsExpiring != 100 {
+		t.Fatalf("前置：3 天后到期在 7 天窗内，credits_expiring=%d want 100", st.CreditsExpiring)
+	}
+
+	// 上游改口：到期时间推到 30 天后（7 天窗外）→ 本轮必须把分桶复位为 0。
+	stub.set(cstWallClock(time.Now().Add(30 * 24 * time.Hour)))
+	s.RunBalanceRefreshNow()
+	st, _ := p.Status("u1")
+	if st.CreditsExpiring != 0 {
+		t.Errorf("窗口外刷新后 credits_expiring=%d want 0（expiring==0 必须复位，陈旧值永久留存即缺陷 A）", st.CreditsExpiring)
+	}
+	if st.Credits != 100 {
+		t.Errorf("余额本身照常更新：credits=%d want 100", st.Credits)
+	}
+	// 落盘口径同步：state.json 不再残留旧分桶（重启后也不会失忆地沿用）。
+	p.Flush()
+	if got := creditsExpiringFromState(t, fp, "u1"); got != 0 {
+		t.Errorf("state.json credits_expiring=%d want 0（陈旧分桶已复位）", got)
+	}
+}
+
+// TestRunCheckinResetsExpiringToZero 签到路径同形缺陷的回归（两处必须一起修，
+// 否则「签到 09:00/21:00」这条更常跑的路径仍会把陈旧值写回去）。
+func TestRunCheckinResetsExpiringToZero(t *testing.T) {
+	stub := newMutableExpiringStub(cstWallClock(time.Now().Add(72 * time.Hour)))
+	srv := stub.server()
+	defer srv.Close()
+
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := pool.New(fp)
+	defer p.Close()
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+
+	s.RunCheckinNow()
+	if st, _ := p.Status("u1"); st.CreditsExpiring != 100 {
+		t.Fatalf("前置：签到后 3 天后到期的余额应计入，credits_expiring=%d want 100", st.CreditsExpiring)
+	}
+
+	stub.set(cstWallClock(time.Now().Add(30 * 24 * time.Hour)))
+	s.RunCheckinNow()
+	if st, _ := p.Status("u1"); st.CreditsExpiring != 0 {
+		t.Errorf("签到刷新后 credits_expiring=%d want 0（签到路径同样必须复位）", st.CreditsExpiring)
+	}
+}
+
+// TestRunCheckinExpiringKeepsReviveSemantics 分桶同步与解冻是两件事，都不得回归：
+//   - 硬冷却（余额耗尽）账号余额恢复 → 照常解冻（ReenableIfCredits 既有语义），分桶写入；
+//   - 软冷却账号 → **不**被签到解冻（issue #199 收窄），但分桶照常写入
+//     （SetCreditsExpiring 无解冻语义，只同步观测量）。
+func TestRunCheckinExpiringKeepsReviveSemantics(t *testing.T) {
+	stub := newMutableExpiringStub(cstWallClock(time.Now().Add(72 * time.Hour)))
+	srv := stub.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "hard", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "soft", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Cooldown("hard", pool.CoolHard, time.Hour, "余额不足")
+	p.CooldownSoftRate("soft", time.Hour, time.Time{}, "429 rate limit")
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	s.RunCheckinNow()
+
+	hard, _ := p.Status("hard")
+	if hard.Cooling {
+		t.Errorf("硬冷却账号余额恢复应照常解冻：%+v", hard)
+	}
+	if hard.CreditsExpiring != 100 {
+		t.Errorf("硬冷却解冻路径也必须写入分桶：credits_expiring=%d want 100", hard.CreditsExpiring)
+	}
+	soft, _ := p.Status("soft")
+	if !soft.Cooling {
+		t.Errorf("软冷却账号不得被签到解冻（issue #199）：%+v", soft)
+	}
+	if soft.CreditsExpiring != 100 {
+		t.Errorf("软冷却账号的分桶照常写入（分桶 ≠ 解冻）：credits_expiring=%d want 100", soft.CreditsExpiring)
+	}
+}
+
+// TestBalanceDiagLogDistinguishesNoExpiryFromNoParse 诊断日志（本任务关键交付）：
+// 每个账号每轮一条，让运维一眼区分
+//   - 「窗口内确实没有快过期积分」（有可解析到期时间，但都在窗口外）；
+//   - 「根本没解析到任何 CycleEndTime」（上游字段变化/解析失败，不是"没有"）。
+//
+// 日志形如：
+//
+//	balance uid=01234567 剩余=100/100 快过期=0（窗口=168h，包裹数=1，可解析到期=1，最近到期=2026-09-24 05:00:00）
+func TestBalanceDiagLogDistinguishesNoExpiryFromNoParse(t *testing.T) {
+	const uid = "0123456789abcdef"
+	sink := captureLog(t)
+
+	// ① 到期时间在窗口外（窗口 1h，到期在 3 天后）→ 快过期=0，但可解析到期=1 且有最近到期。
+	stub := newMutableExpiringStub(cstWallClock(time.Now().Add(72 * time.Hour)))
+	srv := stub.server()
+	defer srv.Close()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: time.Hour})
+	s.RunBalanceRefreshNow()
+
+	got := sink.String()
+	if n := strings.Count(got, "balance uid=01234567"); n != 1 {
+		t.Fatalf("每账号每轮应恰好一条分桶日志，got %d 条：\n%s", n, got)
+	}
+	if strings.Contains(got, uid) {
+		t.Errorf("日志不得泄漏全量 uid（只打 uid8）：\n%s", got)
+	}
+	for _, want := range []string{"剩余=100/100", "快过期=0", "窗口=1h", "包裹数=1", "可解析到期=1", "最近到期="} {
+		if !strings.Contains(got, want) {
+			t.Errorf("分桶日志缺 %q（窗口内没有 vs 没解析到 必须可分）：\n%s", want, got)
+		}
+	}
+
+	// ② 响应不带 CycleEndTime → 可解析到期=0，且**不带**最近到期段（区分「没解析到」）。
+	sink.Reset()
+	stub.set("")
+	s.RunBalanceRefreshNow()
+	got = sink.String()
+	if !strings.Contains(got, "可解析到期=0") {
+		t.Errorf("无到期字段时应报 可解析到期=0：\n%s", got)
+	}
+	if strings.Contains(got, "最近到期=") {
+		t.Errorf("没有任何可解析到期时间时不应出现最近到期段：\n%s", got)
 	}
 }

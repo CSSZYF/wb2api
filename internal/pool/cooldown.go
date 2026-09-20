@@ -17,9 +17,12 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	}
 }
 
-// SetCreditsDetailed 更新账号余额/总额 + 快过架子集（签到与余额刷新时调用，
-// 供选号优先消耗快过期积分）。expiring 会被钳到 [0, credits]：上游分桶异常时
-// 不污染权重。
+// SetCreditsDetailed 一次性原子写入余额/总额 + 快过架子集（供测试与需要同时落三者的
+// 调用方使用）。expiring 会被钳到 [0, credits]：上游分桶异常时不污染权重。
+//
+// 生产路径（签到 / 余额刷新 / 面板刷新）已拆成两步：ReenableIfCredits（余额 + 既有
+// 解冻语义）+ SetCreditsExpiring（分桶，含 expiring==0 的复位）——分桶与解冻必须解耦，
+// 理由见 SetCreditsExpiring 的注释（旧实现把分桶塞进 if 分支 = 缺陷 A）。
 func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -35,6 +38,45 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
 		e.creditsExpiring = expiring
 		p.dirty.Store(true)
 	}
+}
+
+// SetCreditsExpiring 只把「快过期积分子集」同步成真值（credits 的一部分，见
+// entry.creditsExpiring），**不动** credits/creditsTotal，也不碰任何冷却/熔断/降权状态。
+//
+// 为什么必须有这个入口（缺陷 A）：分桶值由「本轮上游是否给出窗口内到期时间」决定，
+// 而**零值同样是真值**——积分到期、窗口缩小（pool.expiring_soon 调小）、上游不再下发
+// CycleEndTime 之后，expiring==0 必须把上一轮的非零值复位。旧实现在 expiring>0 才写
+// （SetCreditsDetailed 落在 if 分支里），expiring==0 时该字段保持陈旧非零值：
+// 选号第四因子（快过期优先消耗）与面板显示会一直按旧值行事，且**永不自我纠正**。
+//
+// 为什么不合并进 ReenableIfCredits / 复用 SetCreditsDetailed：
+//   - ReenableIfCredits 带「解冻」语义（remain>0 且账号处于有效硬冷却才清冷却域，
+//     软冷却/模型级冷却**不**被余额恢复解冻，issue #199）。把分桶写进它会让
+//     「是否解冻」与「是否分桶」重新耦合——那正是旧实现 if/else 二选一的老毛病
+//     （有快过期积分的硬冷却账号曾因此永不解冻）；
+//   - 给 ReenableIfCredits 加 expiring 参数会改动全部既有调用点与测试的签名，且让
+//     一个函数同时承担两件事（解冻判定 + 观测同步），语义不再单一；
+//   - SetCreditsDetailed 会连带改写 credits/creditsTotal，而余额口径的唯一写入者
+//     应当是 ReenableIfCredits（它内含解冻分支），二者叠加写同一字段属职责重叠。
+//
+// 调用约定：与 ReenableIfCredits **成对**调用（先它、后本函数），两者职责正交——
+// 前者写余额与解冻，后者只写分桶。入参 expiring 钳到 [0, e.credits]（与
+// SetCreditsDetailed / 恢复侧 applyAccountsLocked 同口径）。
+func (p *Pool) SetCreditsExpiring(uid string, expiring int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	if expiring < 0 {
+		expiring = 0
+	}
+	if expiring > e.credits {
+		expiring = e.credits
+	}
+	e.creditsExpiring = expiring
+	p.dirty.Store(true)
 }
 
 // Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）。

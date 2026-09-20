@@ -62,16 +62,24 @@ type TokenUsageDelta struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Credits       int64     `json:"credits"`
-	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（有界退避指数；有重置时间时不计数，见 entry.softStreak）
+	UID          string `json:"uid"`
+	Nickname     string `json:"nickname,omitempty"`
+	Credits      int64  `json:"credits"`
+	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// CreditsExpiring 快过期积分子集（credits 的一部分，见 entry.creditsExpiring），
+	// 口径与 credits_total 一致：0 = 未知/无（omitempty 省略）。
+	//
+	// 面板据此展示「快过期 N」并区分三态——① >0：明确显示数值；② ==0 且
+	// credits_total>0：总额已知、窗口内确实没有（**不得**渲染成「0 分快过期」，
+	// 那会让人以为功能坏了）；③ credits_total 也为 0（旧 state/未刷新过）：未知。
+	// 缺本字段时前端无从显示快过期部分（缺陷 B：字段从不透出）。
+	CreditsExpiring int64     `json:"credits_expiring,omitempty"`
+	Cooling         bool      `json:"cooling"`
+	CoolKind        string    `json:"cool_kind,omitempty"`
+	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
+	Until           time.Time `json:"until,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
+	SoftStreak      int       `json:"soft_streak,omitempty"` // 连续软冷却次数（有界退避指数；有重置时间时不计数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。

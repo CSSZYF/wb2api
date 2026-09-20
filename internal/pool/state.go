@@ -552,6 +552,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,
+		// 快过期积分子集（credits 的一部分）：与 credits/creditsTotal 同源同快照，
+		// 面板据此显示「快过期 N」。0 时经 omitempty 省略——前端配合 credits_total
+		// 判「窗口内确实没有」（总额已知）还是「未知」（旧 state）。
+		CreditsExpiring: e.creditsExpiring,
 		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
 		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
 		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),

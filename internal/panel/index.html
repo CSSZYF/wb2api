@@ -260,6 +260,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .cred { min-width: 84px; }
 .cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
 .cred .n .of { color: var(--ink-3); font-size: 11px; }
+/* 快过期积分子集标记（credits_expiring>0 时才渲染）：与积分进度条同一列、同一套
+   令牌（warn 色 = 需留意但非故障），不引入新的视觉体系。0/未知/分桶未启用时不渲染，
+   避免「0 分快过期」这种误导性读数（判定见 app.js expiringNote）。 */
+.cred .exp { margin-top: 3px; font: 500 10.5px/1.25 var(--sans); color: var(--warn); white-space: nowrap; }
 .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; max-width: 88px; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
 .tag {
