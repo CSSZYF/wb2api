@@ -184,6 +184,78 @@ function modelLimitTag(list, quiet) {
     '" title="' + esc(rows.join(' / ')) + '">' + (allBlocked ? '模型不可用 ' : '模型限流 ') + list.length + '</span></div>';
 }
 
+/* ── 快过期积分（credits_expiring）───────────────────────────────────── */
+/* 后端在 overview 的 accounts[] 里给出 credits_expiring（快过期的积分子集，是 credits
+   的一部分），口径与 credits_total 一致：0 = 未知/无（omitempty 省略）。三态必须分开
+   呈现，不能都渲染成一个数字——本 issue 的原始困惑正是「看不到快过期积分」：
+     ① 'some'    有值（>0）           → 明确显示数值；
+     ② 'none'    0/字段缺席 且总额已知 → 窗口内确实没有（**不**显示「0 分快过期」，
+                                        那会让人以为功能坏了）；
+     ③ 'unknown' 总额也未知（旧 state）→ 不显示数值，提示说明是未知；
+     ④ 'off'     窗口未知/已禁用       → 不显示数值，也不谎称「没有」（分桶根本没跑）。
+   窗口值来自后端 overview.expiring_soon_sec（即 config 的 pool.expiring_soon 解析后的
+   热生效值），不写死 168h。 */
+
+// 快过期窗口的可读文案：秒 → 「7 天」/「1 小时」/「30 分钟」；0/未知 → 空串（= 分桶未启用）。
+function expiringWindowText(sec) {
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n % 86400 === 0) return (n / 86400) + ' 天';
+  if (n % 3600 === 0) return (n / 3600) + ' 小时';
+  return Math.round(n / 60) + ' 分钟';
+}
+
+// expiringNote 三态（+未启用）判定与文案。纯函数：窗口文案由调用方传入（便于单测）。
+// 返回 { kind, text, tip, short }：text 是积分列里的可见标记（无值时为空串），
+// tip 是积分 tooltip 的补充说明，short 是手动刷新 toast 的后缀。
+function expiringNote(s, win) {
+  const exp = Number((s && s.credits_expiring) || 0);
+  const total = Number((s && s.credits_total) || 0);
+  const w = win || '';
+  const inWin = w ? w + '内' : '快过期窗口内';
+  if (exp > 0) {
+    return {
+      kind: 'some',
+      text: '快过期 ' + exp,
+      tip: '其中 ' + exp + ' 分将在' + inWin + '到期',
+      short: '（快过期 ' + exp + '）',
+    };
+  }
+  if (total > 0 && w) {
+    return {
+      kind: 'none',
+      text: '',
+      tip: '快过期：无（' + inWin + '没有到期积分）',
+      short: '（' + w + '内无快过期）',
+    };
+  }
+  if (total > 0) {
+    // 总额已知但窗口未知/为 0：分桶未启用（pool.expiring_soon=0）——不能说「没有快过期」。
+    return {
+      kind: 'off',
+      text: '',
+      tip: '快过期：分桶未启用（pool.expiring_soon 为 0 或未取到窗口值）',
+      short: '',
+    };
+  }
+  return {
+    kind: 'unknown',
+    text: '',
+    tip: '快过期：未知（旧 state 或尚未刷新过余额）',
+    short: '',
+  };
+}
+
+// 账号行/卡片用的三态结果（窗口取自 overview，后端按 pool.expiring_soon 解析后下发）。
+function expiringOf(s) {
+  return expiringNote(s, expiringWindowText(overviewData && overviewData.expiring_soon_sec));
+}
+
+// 手动签到/余额刷新的 toast 后缀（同口径：有值报数值，无值说清依据窗口，未知/未启用不谎报）。
+function expiringToast(r) {
+  return expiringOf(r).short;
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -227,7 +299,11 @@ function renderAccounts(list) {
     const pct = s.credits_total > 0
       ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
       : Math.round((s.credits || 0) / maxCred * 100);
-    const credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    // 快过期部分：有值时在积分旁追加小标记（沿用积分列的样式体系），无值/未知只在
+    // tooltip 里说明依据——把「没有」渲染成「0 分快过期」会让人以为功能坏了。
+    const exp = expiringOf(s);
+    const expTag = exp.text ? '<div class="exp" title="' + esc(exp.tip) + '">' + esc(exp.text) + '</div>' : '';
+    const credTip = (s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）') + '；' + exp.tip;
     // 「解冻」只针对惩罚态（禁用/冷却/熔断/降权）；临时停用不属惩罚态，用「恢复」。
     const frozen = broken || cool > 0;
     const tu = s.token_usage || {};
@@ -241,7 +317,7 @@ function renderAccounts(list) {
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + modelLimitTag(s.rate_limited_models, frozen) + '</td>' +
-      '<td class="cred" title="' + credTip + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div>' + expTag + '</td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
@@ -306,10 +382,10 @@ $('accBody').addEventListener('click', async ev => {
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + expiringToast(r) + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
-      toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+      toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : '') + expiringToast(r), 'ok');
     } else if (a === 'revive') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       // 解冻只清惩罚态，不动临时停用位——仍是临时停用时必须说清「为什么还不能用」。

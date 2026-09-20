@@ -931,6 +931,114 @@ func TestUserResourceDetailedRequestKeepsPackageEndTimeRange(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 分桶诊断（UserResourceDetailedDiag）：让调用方区分「窗口内确实没有快过期积分」
+// 与「根本没解析到任何 CycleEndTime」（运维诉求：到期积分不显示时能自证是哪种情况）。
+//
+// 为什么新增变体而不是改 UserResourceDetailed 签名：上面 6 个既有用例逐字锁定分桶
+// 语义（含「忽略 PackageEndTime」「缺/坏 EndTime 归长期」），签名一变它们全部要改；
+// 变体把「语义」与「诊断」分开——UserResourceDetailed 委托变体实现，返回值不变。
+// ---------------------------------------------------------------------------
+
+// TestUserResourceDetailedDiagNearestEnd 诊断字段：包裹数 / 可解析到期数 / 坏字段数 /
+// 最近到期时刻（最早的可解析到期，含已过期——上游按 PackageEndTimeRangeBegin=now 过滤，
+// 正常不该出现，出现即数据异常，日志里直接可见）。
+func TestUserResourceDetailedDiagNearestEnd(t *testing.T) {
+	in3d := time.Now().In(softRateResetLoc).Add(3 * 24 * time.Hour).Format(packageEndLayout)
+	in30d := time.Now().In(softRateResetLoc).Add(30 * 24 * time.Hour).Format(packageEndLayout)
+	c := resourceStub(
+		`{"PackageName":"奖励包","CycleEndTime":"` + in3d + `","CycleCapacitySize":1500,"CycleCapacityRemain":1200,"CycleCapacityUsed":300},` +
+			`{"PackageName":"周期包","CycleEndTime":"` + in30d + `","CycleCapacitySize":500,"CycleCapacityRemain":300,"CycleCapacityUsed":200},` +
+			`{"PackageName":"无到期","CycleCapacitySize":100,"CycleCapacityRemain":90,"CycleCapacityUsed":10},` +
+			`{"PackageName":"坏字段","CycleEndTime":"not-a-time","CycleCapacitySize":10,"CycleCapacityRemain":5,"CycleCapacityUsed":5}`)
+	remain, _, expiring, diag, err := c.UserResourceDetailedDiag(&auth.Auth{AccessToken: "at"}, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("detailed diag: %v", err)
+	}
+	// 分桶口径与 UserResourceDetailed 完全一致（变体只多返回诊断）。
+	if remain != 1595 || expiring != 1200 {
+		t.Errorf("remain=%d expiring=%d want 1595/1200（分桶口径不得与 UserResourceDetailed 分叉）", remain, expiring)
+	}
+	if diag.Packages != 4 {
+		t.Errorf("diag.Packages=%d want 4（上游返回的套餐条目数）", diag.Packages)
+	}
+	if diag.WithEnd != 2 {
+		t.Errorf("diag.WithEnd=%d want 2（可解析 CycleEndTime 的条目数）", diag.WithEnd)
+	}
+	if diag.BadEnd != 1 {
+		t.Errorf("diag.BadEnd=%d want 1（非空但解析失败的条目数）", diag.BadEnd)
+	}
+	if diag.Soon != 7*24*time.Hour {
+		t.Errorf("diag.Soon=%v want 168h（本次分桶实际使用的窗口）", diag.Soon)
+	}
+	want, _ := time.ParseInLocation(packageEndLayout, in3d, softRateResetLoc)
+	if !diag.NearestEnd.Equal(want) {
+		t.Errorf("diag.NearestEnd=%v want %v（最早的到期时刻）", diag.NearestEnd, want)
+	}
+	// 最近到期的可读文案：上游墙钟格式（UTC+8），供日志行直接拼用。
+	if got := diag.NearestEndText(); got != in3d {
+		t.Errorf("NearestEndText()=%q want %q", got, in3d)
+	}
+}
+
+// TestUserResourceDetailedDiagNoEndTime 响应里没有任何可解析 CycleEndTime 时：
+// WithEnd=0、NearestEnd 零值、NearestEndText 空串——调用方据此把
+// 「窗口内没有」与「根本没解析到」区分开（后者是上游字段变化/解析失败）。
+func TestUserResourceDetailedDiagNoEndTime(t *testing.T) {
+	c := resourceStub(`{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}`)
+	_, _, expiring, diag, err := c.UserResourceDetailedDiag(&auth.Auth{AccessToken: "at"}, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("detailed diag: %v", err)
+	}
+	if expiring != 0 || diag.WithEnd != 0 || diag.BadEnd != 0 || diag.Packages != 1 {
+		t.Errorf("expiring=%d diag=%+v want 0/WithEnd=0/BadEnd=0/Packages=1", expiring, diag)
+	}
+	if !diag.NearestEnd.IsZero() || diag.NearestEndText() != "" {
+		t.Errorf("无可解析到期时间时 NearestEnd 应为零值、文案为空：%+v %q", diag.NearestEnd, diag.NearestEndText())
+	}
+}
+
+// TestUserResourceDetailedDiagDisabledWindow soon<=0（禁用分桶）时诊断照样给出窗口与
+// 到期信息：运维据日志判断"分桶被关掉了"（而不是"没有快过期积分"）。
+func TestUserResourceDetailedDiagDisabledWindow(t *testing.T) {
+	in1h := time.Now().In(softRateResetLoc).Add(time.Hour).Format(packageEndLayout)
+	c := resourceStub(`{"PackageName":"p","CycleEndTime":"` + in1h + `","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}`)
+	_, _, expiring, diag, err := c.UserResourceDetailedDiag(&auth.Auth{AccessToken: "at"}, 0)
+	if err != nil {
+		t.Fatalf("detailed diag: %v", err)
+	}
+	if expiring != 0 {
+		t.Errorf("expiring=%d want 0（soon<=0 禁用分桶）", expiring)
+	}
+	if diag.Soon != 0 || diag.WithEnd != 1 {
+		t.Errorf("diag=%+v want Soon=0/WithEnd=1（窗口禁用也要能看出到期信息）", diag)
+	}
+	// 日志正文：窗口禁用必须显式写出（否则「快过期=0」会被读成"确实没有"）。
+	line := BalanceLine(80, 100, expiring, diag)
+	if !strings.Contains(line, "禁用分桶") {
+		t.Errorf("窗口禁用时日志正文应显式标注：%q", line)
+	}
+}
+
+// TestBalanceLineShape 日志正文形态（调度器/面板共用同一口径，便于 grep 与对照）：
+// 剩余/快过期在括号外，窗口/包裹数/可解析到期在括号内，最近到期仅在可解析时出现。
+func TestBalanceLineShape(t *testing.T) {
+	c := resourceStub(`{"PackageName":"p","CycleEndTime":"` +
+		time.Now().In(softRateResetLoc).Add(3*24*time.Hour).Format(packageEndLayout) +
+		`","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}`)
+	_, _, expiring, diag, err := c.UserResourceDetailedDiag(&auth.Auth{AccessToken: "at"}, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("detailed diag: %v", err)
+	}
+	line := BalanceLine(80, 100, expiring, diag)
+	t.Logf("日志正文样例：%s", line)
+	for _, want := range []string{"剩余=80/100", "快过期=80", "窗口=168h", "包裹数=1", "可解析到期=1", "最近到期="} {
+		if !strings.Contains(line, want) {
+			t.Errorf("日志正文缺 %q：%q", want, line)
+		}
+	}
+}
+
 func TestDailyCheckinAlready(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/daily-checkin") {

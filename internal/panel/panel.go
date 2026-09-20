@@ -24,6 +24,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -248,8 +249,21 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		// 快过期窗口（秒）：前端据此在积分列/提示里写清「快过期 N」的依据窗口
+		// （「7 天内没有到期积分」与「没有快过期积分」是两种结论），不写死 168h。
+		// 与调度器同源（同一原子的热生效值，面板改 pool.expiring_soon 后立即一致）。
+		"expiring_soon_sec": int64(p.expiringSoonWindow().Seconds()),
+		"accounts":          p.cfg.Pool.List(),
 	})
+}
+
+// expiringSoonWindow 当前生效的快过期窗口：与调度器同源（热改后立即一致）。
+// 无调度器（未装配/单测）时返回 0 = 禁用分桶，与 scheduler 的零值语义一致。
+func (p *Panel) expiringSoonWindow() time.Duration {
+	if p.cfg.Scheduler == nil {
+		return 0
+	}
+	return p.cfg.Scheduler.ExpiringSoonWindow()
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
@@ -501,6 +515,8 @@ func panelReasonFromBody(r *http.Request) string {
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。解冻口径同 issue #199：仅硬冷却
 // （余额耗尽）账号余额恢复即解冻，软冷却/6004 模型级冷却不被签到解冻。
+// 分桶口径与调度器同源（同一窗口 + 同一对入口：ReenableIfCredits 写余额/解冻，
+// SetCreditsExpiring 无条件写快过架子集，含 expiring==0 的复位）。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -516,20 +532,29 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, expiring, diag, err := p.cfg.Upstream.UserResourceDetailedDiag(a, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
+	p.cfg.Pool.SetCreditsExpiring(uid, expiring)
 	resp["credits"] = remain
 	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	resp["credits_expiring"] = expiring
+	log.Printf("panel: checkin uid=%s msg=%q %s", logfmt.UID8(uid), checkinMsg,
+		upstream.BalanceLine(remain, total, expiring, diag))
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// accountBalance 单号余额刷新：UserResource → SetCredits（不触碰冷却状态）。
+// accountBalance 单号余额刷新：UserResourceDetailed → SetCredits（余额口径，**不触碰
+// 冷却状态**——本按钮的既有契约）+ SetCreditsExpiring（分桶口径，含 expiring==0 的复位）。
+// 响应回传 credits/credits_total/credits_expiring：面板 toast 直接显示快过期部分，
+// 让运维点一下就能确认「到底有没有快过期积分」。
+//
+// 与调度器的差异是刻意的：后台余额刷新/签到走 ReenableIfCredits（余额恢复即解冻硬冷却），
+// 而手动「余额」按钮只刷新观测量（不解冻）——保留既有契约，不顺手改解冻行为。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -537,13 +562,18 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, expiring, diag, err := p.cfg.Upstream.UserResourceDetailedDiag(a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
 	p.cfg.Pool.SetCredits(uid, remain, total)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
+	p.cfg.Pool.SetCreditsExpiring(uid, expiring)
+	log.Printf("panel: balance uid=%s %s", logfmt.UID8(uid),
+		upstream.BalanceLine(remain, total, expiring, diag))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "credits": remain, "credits_total": total, "credits_expiring": expiring,
+	})
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。

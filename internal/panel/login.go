@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 const (
@@ -268,9 +270,16 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 			checkinMsg = err.Error()
 		}
 	}
-	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+	// 登录后的余额回填：与后台刷新同一对入口（ReenableIfCredits 写余额/解冻、
+	// SetCreditsExpiring 无条件同步快过架子集）——重新登录同一账号时，旧的分桶值
+	// 也必须跟着本次余额一起更新，否则会残留一个可能大于新 credits 的陈旧子集
+	// （weightOf 的占比项会据此放大选号权重）。
+	if rm, tt, exp, diag, err := p.cfg.Upstream.UserResourceDetailedDiag(a, p.expiringSoonWindow()); err == nil {
 		remain, total = rm, tt
 		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
+		p.cfg.Pool.SetCreditsExpiring(acct.UID, exp)
+		log.Printf("panel: login balance uid=%s %s", logfmt.UID8(acct.UID),
+			upstream.BalanceLine(rm, tt, exp, diag))
 	}
 
 	p.loginMu.Lock()

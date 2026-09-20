@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // TestAccountReviveForcesSoftCooldownClear 面板「解冻」按钮（POST /panel/api/accounts/{uid}/revive
@@ -274,5 +277,121 @@ func TestAccountSuspendAuthRequired(t *testing.T) {
 	}
 	if p.Pick() == nil {
 		t.Error("未鉴权请求不得影响可选性")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 快过期积分：面板手动刷新接口也必须回传分桶（与 overview/调度器同口径）
+// ---------------------------------------------------------------------------
+
+// mutableBalanceStub 到期时间可改口的 get-user-resource 桩（余额固定 100），
+// 供面板用例构造「先分桶非零、再复位为 0」的序列。
+type mutableBalanceStub struct{ end atomic.Value }
+
+func newMutableBalanceStub(end string) *mutableBalanceStub {
+	s := &mutableBalanceStub{}
+	s.end.Store(end)
+	return s
+}
+
+func (s *mutableBalanceStub) set(end string) { s.end.Store(end) }
+
+func (s *mutableBalanceStub) server() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/get-user-resource") {
+			http.Error(w, "not found", 404)
+			return
+		}
+		acct := `{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0}`
+		if end, _ := s.end.Load().(string); end != "" {
+			acct = `{"PackageName":"p","CycleEndTime":"` + end + `","CycleCapacitySize":100,"CycleCapacityRemain":100,"CycleCapacityUsed":0}`
+		}
+		w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[` + acct + `]}}}}`))
+	}))
+}
+
+// cstWall 上游 CycleEndTime 墙钟串（UTC+8，与 upstream 的 softRateResetLoc 同口径）。
+func cstWall(t time.Time) string {
+	return t.In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05")
+}
+
+// TestAccountBalanceReturnsCreditsExpiring 面板「余额」按钮的响应必须带上 credits_expiring
+// （运维据此在面板上直接确认分桶结果），且刷新后池内分桶同步——包括 expiring==0 的复位。
+func TestAccountBalanceReturnsCreditsExpiring(t *testing.T) {
+	stub := newMutableBalanceStub(cstWall(time.Now().Add(72 * time.Hour)))
+	srv := stub.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	pn := New(Config{Version: "test", APIKey: "test-key", Pool: p, Upstream: up, Scheduler: sch})
+
+	post := func() map[string]any {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/panel/api/accounts/u1/balance", nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		rec := httptest.NewRecorder()
+		pn.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var d map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
+			t.Fatalf("balance JSON 解析失败：%v", err)
+		}
+		return d
+	}
+
+	// ① 窗口内（3 天后到期，窗口 7 天）→ 响应与池内都带 100。
+	d := post()
+	if v, ok := d["credits_expiring"]; !ok || v.(float64) != 100 {
+		t.Errorf("balance 响应 credits_expiring=%v want 100（面板刷新也要能看见分桶）", d["credits_expiring"])
+	}
+	if st, _ := p.Status("u1"); st.CreditsExpiring != 100 {
+		t.Errorf("刷新后池内 credits_expiring=%d want 100", st.CreditsExpiring)
+	}
+
+	// ② 上游改口（30 天后到期，窗口外）→ 响应与池内都必须复位为 0（缺陷 A 的面板侧回归）。
+	stub.set(cstWall(time.Now().Add(30 * 24 * time.Hour)))
+	d = post()
+	if v, ok := d["credits_expiring"]; !ok || v.(float64) != 0 {
+		t.Errorf("balance 响应 credits_expiring=%v want 0（陈旧分桶必须复位）", d["credits_expiring"])
+	}
+	if st, _ := p.Status("u1"); st.CreditsExpiring != 0 {
+		t.Errorf("刷新后池内 credits_expiring=%d want 0（陈旧分桶必须复位）", st.CreditsExpiring)
+	}
+}
+
+// TestAccountCheckinReturnsCreditsExpiring 面板「签到」按钮同口径：响应带 credits_expiring
+// 且池内分桶同步（签到与余额两个按钮必须给出同一种答案，否则面板自相矛盾）。
+func TestAccountCheckinReturnsCreditsExpiring(t *testing.T) {
+	stub := newMutableBalanceStub(cstWall(time.Now().Add(72 * time.Hour)))
+	srv := stub.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	pn := New(Config{Version: "test", APIKey: "test-key", Pool: p, Upstream: up, Scheduler: sch})
+
+	req := httptest.NewRequest("POST", "/panel/api/accounts/u1/checkin", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	pn.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var d map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
+		t.Fatalf("checkin JSON 解析失败：%v", err)
+	}
+	if v, ok := d["credits_expiring"]; !ok || v.(float64) != 100 {
+		t.Errorf("checkin 响应 credits_expiring=%v want 100", d["credits_expiring"])
+	}
+	if st, _ := p.Status("u1"); st.CreditsExpiring != 100 {
+		t.Errorf("签到后池内 credits_expiring=%d want 100", st.CreditsExpiring)
 	}
 }

@@ -2667,3 +2667,127 @@ func TestRestoreFromSnapshotMarksDirtyWhenLocalMissing(t *testing.T) {
 		t.Errorf("本地 state.json 应物化快照内容: %s", raw)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 快过期积分（creditsExpiring）：同步口径 + 对外透出三态
+//
+// 背景（issue「快过期积分完全不显示」两处缺陷）：
+//   - A：签到/余额刷新只在 expiring>0 时写分桶（SetCreditsDetailed），expiring==0 时
+//     旧值永不复位（陈旧值永久留存）；
+//   - B：Status 无 CreditsExpiring 字段、statusOf 也不赋值 → 面板 accounts[] 里根本
+//     没有这个键，前端无从显示。
+// ---------------------------------------------------------------------------
+
+// TestSetCreditsExpiringResetsToZero 缺陷 A 的池侧核心回归：expiring==0 时也必须把
+// creditsExpiring 复位为 0（构造「先设非零、再刷新为 0」的序列）。
+//
+// 为什么需要这个独立入口（而不是复用 SetCreditsDetailed / 合并进 ReenableIfCredits）：
+//   - SetCreditsDetailed 不含「解冻」语义（它只写 credits/total/expiring），而
+//     ReenableIfCredits 带解冻语义（remain>0 且有效硬冷却才清冷却域，软冷却不动）——
+//     把分桶写进解冻入口会让「是否解冻」与「是否分桶」重新耦合；
+//   - 给 ReenableIfCredits 加参数会改动全部既有调用点与测试的签名（纯增量入口不碰它们）。
+//
+// 故本入口只做一件事：把分桶观测量同步成真值（含 0），不碰 credits/冷却/熔断/降权。
+func TestSetCreditsExpiringResetsToZero(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 先设非零（模拟上一轮窗口内分桶），再同步为 0（积分到期/窗口缩小/上游不再给到期字段）。
+	p.SetCreditsDetailed("u1", 1000, 2000, 400)
+	if got, _ := p.creditsExpiringOf("u1"); got != 400 {
+		t.Fatalf("前置：creditsExpiring=%d want 400", got)
+	}
+	p.SetCreditsExpiring("u1", 0)
+	if got, _ := p.creditsExpiringOf("u1"); got != 0 {
+		t.Errorf("creditsExpiring=%d want 0（expiring==0 必须复位，否则陈旧值永久留存）", got)
+	}
+	// 只动分桶观测量：余额口径不被本入口改写（credits/creditsTotal 由 ReenableIfCredits 写）。
+	st, _ := p.Status("u1")
+	if st.Credits != 1000 || st.CreditsTotal != 2000 {
+		t.Errorf("SetCreditsExpiring 不应改余额口径：credits=%d total=%d want 1000/2000", st.Credits, st.CreditsTotal)
+	}
+	// 越界钳制与 SetCreditsDetailed / 恢复侧同口径（上游分桶异常不得污染权重）。
+	p.SetCreditsExpiring("u1", 5000)
+	if got, _ := p.creditsExpiringOf("u1"); got != 1000 {
+		t.Errorf("越界 expiring=%d want 1000（钳到 credits）", got)
+	}
+	p.SetCreditsExpiring("u1", -5)
+	if got, _ := p.creditsExpiringOf("u1"); got != 0 {
+		t.Errorf("负值 expiring=%d want 0", got)
+	}
+	// 不存在的 uid：空操作（面板/调度并发下 uid 可能已被移除，不得 panic）。
+	p.SetCreditsExpiring("nope", 10)
+}
+
+// TestSetCreditsExpiringKeepsCooldownState 分桶同步不得触碰任何惩罚态（解冻语义不回归）：
+// 软冷却账号调 SetCreditsExpiring 后仍在冷却，熔断/降权同理。
+func TestSetCreditsExpiringKeepsCooldownState(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftRate("u1", time.Hour, time.Time{}, "429 rate limit")
+	p.SetCreditsExpiring("u1", 100)
+	if st, _ := p.Status("u1"); !st.Cooling {
+		t.Errorf("SetCreditsExpiring 不得解冻软冷却账号：%+v", st)
+	}
+	if got, _ := p.creditsExpiringOf("u1"); got != 0 {
+		// credits 为 0（未刷新余额）→ 钳到 0；这里只断言不 panic 且不越界。
+		t.Errorf("credits=0 时 expiring=%d want 0（钳到 credits）", got)
+	}
+}
+
+// TestStatusExposesCreditsExpiring 缺陷 B 的池侧核心回归：Status 必须透出
+// credits_expiring（面板 overview 的 accounts[] 直接序列化 Status），且三态在 JSON
+// 上可区分：
+//
+//	① credits_expiring > 0            → 键带数值（明确显示快过期部分）；
+//	② == 0 且总额已知（credits_total）→ 键缺席（omitempty）+ credits_total 在场
+//	                                    → 「窗口内确实没有快过期积分」；
+//	③ 旧 state / 未知（两者都 0）      → 键缺席且 credits_total 也缺席 → 「未知」。
+//
+// ② 与 ③ 必须可分：前端据此避免把「没有快过期积分」显示成「0 分快过期」。
+func TestStatusExposesCreditsExpiring(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"}) // ① 有快过期
+	p.Add(&auth.Auth{UID: "u2"}) // ② 总额已知、无快过期
+	p.Add(&auth.Auth{UID: "u3"}) // ③ 未知（旧 state）
+	p.SetCreditsDetailed("u1", 1000, 2000, 300)
+	p.SetCreditsDetailed("u2", 500, 800, 0)
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("no status for u1")
+	}
+	if st.CreditsExpiring != 300 {
+		t.Errorf("Status.CreditsExpiring=%d want 300（字段缺失即缺陷 B）", st.CreditsExpiring)
+	}
+
+	// JSON 序列化断言：面板读的就是这些键。
+	states := map[string]map[string]any{}
+	for _, s := range p.List() {
+		raw, err := json.Marshal(s)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", s.UID, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("unmarshal %s: %v", s.UID, err)
+		}
+		states[s.UID] = m
+	}
+	if v, ok := states["u1"]["credits_expiring"]; !ok {
+		t.Errorf("① u1 的 JSON 缺 credits_expiring：%v", states["u1"])
+	} else if v.(float64) != 300 {
+		t.Errorf("① u1 credits_expiring=%v want 300", v)
+	}
+	if _, ok := states["u2"]["credits_expiring"]; ok {
+		t.Errorf("② u2 无快过期时不应出现 credits_expiring（避免前端显示成 0 分快过期）：%v", states["u2"])
+	}
+	if _, ok := states["u2"]["credits_total"]; !ok {
+		t.Errorf("② u2 必须有 credits_total（前端据此判定「窗口内没有」而非「未知」）：%v", states["u2"])
+	}
+	if _, ok := states["u3"]["credits_total"]; ok {
+		t.Errorf("③ u3（旧 state）不应有 credits_total：%v", states["u3"])
+	}
+	if _, ok := states["u3"]["credits_expiring"]; ok {
+		t.Errorf("③ u3（旧 state）不应有 credits_expiring：%v", states["u3"])
+	}
+}
