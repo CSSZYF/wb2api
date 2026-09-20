@@ -989,9 +989,7 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			out = append(out, item)
 			continue
 		}
-		if before.Claimed || before.Current >= before.Target && before.Target > 0 {
-			item["status"] = "skipped"
-			item["message"] = "已完成（" + taskProgressText(before) + "）"
+		if p.autoAllSkipOrSettle(a, item, before) {
 			out = append(out, item)
 			continue
 		}
@@ -1028,6 +1026,64 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 		time.Sleep(reportGap) // 项间节流
 	}
 	return out
+}
+
+// autoAllSkipOrSettle 「一键完成全部」动手前的短路判定：任务本轮无需执行时，就地写结果
+// 并返回 true（调用方 append 后 continue）；返回 false 表示仍需走 act.run 执行链路。
+//
+// 为什么要在跳过之前先补一次结算（本函数存在的理由）：批量路径原先把「已达标但没领奖」
+// 一律当"已完成"跳过，而单任务路径在领奖失败时记的是 done + claim_error（提示"可在列表
+// 手动点「领取」重试"）。两条路径相遇时——单任务领奖失败 → 下一轮批量跑到该项 →
+// Current>=Target 成立 → 直接 skipped 且 continue——runAutoAll 里达标的 claimRewardFor
+// 分支永远不可达，**自动补领永远不会发生，积分只能靠用户手动点**（静默丢分）。
+// 因此达标未领时先在这里补一次 claimRewardFor（幂等接口，已领过时上游返回
+// already_claimed，不会重复计分）。
+//
+// 边界：只在 Claimable 为真时补领。Claimable 是本地推算字段（upstream/tasks.go 的
+// Claimable: !claimed && tgt>0 && cur>=tgt），上游计分异步时"看着达标"未必真能领；
+// 对 Claimable==false 的项强行领奖必失败并污染上游日志，故这类保持 skipped，
+// 但 message 与「已完成」区分开（"暂不可领"），便于排查。
+//
+// 补领失败沿用单任务路径口径（status=done + claim_error）：skipped 会被前端当成
+// 「本轮无事可做」，把失败藏起来——正是本次要修的静默丢分；done 与动作失败的
+// error 也能区分开。
+func (p *Panel) autoAllSkipOrSettle(a *auth.Auth, item map[string]any, before *upstream.Task) bool {
+	if before == nil {
+		return false // 调用方已判过 nil（该账号无此任务）；此处兜底，避免解引用 panic
+	}
+	if !before.Claimed && before.Current >= before.Target && before.Target > 0 {
+		progress := taskProgressText(before)
+		if !before.Claimable {
+			item["status"] = "skipped"
+			item["message"] = "已完成（" + progress + "），但暂不可领（上游计分未落定，稍后自动重试）"
+			return true
+		}
+		item["claimable"] = true
+		credit, energy, cerr := p.claimRewardFor(a, before.TaskCode)
+		if cerr != nil {
+			item["status"] = "done"
+			item["claim_error"] = cerr.Error()
+			item["message"] = "已完成（" + progress + "）；达标但补领失败：" + cerr.Error() +
+				"（可在任务列表手动点「领取」重试）"
+			return true
+		}
+		item["status"] = "done"
+		item["claimed"] = true
+		item["credit"] = credit
+		item["energy"] = energy
+		if credit > 0 || energy > 0 {
+			item["message"] = fmt.Sprintf("已完成（%s）；已自动领奖 +%d 分 +%d 能", progress, credit, energy)
+		} else {
+			item["message"] = "已完成（" + progress + "）；奖励此前已领取"
+		}
+		return true
+	}
+	if before.Claimed {
+		item["status"] = "skipped"
+		item["message"] = "已完成（" + taskProgressText(before) + "）"
+		return true
+	}
+	return false
 }
 
 // accountTaskAutoAll 一键完成该账号全部可自动任务。
