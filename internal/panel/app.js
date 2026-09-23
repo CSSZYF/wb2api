@@ -256,6 +256,72 @@ function expiringToast(r) {
   return expiringOf(r).short;
 }
 
+/* ── 逐包到期三态（「积分构成」的到期列）────────────────────────────── */
+/* 后端 CreditPackages 把上游 CycleEndTime **原样透传**（形态 "2006-01-02 15:04:05"，
+   UTC+8 墙钟，即后端的 packageEndLayout + softRateResetLoc 口径）。前端不做任何
+   格式归一，只按同一口径解析出时刻，再据此把「到期」列分成三态：
+     expired 已过期（bad 色）/ soon 快过期（warn 色，窗口来自配置）/ normal 正常。
+   无到期信息（字段缺省/空/解析不出）保持「—」——「不知道」不等于「已过期」，
+   不显示 0，也不显示剩余天数（照后端 UserResourceDetailed 的保守语义）。 */
+
+// pkgEndMs 上游到期墙钟串 → epoch 毫秒；缺省/空/格式不符 → NaN（= 无到期信息）。
+//
+// 为什么不直接 new Date(s)：带空格的时间串是**非标准**形态（ES 只规定 ISO 的 T 分隔），
+// 各引擎行为不一；而把空格换成 T 后又是「无时区偏移 → 按浏览器本地时区」——用户不在
+// UTC+8 时剩余天数会整体偏移。上游串是 UTC+8 墙钟，故显式补 +08:00，与后端
+// softRateResetLoc 同一口径（跨时区浏览器算出的剩余天数与后端分桶一致）。
+function pkgEndMs(s) {
+  const m = /^([0-9][0-9][0-9][0-9])-([0-9][0-9])-([0-9][0-9])[ T]([0-9][0-9]):([0-9][0-9]):([0-9][0-9])/.exec(String(s == null ? '' : s));
+  if (!m) return NaN;
+  return Date.parse(m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':' + m[6] + '+08:00');
+}
+
+// pkgExpiryWindowSec 快过期窗口（秒）：与 expiringOf 同源（overview.expiring_soon_sec，
+// 即 config 的 pool.expiring_soon 解析后的热生效值），**不写死 168h**。
+// 取不到（旧 state / 未启用）→ 0：此时只判得了「已过期」，判不了「快过期」。
+function pkgExpiryWindowSec() {
+  const n = Number(overviewData && overviewData.expiring_soon_sec);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// pkgExpiryState 单个包的到期三态（纯函数：nowMs/winSec 由调用方传入，便于单测）。
+// 返回 { kind, date, text, cls, tip }：date 是列内可见的日期（空串 = 渲染「—」），
+// text 是列内的剩余天数标记（''=不渲染），cls 是单元格配色类（''=默认色），
+// tip 是 tooltip（把「依据」写全，含窗口）。
+function pkgExpiryState(p, nowMs, winSec) {
+  const raw = String((p && p.end_time) || '');
+  if (!raw) {
+    return { kind: 'none', date: '', text: '', cls: '', tip: '上游未下发该包到期时间' };
+  }
+  const ms = pkgEndMs(raw);
+  if (!Number.isFinite(ms)) {
+    // 有值但解析不出：同样渲染「—」（不谎称已过期），tooltip 说清是字段形态问题。
+    return { kind: 'none', date: '', text: '', cls: '',
+      tip: '到期时间无法解析（上游字段形态变化）：' + raw };
+  }
+  const date = raw.slice(0, 10);
+  const left = ms - Number(nowMs || 0);
+  // 窗口非数/<=0 一律当 0（未启用）：此时只判得了「已过期」，判不了「快过期」。
+  const win = Number(winSec);
+  const winOk = Number.isFinite(win) && win > 0;
+  if (left <= 0) {
+    // 已过期：天数向上取整（过期 1 秒也算「已过期 1 天」），不显示负数。
+    const over = Math.max(1, Math.ceil(-left / 86400000));
+    return { kind: 'expired', date: date, text: '已过期 ' + over + ' 天', cls: 'exp-bad',
+      tip: date + ' 到期 · 已过期 ' + over + ' 天' };
+  }
+  const days = Math.max(1, Math.ceil(left / 86400000));
+  if (winOk && left <= win * 1000) {
+    // 快过期：窗口文案来自配置（「7 天内为快过期」），不写死 168h。
+    return { kind: 'soon', date: date, text: days + ' 天后', cls: 'exp-warn',
+      tip: date + ' 到期 · 剩余 ' + days + ' 天（' + expiringWindowText(win) + '内为快过期）' };
+  }
+  // 正常：默认色，但 tooltip 照样给出剩余天数与窗口依据。
+  const tail = winOk ? '（' + expiringWindowText(win) + '内为快过期）' : '（快过期分桶未启用）';
+  return { kind: 'normal', date: date, text: '', cls: '',
+    tip: date + ' 到期 · 剩余 ' + days + ' 天' + tail };
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -1854,6 +1920,10 @@ function renderPackages(d) {
   $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
 
   // 逐包明细：每个账号一个表，包的**面额**列是重点
+  // 到期三态的「现在」与「快过期窗口」在整批渲染内取一次：同一屏里所有行用同一基准，
+  // 否则同一时刻渲染的两行可能因 Date.now() 抖动落在不同侧（窗口来自配置，不写死）。
+  const nowMs = Date.now();
+  const winSec = pkgExpiryWindowSec();
   $('pkDetail').innerHTML = list.map(a => {
     if (a.error) return '';
     const packs = (a.packages || []);
@@ -1861,6 +1931,9 @@ function renderPackages(d) {
       const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
       const sub = (p.sub_product_code || '').replace(/^sp_tcaca_codebuddyide_?/, '') ||
                   (p.package_code || '').replace(/^TCACA_/, '');
+      // 到期：日期 + 三态（已过期 bad / 快过期 warn / 正常默认）。无到期信息渲染「—」
+      // 且不着色——上游没给不等于已过期（后端 end_time 为空串时即为这种情况）。
+      const ex = pkgExpiryState(p, nowMs, winSec);
       return '<tr><td class="mark" aria-hidden="true"><i style="background:' +
         colorOf(k) + '"></i></td>' +
       '<td>' + esc(p.name || '(未命名)') +
@@ -1869,7 +1942,9 @@ function renderPackages(d) {
       '<td class="num">' + fmtTok(p.remain) + '</td>' +
       '<td class="num">' + fmtTok(p.used) + '</td>' +
       '<td class="num">' + esc((p.created_at || '').slice(0, 16).replace('T', ' ') || '—') + '</td>' +
-      '<td class="num">' + esc((p.end_time || '').slice(0, 10) || '—') + '</td>' +
+      '<td class="num' + (ex.cls ? ' ' + ex.cls : '') + '" title="' + esc(ex.tip) + '">' +
+        esc(ex.date || '—') +
+        (ex.text ? '<span class="exp-left">' + esc(ex.text) + '</span>' : '') + '</td>' +
       '</tr>';
     }).join('');
     return '<div class="box"><header><h3>' +
@@ -1888,6 +1963,10 @@ async function loadPackages() {
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
   $('pkDetail').innerHTML = '';
   try {
+    // 到期三态的窗口取自 overview.expiring_soon_sec。面板启动即拉过一次 overview
+    // （start()），配置保存后也会重拉——只有直接落到本视图且从未拉到时才补一次，
+    // 不在每次点「查询」时多打一次本地接口。
+    if (!overviewData) await loadOverview(true);
     const d = await api('packages');
     renderPackages(d);
   } catch (e) {

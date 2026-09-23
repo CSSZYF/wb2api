@@ -1039,6 +1039,155 @@ func TestBalanceLineShape(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 面板「积分构成」的逐包到期时间（CreditPackages.EndTime）
+//
+// 面板每一行包的「到期」列全是「-」：CreditPackages 的匿名响应结构体只声明了
+// ExpiredTime / PackageEndTime 两个到期字段，而上游（与 Expiring 分桶同一个端点
+// get-user-resource，CN/global 两域实测）这两个字段**都不下发**（恒空串）→
+// cp.EndTime 恒空 → 前端 esc((p.end_time||'').slice(0,10)||'—') 渲染成「-」。
+// 真实到期字段是 CycleEndTime——与本文件 UserResourceDetailed 的 Expiring 分桶
+// 判据同源（同端点、同墙钟格式 packageEndLayout，见 cfa10cf）。
+// ---------------------------------------------------------------------------
+
+// TestCreditPackagesEndTimeFromCycleEndTime 核心回归：上游只下发 CycleEndTime
+// （不下发 ExpiredTime/PackageEndTime）时，逐包到期时间必须取到该值。
+// 修复前此用例必红（EndTime 恒空 → 面板「到期」列恒为「-」）。
+func TestCreditPackagesEndTimeFromCycleEndTime(t *testing.T) {
+	c := resourceStub(`{"PackageName":"国内运营裂变包","CycleEndTime":"2026-10-18 05:24:02",` +
+		`"CapacitySize":1500,"CapacityRemain":900,"CapacityUsed":600}`)
+	packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if len(packs) != 1 {
+		t.Fatalf("packs=%d want 1", len(packs))
+	}
+	if packs[0].EndTime != "2026-10-18 05:24:02" {
+		t.Errorf("EndTime=%q want %q（上游只下发 CycleEndTime 时不得为空——面板「到期」列恒为「-」的根因）",
+			packs[0].EndTime, "2026-10-18 05:24:02")
+	}
+}
+
+// TestCreditPackagesEndTimeFallbackOrder 三级兜底优先级
+// ExpiredTime → PackageEndTime → CycleEndTime，且「有值就用」：空串不得覆盖真值。
+//
+// 顺序理由：前两个字段是修复前就在读的（旧行为对真下发它们的域零回归——取值与修复前
+// 逐字一致）；但它们上游实测从不下发，所以真正补上缺口的是末位的 CycleEndTime。
+// 若哪天实测发现某个域真的下发了前两个字段且语义不同，才需要重新评估这个顺序。
+func TestCreditPackagesEndTimeFallbackOrder(t *testing.T) {
+	cases := []struct {
+		name string
+		acct string
+		want string
+	}{
+		{"三个都给取 ExpiredTime",
+			`{"PackageName":"p","ExpiredTime":"2026-11-01 00:00:00","PackageEndTime":"2026-12-01 00:00:00","CycleEndTime":"2026-10-18 05:24:02"}`,
+			"2026-11-01 00:00:00"},
+		{"只给后两个取 PackageEndTime",
+			`{"PackageName":"p","PackageEndTime":"2026-12-01 00:00:00","CycleEndTime":"2026-10-18 05:24:02"}`,
+			"2026-12-01 00:00:00"},
+		{"只给 CycleEndTime（上游实际形态）",
+			`{"PackageName":"p","CycleEndTime":"2026-10-18 05:24:02"}`,
+			"2026-10-18 05:24:02"},
+		{"ExpiredTime 空串不得覆盖 PackageEndTime",
+			`{"PackageName":"p","ExpiredTime":"","PackageEndTime":"2026-12-01 00:00:00","CycleEndTime":"2026-10-18 05:24:02"}`,
+			"2026-12-01 00:00:00"},
+		{"前两个空串不得覆盖 CycleEndTime",
+			`{"PackageName":"p","ExpiredTime":"","PackageEndTime":"","CycleEndTime":"2026-10-18 05:24:02"}`,
+			"2026-10-18 05:24:02"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := resourceStub(tc.acct)
+			packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at"})
+			if err != nil {
+				t.Fatalf("packages: %v", err)
+			}
+			if len(packs) != 1 {
+				t.Fatalf("packs=%d want 1", len(packs))
+			}
+			if packs[0].EndTime != tc.want {
+				t.Errorf("EndTime=%q want %q", packs[0].EndTime, tc.want)
+			}
+		})
+	}
+}
+
+// TestCreditPackagesEndTimeEmptyWhenAllMissing 三个到期字段全缺 → EndTime 保持空串
+// （前端渲染「-」）。**不得**回落成 "0"/零时刻/"1970-01-01"：那会让面板把「无到期」
+// 显示成「已过期」，比空值更坏。
+func TestCreditPackagesEndTimeEmptyWhenAllMissing(t *testing.T) {
+	c := resourceStub(`{"PackageName":"p","CapacitySize":10,"CapacityRemain":5,"CapacityUsed":5}`)
+	packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if len(packs) != 1 {
+		t.Fatalf("packs=%d want 1", len(packs))
+	}
+	if packs[0].EndTime != "" {
+		t.Errorf("EndTime=%q want 空串（无到期字段 = 无到期，前端渲染「-」）", packs[0].EndTime)
+	}
+}
+
+// TestCreditPackagesEndTimePassThrough 到期值**原样透传**，不做格式归一：
+// CycleEndTime 上游形态就是 "2006-01-02 15:04:05"（packageEndLayout），前端「到期」
+// 列按 slice(0,10) 取日期，原样即已满足；归一成 RFC3339 会多一次格式转换（且要同步
+// 改前端），零收益而引入格式风险。
+func TestCreditPackagesEndTimePassThrough(t *testing.T) {
+	const end = "2027-03-12 22:03:50"
+	c := resourceStub(`{"PackageName":"p","CycleEndTime":"` + end + `"}`)
+	packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if len(packs) != 1 || packs[0].EndTime != end {
+		t.Fatalf("EndTime 必须原样透传 %q，实际 %+v", end, packs)
+	}
+	// 与 UserResourceDetailed 的解析口径同源：同串必须能被 packageEndLayout +
+	// softRateResetLoc 解析（前端三态判定也按这个口径算剩余天数）。
+	if _, perr := time.ParseInLocation(packageEndLayout, packs[0].EndTime, softRateResetLoc); perr != nil {
+		t.Errorf("透传值 %q 必须可被 packageEndLayout 解析：%v", packs[0].EndTime, perr)
+	}
+}
+
+// TestCreditPackagesSumUnchanged 求和口径锁定（本次只加到期字段，求和逐字不变）：
+// CycleCapacitySize > 0 时按周期字段算，否则按 Capacity 字段算——两条路径不能混，
+// 否则同一个包会被算两次（与 UserResourceDetailed 的聚合口径一致）。
+func TestCreditPackagesSumUnchanged(t *testing.T) {
+	c := resourceStub(
+		`{"PackageName":"周期包","CycleEndTime":"2026-10-18 05:24:02",` +
+			`"CapacitySize":9999,"CapacityRemain":9999,"CapacityUsed":0,` +
+			`"CycleCapacitySize":1500,"CycleCapacityRemain":1200,"CycleCapacityUsed":300},` +
+			`{"PackageName":"普通包","CycleEndTime":"2027-03-12 22:03:50",` +
+			`"CapacitySize":800,"CapacityRemain":500,"CapacityUsed":300}`)
+	packs, remain, size, err := c.CreditPackages(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if len(packs) != 2 {
+		t.Fatalf("packs=%d want 2", len(packs))
+	}
+	// 周期包的 CapacitySize=9999 不得参与求和（否则同一个包被算两次）。
+	if remain != 1700 || size != 2300 {
+		t.Errorf("remain/size=%d/%d want 1700/2300（求和口径：周期包只走周期字段）", remain, size)
+	}
+	if !packs[0].Cycle || packs[1].Cycle {
+		t.Errorf("Cycle 标记错误：%+v", packs)
+	}
+	if packs[0].Remain != 1200 || packs[0].Size != 1500 || packs[0].Used != 300 {
+		t.Errorf("周期包明细错误：%+v", packs[0])
+	}
+	if packs[1].Remain != 500 || packs[1].Size != 800 || packs[1].Used != 300 {
+		t.Errorf("普通包明细错误：%+v", packs[1])
+	}
+	// 到期字段与求和互不影响：两个包各自带自己的到期时刻。
+	if packs[0].EndTime != "2026-10-18 05:24:02" || packs[1].EndTime != "2027-03-12 22:03:50" {
+		t.Errorf("到期字段错误：%+v", packs)
+	}
+}
+
 func TestDailyCheckinAlready(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/daily-checkin") {
