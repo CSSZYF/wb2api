@@ -430,6 +430,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     font-size: 11px; color: var(--ink-3); }
   .pk-legend span { display: flex; align-items: center; gap: 5px; }
   .pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  /* 逐包到期三态（正常/快过期/已过期）：只借既有 warn/bad 令牌（与账号表冷却/停用
+     同一套语义——warn=需留意、bad=有问题），不引入新的视觉体系。无到期信息
+     （上游没下发 / 字段解析不出）不加类也不着色：「不知道」不等于「已过期」。 */
+  .acc td.exp-warn { color: var(--warn); }
+  .acc td.exp-bad { color: var(--bad); }
+  /* 列内剩余天数标记（快过期/已过期才渲染），与积分列的「快过期」标记同一形态 */
+  .acc td .exp-left { display: block; margin-top: 3px; font: 500 10px/1.3 var(--sans); opacity: .9; }
 
 </style>
 </head>

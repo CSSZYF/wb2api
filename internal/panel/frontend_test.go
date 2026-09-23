@@ -399,6 +399,232 @@ func TestPanelOverviewExposesCreditsExpiring(t *testing.T) {
 	}
 }
 
+// TestPanelPackagesExposesEndTime 端到端回归：GET /panel/api/packages 的 JSON 里每个包
+// 都必须带 end_time（面板「积分构成」的「到期」列直接读它）。上游（get-user-resource，
+// 与 Expiring 分桶同一端点）实测只下发 CycleEndTime、不下发 ExpiredTime/PackageEndTime
+// ——修复前 end_time 恒空（omitempty 连键都不出现）→ 前端 esc(...||'—') 渲染成「-」，
+// 正是用户实测的「每一行包的到期列都是 -」。
+func TestPanelPackagesExposesEndTime(t *testing.T) {
+	soon := cstWall(time.Now().Add(72 * time.Hour))
+	far := cstWall(time.Now().Add(30 * 24 * time.Hour))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/get-user-resource") {
+			http.Error(w, "not found", 404)
+			return
+		}
+		// 上游真实形态：只有 CycleEndTime，没有 ExpiredTime / PackageEndTime。
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[` +
+			`{"PackageName":"国内运营裂变包","CycleEndTime":"` + soon + `",` +
+			`"CapacitySize":1500,"CapacityRemain":900,"CapacityUsed":600},` +
+			`{"PackageName":"拉新权益包","CycleEndTime":"` + far + `",` +
+			`"CapacitySize":300,"CapacityRemain":300,"CapacityUsed":0}` +
+			`]}}}}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	pn := New(Config{Version: "test", APIKey: "test-key", Pool: p, Upstream: up, Scheduler: sch})
+
+	req := httptest.NewRequest("GET", "/panel/api/packages", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	pn.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Accounts []struct {
+			UID      string `json:"uid"`
+			Packages []struct {
+				Name    string `json:"name"`
+				Size    int64  `json:"size"`
+				EndTime string `json:"end_time"`
+			} `json:"packages"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("packages JSON 解析失败：%v\n%s", err, rec.Body.String())
+	}
+	if len(got.Accounts) != 1 || len(got.Accounts[0].Packages) != 2 {
+		t.Fatalf("accounts/packages 数量不对：%s", rec.Body.String())
+	}
+	// 面额降序：1500 在前。到期值原样透传上游 CycleEndTime（面板按 slice(0,10) 取日期）。
+	pk := got.Accounts[0].Packages
+	if pk[0].EndTime != soon {
+		t.Errorf("end_time=%q want %q（面板「到期」列的取值来源）", pk[0].EndTime, soon)
+	}
+	if pk[1].EndTime != far {
+		t.Errorf("end_time=%q want %q", pk[1].EndTime, far)
+	}
+	// 求和口径不变：只加到期字段，remain/size 不受影响。
+	if pk[0].Size != 1500 || pk[1].Size != 300 {
+		t.Errorf("size 求和口径被改动：%+v", pk)
+	}
+}
+
+// TestAppJSPkgExpiryThreeStates 逐包到期三态判定（纯 JS，用 node 实跑函数体）：
+// 已过期 / 快过期（窗口内）/ 正常 三态必须可区分且配色类不同；窗口值来自**参数**
+// （证明不写死 168h）；无到期信息（字段缺省/空/形态非法）一律判 none、不着色、
+// 不显示剩余天数——上游没下发到期 ≠ 已过期（比空值更坏的误导）。
+func TestAppJSPkgExpiryThreeStates(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping JS logic check")
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	winFn := jsFuncFull(src, "function expiringWindowText(")
+	endFn := jsFuncFull(src, "function pkgEndMs(")
+	stFn := jsFuncFull(src, "function pkgExpiryState(")
+	if winFn == "" || endFn == "" || stFn == "" {
+		t.Fatal("app.js 缺 expiringWindowText/pkgEndMs/pkgExpiryState（逐包到期三态的纯函数）")
+	}
+	script := winFn + "\n" + endFn + "\n" + stFn + `
+const now = Date.parse('2026-09-23T00:00:00+08:00');
+const win7 = 7 * 86400;
+const mk = (end) => ({ name: 'p', end_time: end });
+const out = {
+  expired: pkgExpiryState(mk('2026-09-21 00:00:00'), now, win7),   // 已过期 2 天
+  soon7:   pkgExpiryState(mk('2026-09-26 00:00:00'), now, win7),   // 3 天后，窗口 7 天
+  normal2: pkgExpiryState(mk('2026-09-26 00:00:00'), now, 2 * 86400), // 同刻但窗口 2 天 → 正常
+  normal:  pkgExpiryState(mk('2027-03-12 22:03:50'), now, win7),
+  empty:   pkgExpiryState(mk(''), now, win7),
+  missing: pkgExpiryState({ name: 'p' }, now, win7),
+  bad:     pkgExpiryState(mk('not-a-time'), now, win7),
+  soonNoWin: pkgExpiryState(mk('2026-09-26 00:00:00'), now, 0),    // 分桶未启用
+  ms: pkgEndMs('2026-10-18 05:24:02'),
+};
+console.log(JSON.stringify(out));
+`
+	fp := filepath.Join(t.TempDir(), "pkg_expiry_check.js")
+	if err := os.WriteFile(fp, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, fp).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node 运行失败: %v\n%s", err, out)
+	}
+	type st struct {
+		Kind string `json:"kind"`
+		Date string `json:"date"`
+		Text string `json:"text"`
+		Cls  string `json:"cls"`
+		Tip  string `json:"tip"`
+	}
+	var got struct {
+		Expired, Soon7, Normal2, Normal, Empty, Missing, Bad, SoonNoWin st
+		MS                                                              int64 `json:"ms"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("node 输出解析失败: %v\n%s", err, out)
+	}
+	// ① 已过期 → bad 色 + 列内剩余天数（负向表述），不得显示负数天
+	if got.Expired.Kind != "expired" || got.Expired.Cls != "exp-bad" {
+		t.Errorf("① 已过期应判 expired/exp-bad：%+v", got.Expired)
+	}
+	if !strings.Contains(got.Expired.Text, "已过期") || !strings.Contains(got.Expired.Text, "2") {
+		t.Errorf("① 已过期应显示「已过期 2 天」：%+v", got.Expired)
+	}
+	if got.Expired.Date != "2026-09-21" {
+		t.Errorf("① 到期列仍须显示日期：%+v", got.Expired)
+	}
+	// ② 窗口内 → warn 色 + 「N 天后」，tooltip 带窗口依据
+	if got.Soon7.Kind != "soon" || got.Soon7.Cls != "exp-warn" {
+		t.Errorf("② 快过期应判 soon/exp-warn：%+v", got.Soon7)
+	}
+	if !strings.Contains(got.Soon7.Text, "3 天后") || !strings.Contains(got.Soon7.Tip, "7 天") {
+		t.Errorf("② 快过期应显示剩余天数并带窗口依据：%+v", got.Soon7)
+	}
+	// ③ 同一到期时刻，窗口收到 2 天 → 窗口外 → 正常：证明窗口来自参数（不写死 168h）
+	if got.Normal2.Kind != "normal" || got.Normal2.Text != "" || got.Normal2.Cls != "" {
+		t.Errorf("③ 窗口参数化失效（同一时刻在 2 天窗口下应为正常）：%+v", got.Normal2)
+	}
+	// ④ 远未来 → 正常，但 tooltip 照样给出剩余天数
+	if got.Normal.Kind != "normal" || !strings.Contains(got.Normal.Tip, "剩余") {
+		t.Errorf("④ 正常态 tooltip 应含剩余天数：%+v", got.Normal)
+	}
+	// ⑤ 无到期信息（空串/字段缺席/形态非法）→ 一律 none：不着色、无剩余天数、
+	//    日期留空（前端据此渲染「—」）。不得判成 expired（上游没给 ≠ 已过期）。
+	for _, k := range []struct {
+		name string
+		v    st
+	}{{"空串", got.Empty}, {"字段缺席", got.Missing}, {"形态非法", got.Bad}} {
+		if k.v.Kind != "none" || k.v.Cls != "" || k.v.Text != "" || k.v.Date != "" {
+			t.Errorf("⑤ %s 应判 none 且不着色/不显示天数：%+v", k.name, k.v)
+		}
+	}
+	if got.Missing.Tip == got.Bad.Tip {
+		t.Error("⑤ 「上游未下发」与「字段形态变化」的 tooltip 应可区分（前者正常、后者要排查）")
+	}
+	// ⑥ 窗口未启用（0）→ 只判得了已过期，判不了快过期：3 天后到期归正常（不谎称快过期）
+	if got.SoonNoWin.Kind != "normal" {
+		t.Errorf("⑥ 窗口未启用时不得判快过期：%+v", got.SoonNoWin)
+	}
+	// ⑦ 时区口径：UTC+8 墙钟串按 +08:00 解析（与后端 softRateResetLoc 同口径，
+	//    浏览器在别的时区也算不错剩余天数）
+	want := time.Date(2026, 10, 18, 5, 24, 2, 0, time.FixedZone("UTC+8", 8*3600)).UnixMilli()
+	if got.MS != want {
+		t.Errorf("⑦ pkgEndMs 时区口径错误：got=%d want=%d（UTC+8 墙钟）", got.MS, want)
+	}
+}
+
+// TestAppJSPkgExpiryWiring 逐包到期三态的接线完整性：app.js 必须把三态判定接到
+// renderPackages 的到期列上（只加后端字段不接线 = 面板照旧显示「-」，本 issue 的
+// 直接诉求就是「到期列有值且能看出快过期/已过期」），窗口必须取自 overview
+// （配置 pool.expiring_soon 的热生效值），index.html 必须有对应的配色类。
+func TestAppJSPkgExpiryWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+	for _, want := range []string{
+		"function pkgEndMs(",           // 上游墙钟串解析（UTC+8 口径）
+		"function pkgExpiryState(",     // 三态判定
+		"function pkgExpiryWindowSec(", // 窗口来源
+		"expiring_soon_sec",            // 窗口取自 overview（不写死 168h）
+		"expiringWindowText(",          // 窗口文案复用既有函数（同一套口径）
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("app.js 缺逐包到期接线：%q", want)
+		}
+	}
+	body := jsFuncBody(s, "function renderPackages(")
+	if body == "" {
+		t.Fatal("app.js 缺 renderPackages")
+	}
+	if !strings.Contains(body, "pkgExpiryState(") {
+		t.Error("renderPackages 未接三态判定（到期列照旧渲染成「-」）")
+	}
+	if !strings.Contains(body, "ex.cls") || !strings.Contains(body, "ex.tip") {
+		t.Error("renderPackages 到期列未使用配色类/tooltip")
+	}
+	// 旧写法必须消失：直接 slice(0,10) 渲染会让三态与剩余天数无从落地。
+	if strings.Contains(body, `esc((p.end_time || '').slice(0, 10) || '—')`) {
+		t.Error("renderPackages 仍在用旧的「只取日期」写法（三态未接线）")
+	}
+	// 窗口取一次：整屏同基准（逐行取 Date.now() 会让同一时刻的两行落在不同侧）。
+	if !strings.Contains(body, "const nowMs = Date.now();") {
+		t.Error("renderPackages 应在整批渲染前取一次 nowMs")
+	}
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, want := range []string{".acc td.exp-warn", ".acc td.exp-bad", ".exp-left"} {
+		if !strings.Contains(h, want) {
+			t.Errorf("index.html 缺到期三态样式 %s", want)
+		}
+	}
+}
+
 // TestAppJSExpiringThreeStates 前端三态判定逻辑（纯 JS，用 node 实跑函数体）：
 // ① 有值 → 显示数值；② 字段缺席/0 且总额已知 → **不**显示成「快过期 0」；
 // ③ 旧 state/未知 → 与 ② 同处理（不显示数值），文案说明依据。

@@ -1677,7 +1677,11 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime 二者取有值者）。
+	// EndTime 该包的周期结束时间，上游墙钟串（packageEndLayout "2006-01-02 15:04:05"，
+	// UTC+8），**原样透传**不做格式归一：面板「到期」列按 slice(0,10) 取日期、并按同
+	// 口径算剩余天数。取值三级兜底 ExpiredTime → PackageEndTime → CycleEndTime（理由
+	// 见 CreditPackages 内赋值处）；空串 = 上游没给到期时间（面板渲染「-」，不是 0、
+	// 也不是「已过期」）。
 	EndTime string `json:"end_time,omitempty"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
@@ -1696,6 +1700,9 @@ type CreditPackage struct {
 //
 // 字段选择与 UserResourceDetailed 的聚合口径一致：CycleCapacitySize > 0 时按
 // 周期字段算，否则按 Capacity 字段算——两条路径不能混，否则同一个包会被算两次。
+//
+// 到期时间读 CycleEndTime（见下方赋值处的三级兜底与实证依据）；本方法只透出明细，
+// 不参与任何分桶/选号判定。
 func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, error) {
 	now := time.Now()
 	body := map[string]any{
@@ -1724,9 +1731,14 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
 					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
 					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					// 到期时间字段名在上游同时存在两种口径，都读，谁有值用谁。
+					// 到期时间字段三级兜底（取值顺序见下方赋值处）。前两个字段上游
+					// 实测从不下发（恒空串，这正是面板「到期」列全是「-」的根因），
+					// 真实到期字段是 CycleEndTime——与 UserResourceDetailed 的
+					// Expiring 分桶判据同源（同一端点 get-user-resource，同一种
+					// 墙钟格式 packageEndLayout）。
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
+					CycleEndTime   string `json:"CycleEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -1749,10 +1761,30 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
+		// 到期时间三级兜底 ExpiredTime → PackageEndTime → CycleEndTime（「有值就用」：
+		// 空串不覆盖真值，故用 if/else if 而不是后写覆盖前写）。
+		//
+		// 为什么是这个顺序：前两个字段是修复前就在读的，排在前面保证「真下发它们的域」
+		// 取值与修复前逐字一致（零回归）；但上游 CN/global 两域实测**都不下发**这两个
+		// 字段（恒空串，面板「到期」列全是「-」的根因），所以真正补上缺口的是末位的
+		// CycleEndTime。若哪天实测发现某域真的下发了前两个字段且语义与包到期不同，
+		// 才需要重新评估这个顺序。
+		//
+		// 为什么读 CycleEndTime：与 UserResourceDetailed 的 Expiring 分桶判据同源
+		// （同一端点 get-user-resource，两域字段全集均无 PackageEndTime，真实到期
+		// 字段是 CycleEndTime——上游 sliver 75c15e8 + 本仓 cfa10cf 两处实证），
+		// 照它的口径，不自创第二套。
+		//
+		// 原样透传、不做格式归一：CycleEndTime 上游形态即 packageEndLayout
+		// "2006-01-02 15:04:05"（UTC+8 墙钟），前端「到期」列按 slice(0,10) 取日期、
+		// 三态判定按同口径算剩余天数，原样已够用；归一成 RFC3339 要多一次格式转换
+		// （且必须同步改前端），零收益而引入格式风险。
 		if p.ExpiredTime != "" {
 			cp.EndTime = p.ExpiredTime
-		} else {
+		} else if p.PackageEndTime != "" {
 			cp.EndTime = p.PackageEndTime
+		} else {
+			cp.EndTime = p.CycleEndTime
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
