@@ -167,8 +167,14 @@ func (a *statsAcc) finish(model string) StatsModel {
 // Stats 聚合当前全部桶，按模型汇总（跨账号、跨域）。
 //
 // hours > 0 时只统计最近 hours 小时内仍有数据的分片（分片按覆盖区间判定，见
-// bucketEnd）；hours <= 0 表示不限窗口（与上游 /v1/stats 的「全量累计」同口径，
-// 也是缺省）。窗口过滤在聚合前做，因此 total 与 models 始终同口径。
+// inWindow——与面板 Snapshot 共用同一条窗口边界）；hours <= 0 表示不限窗口（与
+// 上游 /v1/stats 的「全量累计」同口径，也是缺省）。窗口过滤在聚合前做，因此
+// total 与 models 始终同口径。
+//
+// 注意「缺省全量」是本端点的对外契约（社区面板按「至今累计」对账），与面板
+// Snapshot 缺省 72 小时的窗口化视图是**两套有意不同的口径**：前者回答「一共用了
+// 多少」，后者回答「选中的这段用了多少」。改这里之前先看
+// TestStatsUnaffectedBySnapshotWindow。
 //
 // 只读：先在锁内复制桶快照，聚合在锁外进行——Add/Rollup 只被 memcpy 级占用，
 // 不阻塞请求路径（与 Snapshot 同一纪律）。不触发任何上游请求、不落盘。
@@ -196,24 +202,18 @@ func (r *Recorder) Stats(hours int) StatsSnapshot {
 	}
 	r.mu.Unlock()
 
-	var cutoff time.Time
-	if hours > 0 {
-		cutoff = now.Add(-time.Duration(hours) * time.Hour)
-	}
+	// hours <= 0（缺省）时 windowCutoff 返回零值时间，inWindow 据此不裁剪。
+	cutoff := windowCutoff(now, hours)
 
 	byModel := map[string]*statsAcc{}
 	var total statsAcc
 	var earliest time.Time
 	for i := range bs {
 		b := &bs[i]
-		if !cutoff.IsZero() {
-			// 用分片**覆盖区间**判定而非起点：起点早于 cutoff 但仍在覆盖中的
-			// 当前小时桶，其数据可能全部落在窗口内，按起点判定会把它们整片丢掉
-			// （窗口越小丢得越明显，如 hours=1 时当前小时桶必被丢）。
-			end, ok := bucketEnd(b.Scope)
-			if ok && end.Before(cutoff) {
-				continue
-			}
+		// 窗口判据与面板 Snapshot 共用（inWindow）：按分片**覆盖区间**判定，
+		// 理由见 inWindow 的注释。
+		if !inWindow(b.Scope, cutoff) {
+			continue
 		}
 		a := byModel[b.Model]
 		if a == nil {
@@ -277,4 +277,50 @@ func bucketEnd(scope string) (time.Time, bool) {
 		return t.Add(time.Hour), true
 	}
 	return t.AddDate(0, 0, 1), true
+}
+
+// scopeKey 去掉分片键的粒度前缀（"h:2026-09-16T13" → "2026-09-16T13"），
+// 前缀不是 "h:"/"d:" 时原样返回（畸形键的判定交给 bucketStart）。
+func scopeKey(scope string) string {
+	if strings.HasPrefix(scope, "h:") || strings.HasPrefix(scope, "d:") {
+		return scope[2:]
+	}
+	return scope
+}
+
+// ------------------------------------------------------------ 窗口判据 ----
+//
+// 下面两个函数是 Snapshot（面板「用量总览」，按 hours 窗口化）与 Stats
+// （/v1/stats，缺省全量、显式 hours 才裁剪）**共用**的窗口判据。
+//
+// 为什么必须共用同一份：两套视图读的是同一份桶，各写一套判定就会在窗口边缘
+// 裁在不同的位置——同一分钟内「面板看到的」与「/v1/stats 报的」对不上账，
+// 而且这种偏差只在边缘一两个桶上出现，极难发现。
+
+// windowCutoff 返回「最近 hours 小时」窗口的左端点；hours <= 0 返回零值时间，
+// 表示不限窗口（零值时间在 inWindow 里被识别为「不裁剪」）。
+func windowCutoff(now time.Time, hours int) time.Time {
+	if hours <= 0 {
+		return time.Time{}
+	}
+	return now.Add(-time.Duration(hours) * time.Hour)
+}
+
+// inWindow 判定分片是否与窗口相交（cutoff 为零值时不裁剪）。
+//
+// 判据用分片**覆盖区间**的右端点（bucketEnd）而不是起点：起点早于 cutoff 但仍在
+// 覆盖中的当前小时桶，其数据可能全部落在窗口内，按起点判定会把它们整片丢掉
+// （窗口越小丢得越明显，如 hours=1 时当前小时桶必被丢）。日桶同理——它覆盖一整天，
+// 按起点判定会多丢一天。
+//
+// 键解析不出来时宁留不丢：畸形键只影响 since 取值，不该影响任何累计量。
+func inWindow(scope string, cutoff time.Time) bool {
+	if cutoff.IsZero() {
+		return true
+	}
+	end, ok := bucketEnd(scope)
+	if !ok {
+		return true
+	}
+	return !end.Before(cutoff)
 }

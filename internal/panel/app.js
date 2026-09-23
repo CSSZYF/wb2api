@@ -1525,6 +1525,23 @@ function usBar(prompt, completion, total) {
     '</span>';
 }
 
+/* usWindowText 把**实际生效**的窗口（小时数）写成人类可读文案，与 usWindow 下拉框
+   的选项文案一致（近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天）。
+
+   取的是响应里的 d.hours 而不是下拉框的 value：下拉框只说明「用户选了什么」，响应里
+   的 hours 才说明「后端实际按什么窗口算的」（非法值已回退到缺省 72）。两者不一致时
+   必须显示后者——否则用户切换范围后看到数字不变，无从区分「窗口没生效」还是「这段
+   流量本来就一样多」。
+
+   窗口未知（0/undefined，如旧后端不带该字段）返回空串，由调用方省略前缀，
+   不显示成「近 0 小时」。 */
+function usWindowText(hours) {
+  const h = Number(hours || 0);
+  if (!h || h < 0) return '';
+  if (h < 48) return '近 ' + h + ' 小时';
+  return '近 ' + Math.round(h / 24) + ' 天';
+}
+
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
    withPerf 控制是否追加延迟/速率两列——只有「按账号」表的表头带这两列；
    模型表与域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
@@ -1556,7 +1573,11 @@ function renderUsage(d) {
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
-  $('usNote').textContent = (d.buckets || 0) + ' 个分桶 · ' +
+  // 「窗口：近 N 天」用后端回报的**实际生效**值（d.hours，非法入参已回退），不是
+  // 下拉框的 value——两者不一致时必须显示后者，用户才能确认窗口真的生效了。
+  const win = usWindowText(d.hours);
+  $('usNote').textContent = (win ? '窗口：' + win + ' · ' : '') +
+    (d.buckets || 0) + ' 个分桶 · ' +
     (d.since ? '自 ' + d.since.slice(0, 10) : '无数据') +
     (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
 
@@ -1571,7 +1592,8 @@ function renderUsage(d) {
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
 
-  renderUsageChart(d.series || []);
+  // 粒度由后端单选并显式回报（d.granularity），前端只按它渲染一种，不逐点猜。
+  renderUsageChart(d.series || [], d.granularity);
 }
 
 /* renderUsageChart 画堆叠柱状图。
@@ -1583,8 +1605,10 @@ function renderUsage(d) {
  * 另外不再用 preserveAspectRatio="none"：那会把 760 宽的 viewBox 横向拉伸到容器
  * 宽度，柱子和文字一起变形。改为固定比例、高度随宽度自适应（CSS 的 height:auto）。
  *
- * 时间轴按本地时间解析（后端分片键就是本地时区口径），day 点按当天 00:00 参与
- * 定位，与 hour 点落在同一条连续轴上——日桶本来就是他那天所有小时的聚合。
+ * granularity 由后端按窗口**单选**（Snapshot.Granularity：小时粒度 "hour" /
+ * 日粒度 "day"），整条序列只有一种粒度。横轴标签格式与柱宽都跟着它走，不再逐点
+ * 判断 scope——旧实现按 scope 混算，把 "22:00" 与 "9-17" 两种标签画到了同一条轴上
+ * （用户实测：选近 30 天横轴是小时、选近 24 小时横轴是日，与实际选择相反）。
  */
 
 /* parsePointTime 把后端的 t 解析成毫秒时间戳，解析不出来返回 null。
@@ -1598,8 +1622,12 @@ function parsePointTime(p) {
   return isNaN(d.getTime()) ? null : d.getTime();
 }
 
-function renderUsageChart(series) {
+function renderUsageChart(series, granularity) {
   const host = $('usChart');
+
+  // 粒度只用后端回报的那一个；字段缺席（旧后端）时按小时渲染，标签格式退化为
+  // HH:00，不会画出混排的轴。
+  const gran = granularity === 'day' ? 'day' : 'hour';
 
   // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
   const pts = [];
@@ -1610,8 +1638,7 @@ function renderUsageChart(series) {
     pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
                req: p.requests || 0 });
   }
-  // 后端是把日点（升序）与小时点（升序）**先后拼接**成一条时序的，正常已整体
-  // 升序；这里再排一次兜底，保证 t0/t1 真的是最早/最晚的点。
+  // 后端按时间升序返回；这里再排一次兜底，保证 t0/t1 真的是最早/最晚的点。
   pts.sort((a, b) => a.t - b.t);
   if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
@@ -1630,30 +1657,27 @@ function renderUsageChart(series) {
 
   const max = Math.max(1, ...pts.map(p => p.tt));
 
-  // 柱宽取「同粒度最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
-  // 变细，但不会细到看不见。
+  // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会变细，
+  // 但不会细到看不见。后端现在**只返回一种粒度**，整条序列的间隔是齐的，对全序列
+  // 算一次就够。
   //
-  // 这里按 scope 分组算，而不是全序列取一个最小间隔：后端对超出小时窗口的数据折叠
-  // 成日点，于是 30 天/60 天窗口里 day 点（间隔 1 天）会与 hour 点（间隔 1 小时）
-  // **混在同一条轴上**。若按全局最小间隔（1 小时）定宽，日柱会被压成 1.5px 的细线，
-  // 反而比改动前更难读。分组后日柱按天宽、小时柱按小时宽，各保留原来的观感。
+  // barWidth 仍保留「传入一个列表」的签名，而不是写死全序列：若将来后端重新返回
+  // 混合粒度（日点与小时点同在一条轴上），按 scope 分组各调一次即可（日柱按天宽、
+  // 小时柱按小时宽）——旧实现正是这么做的，因为按全局最小间隔（1 小时）定宽会把
+  // 日柱压成 1.5px 的细线。
   function barWidth(list, fallback) {
     let g = Infinity;
     for (let i = 1; i < list.length; i++) g = Math.min(g, list[i].t - list[i - 1].t);
     if (!isFinite(g) || g <= 0) g = fallback;
     return Math.max(1.5, Math.min(30, iw * (g / span) * 0.7));
   }
-  const hours = pts.filter(p => p.scope !== 'day');
-  const days = pts.filter(p => p.scope === 'day');
-  const bwHour = barWidth(hours, span);
-  const bwDay = barWidth(days, 24 * 3600 * 1000);
-  const bwOf = p => (p.scope === 'day' ? bwDay : bwHour);
-  // 单点/同刻时没有真实间隔可用，退回一个能看见的宽度（上面的 fallback 已处理）。
+  // 兜底间隔 = 本粒度的一格（小时粒度 1h、日粒度 1 天）：单点/同刻时算不出真实
+  // 间隔，用一格定宽能画出一根看得见的柱子（再被上限夹到 30px）。
+  const bw = barWidth(pts, gran === 'day' ? 24 * 3600 * 1000 : 3600 * 1000);
 
-  // 时间戳 → x 坐标：真实比例映射，柱心落在自己的时刻上。左右各留出最大柱宽的
-  // 一半，免得贴边的柱子压进 y 轴刻度区或越出绘图区（内部各段的宽窄比例仍严格
-  // 按真实时间）。
-  const pad = Math.max(bwHour, bwDay) / 2;
+  // 时间戳 → x 坐标：真实比例映射，柱心落在自己的时刻上。左右各留出柱宽的一半，
+  // 免得贴边的柱子压进 y 轴刻度区或越出绘图区（内部各段的宽窄比例仍严格按真实时间）。
+  const pad = bw / 2;
   const plot = Math.max(1, iw - pad * 2);
   const xOf = t => degenerate ? PL + iw / 2 : PL + pad + (t - t0) / span * plot;
 
@@ -1669,7 +1693,6 @@ function renderUsageChart(series) {
   }
 
   for (const p of pts) {
-    const bw = bwOf(p);
     const x = xOf(p.t) - bw / 2;
     const hTot = ih * (p.tt / max);
     const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
@@ -1688,7 +1711,8 @@ function renderUsageChart(series) {
     '" y2="' + (PT + ih) + '"/>';
 
   // x 轴刻度：按真实时间等距取 6 个位置，每个位置取**最近的实际柱子**做标签，
-  // 所以标签永远落在有数据的点上，不会指到空档里。
+  // 所以标签永远落在有数据的点上，不会指到空档里。标签格式跟着粒度走：
+  // 小时粒度 → "HH:00"，日粒度 → "M-D"。
   const TICKS = Math.min(6, pts.length);
   const usedLabel = new Set();
   for (let k = 0; k < TICKS; k++) {
@@ -1702,7 +1726,7 @@ function renderUsageChart(series) {
     usedLabel.add(bi);
     const p = pts[bi];
     const d = new Date(p.t);
-    const lab = p.scope === 'day'
+    const lab = gran === 'day'
       ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
       : String(d.getHours()).padStart(2, '0') + ':00';
     // 首尾标签靠边对齐，避免被裁掉
@@ -1715,28 +1739,33 @@ function renderUsageChart(series) {
   // 跨天/跨周时补一条日界虚线 + 顶端日期标注，让长窗口里的「日界」可见——
   // 小时点跨午夜时，x 轴标签只有「06:00 / 16:00」这种时刻，没有日期就分不清
   // 是今天还是昨天。
-  let prevDay = null, markX = -Infinity, markN = 0;
-  for (const p of pts) {
-    const d = new Date(p.t);
-    // 日键用「年月日」而不是 getDate()：只比日号会把「上月的 05 号 → 本月 05 号」
-    // 这类跨月边界漏掉（日号相同就算同一天）。
-    const dk = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
-    if (prevDay !== null && dk !== prevDay) {
-      const x = xOf(p.t);
-      out += '<line class="gl" x1="' + x.toFixed(1) + '" y1="' + PT + '" x2="' + x.toFixed(1) +
-        '" y2="' + (PT + ih) + '" style="opacity:.45"/>';
-      // 日期标注画在绘图区上方的空白里（y = PT 之上），绝不会压到柱子；文字比
-      // 虚线宽，只给间距够开的最多 5 条，避免糊成一团。
-      if (markN < 5 && x - markX >= 64) {
-        markX = x;
-        markN++;
-        const lab = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
-        const anchor = x < PL + 16 ? 'start' : (x > W - PR - 16 ? 'end' : 'middle');
-        out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, x)).toFixed(1) +
-          '" y="' + (PT - 3) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+  //
+  // 日粒度下不画：那时每个点本身就是一天，x 轴标签已经是日期，再叠一层日界虚线
+  // 与顶端标注只会把图糊住（30 天窗口会画出 29 条）。
+  if (gran === 'hour') {
+    let prevDay = null, markX = -Infinity, markN = 0;
+    for (const p of pts) {
+      const d = new Date(p.t);
+      // 日键用「年月日」而不是 getDate()：只比日号会把「上月的 05 号 → 本月 05 号」
+      // 这类跨月边界漏掉（日号相同就算同一天）。
+      const dk = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+      if (prevDay !== null && dk !== prevDay) {
+        const x = xOf(p.t);
+        out += '<line class="gl" x1="' + x.toFixed(1) + '" y1="' + PT + '" x2="' + x.toFixed(1) +
+          '" y2="' + (PT + ih) + '" style="opacity:.45"/>';
+        // 日期标注画在绘图区上方的空白里（y = PT 之上），绝不会压到柱子；文字比
+        // 虚线宽，只给间距够开的最多 5 条，避免糊成一团。
+        if (markN < 5 && x - markX >= 64) {
+          markX = x;
+          markN++;
+          const lab = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
+          const anchor = x < PL + 16 ? 'start' : (x > W - PR - 16 ? 'end' : 'middle');
+          out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, x)).toFixed(1) +
+            '" y="' + (PT - 3) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+        }
       }
+      prevDay = dk;
     }
-    prevDay = dk;
   }
 
   out += '</svg>';

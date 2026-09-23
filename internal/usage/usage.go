@@ -10,6 +10,10 @@
 //   - 近 hourlyKeep 小时内：小时桶（细粒度，看尖峰）
 //   - 更早：折叠为日桶，**永久保留**（看长期趋势）
 //
+// 注意「永久保留」说的是账本，不是面板视图：面板「用量总览」的窗口上限是
+// maxWindowHours（60 天），更早的日桶只留在落盘文件里，/v1/stats 的缺省全量口径
+// 仍看得到，面板窗口看不到——窗口化裁的是**视图**，不动账本。
+//
 // 落盘：data/usage.json，原子替换 + 防抖刷新（默认 30s），重启不丢。
 // 桶数上界 ≈ 账号数 × 模型数 × (hourlyKeep + 已过天数)，单桶约百字节（字段一律
 // 短名落盘，因为桶数量会随时间增长）。
@@ -35,6 +39,37 @@ const flushInterval = 30 * time.Second
 
 // maxBuckets 桶数硬上限。超过时立即触发一次折叠，避免异常流量把内存/文件撑爆。
 const maxBuckets = 400_000
+
+// 面板「用量总览」的窗口边界。
+const (
+	// defaultWindowHours 缺省窗口（近 3 天）：与面板下拉框的默认选项一致，也是
+	// hours 非法时的回退值。
+	defaultWindowHours = 72
+	// maxWindowHours 窗口上限（60 天）：再往前都是日桶，精度不再变化。超出即视为
+	// 非法入参并回退缺省窗口——刻意不静默钳制：钳制会让 hours=999999 这类笔误
+	// 得到一个看似生效的结果，而那正是「切了范围没反应」的观感来源。
+	maxWindowHours = 24 * 60
+)
+
+// granularityHourMaxHours 时序粒度单选阈值（小时）：窗口不超过它用小时点，超过则
+// 整条序列改用日点。
+//
+// 为什么必须单选：旧实现把「窗口内的小时点」与「窗口外的日点」拼在同一条轴上，
+// 横轴因此同时出现 "22:00" 与 "9-17" 两种标签，tooltip 里还混着 "(day)"——用户
+// 完全无法判断一根柱子代表一小时还是一天（现象 B 的根因）。
+//
+// 阈值取 7 天（168h）：与面板「近 7 天」选项对齐，且 168 个小时点的柱宽仍在可读
+// 范围内（旧实现在 7 天窗口下本来就产出 168 个小时点，不是新增压力）；再宽
+// （30 天 = 720 点）柱子会挤到 1px 以下，改用日点才看得清趋势。
+const granularityHourMaxHours = 7 * 24
+
+// granularityFor 按窗口长度选时序粒度（见 granularityHourMaxHours）。
+func granularityFor(hours int) string {
+	if hours > granularityHourMaxHours {
+		return GranularityDay
+	}
+	return GranularityHour
+}
 
 // hourLayout / dayLayout 分片键的时间格式（本地时区，与用户直觉一致）。
 const (
@@ -475,6 +510,13 @@ type Point struct {
 	Agg
 }
 
+// 时序粒度（Snapshot.Granularity）：一条序列只取一种，前端据此决定横轴标签
+// 格式与柱宽，不再逐点靠 scope 猜。
+const (
+	GranularityHour = "hour"
+	GranularityDay  = "day"
+)
+
 // Snapshot 面板一次拉取的全部用量视图数据。
 type Snapshot struct {
 	Totals    Agg        `json:"totals"`
@@ -486,16 +528,52 @@ type Snapshot struct {
 	FileBytes int64      `json:"file_bytes"`
 	Since     string     `json:"since,omitempty"`
 	Generated string     `json:"generated"`
+
+	// Hours 是**实际生效**的窗口（小时）。入参非法（<=0 / 超上限）时回退
+	// defaultWindowHours，这里如实回报——前端据此显示「窗口：近 N 天」，让用户
+	// 看得见窗口真的生效了（数字不变时能区分「窗口没生效」与「这段流量本来就
+	// 一样多」）。
+	Hours int `json:"hours"`
+
+	// Granularity 是时序粒度（GranularityHour / GranularityDay），由 Hours 单选
+	// （阈值见 granularityHourMaxHours）。显式回报而不是让前端逐点猜 scope，
+	// 是因为「一条轴混两种粒度」正是要修掉的缺陷。
+	Granularity string `json:"granularity"`
 }
 
-// Snapshot 聚合当前全部桶。hours 控制时序返回多少个小时点（其余按日折叠）。
+// Snapshot 聚合**窗口内**的桶，供面板「用量总览」一次拉取。
+//
+// hours 是窗口长度（小时），同时作用于 totals / by_realm / by_account /
+// by_model 与时序序列——五者始终同口径。
+//
+// 现象 A 的根因就在旧实现的这一段：它只把 hours 用在时序上（hourFrom 只筛
+// hourSeries），而 total 与 realmAgg/acctAgg/modelAgg 对**全部**桶无条件累加，
+// 于是切换范围时顶部六个汇总数字与「按账号」「按模型」两张表纹丝不动，只有柱状
+// 图在变。现在所有累加器都先过 inWindow——与 Stats(hours) 共用同一条窗口边界
+// （按分片覆盖区间判定，理由见 inWindow），不另立第二套口径。
+//
+// 现象 B 的根因是粒度混排：旧实现把「窗口内的小时点」与「窗口外的日点」拼成一条
+// 序列，横轴因此同时出现 "22:00" 与 "9-17" 两种标签。现在整条序列**单选一种**
+// 粒度（granularityHourMaxHours），并写进 Granularity 显式回报。
+//
+// hours 非法（<=0 或 > maxWindowHours）回退 defaultWindowHours，并把实际生效值
+// 写进 Hours。
+//
+// 与 /v1/stats 的边界：那边调的是 Stats（缺省全量累计，对外契约），不经过本函数，
+// 因此本函数的窗口化不影响它。
+//
 // nicks 是 uid→昵称映射，仅用于展示。
 func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
-	if r == nil {
-		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
+	if hours <= 0 || hours > maxWindowHours {
+		hours = defaultWindowHours
 	}
-	if hours <= 0 || hours > 24*60 {
-		hours = 72
+	gran := granularityFor(hours)
+	if r == nil {
+		return Snapshot{
+			Generated:   time.Now().Format(time.RFC3339),
+			Hours:       hours,
+			Granularity: gran,
+		}
 	}
 
 	r.mu.Lock()
@@ -505,19 +583,22 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	}
 	r.mu.Unlock()
 
+	cutoff := windowCutoff(time.Now(), hours)
+
 	var total aggAcc
 	realmAgg := map[string]*aggAcc{}
 	acctAgg := map[string]*aggAcc{}
 	acctRealm := map[string]string{}
 	modelAgg := map[string]*aggAcc{}
-	hourSeries := map[string]*aggAcc{}
-	daySeries := map[string]*aggAcc{}
-
-	nowHour := time.Now().Truncate(time.Hour)
-	hourFrom := nowHour.Add(-time.Duration(hours-1) * time.Hour)
+	series := map[string]*aggAcc{}
 
 	for i := range bs {
 		b := &bs[i]
+		// 窗口外的桶既不进汇总也不进时序：这正是「切换范围要看到变化」的前提。
+		if !inWindow(b.Scope, cutoff) {
+			continue
+		}
+
 		total.add(b)
 
 		if realmAgg[b.Realm] == nil {
@@ -540,31 +621,28 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 		}
 		modelAgg[b.Model].add(b)
 
-		scope := strings.TrimPrefix(b.Scope, "h:")
-		isHour := strings.HasPrefix(b.Scope, "h:")
-		if isHour {
-			ts, err := time.ParseInLocation(hourLayout, scope, time.Local)
-			if err != nil {
-				continue
+		if k := seriesKey(b.Scope, gran); k != "" {
+			if series[k] == nil {
+				series[k] = &aggAcc{}
 			}
-			if !ts.Before(hourFrom) {
-				if hourSeries[scope] == nil {
-					hourSeries[scope] = &aggAcc{}
-				}
-				hourSeries[scope].add(b)
-			} else {
-				// 超出小时窗口的细粒度数据并入其所在日，避免时序出现空洞。
-				d := ts.Format(dayLayout)
-				if daySeries[d] == nil {
-					daySeries[d] = &aggAcc{}
-				}
-				daySeries[d].add(b)
-			}
-		} else {
-			if daySeries[scope] == nil {
-				daySeries[scope] = &aggAcc{}
-			}
-			daySeries[scope].add(b)
+			series[k].add(b)
+		}
+	}
+
+	// since = 账本里最早的分片键，**不受窗口影响**：它与 Buckets/FileBytes 同属存储
+	// 诊断（账本有多少、从什么时候开始），聚合口径由 Hours 单独表达。若跟着窗口走，
+	// 选「近 24 小时」会显示「自今天」，看起来像历史被删了。
+	var (
+		sinceAt  time.Time
+		sinceKey string
+	)
+	for i := range bs {
+		t, ok := bucketStart(bs[i].Scope)
+		if !ok {
+			continue
+		}
+		if sinceKey == "" || t.Before(sinceAt) {
+			sinceAt, sinceKey = t, scopeKey(bs[i].Scope)
 		}
 	}
 
@@ -574,30 +652,26 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 		ByAccount: keyed(acctAgg, func(k string) (string, string) {
 			return k, nicks[k]
 		}),
-		ByModel:   keyed(modelAgg, func(k string) (string, string) { return k, "" }),
-		Buckets:   len(bs),
-		Generated: time.Now().Format(time.RFC3339),
+		ByModel:     keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		Buckets:     len(bs),
+		Since:       sinceKey,
+		Generated:   time.Now().Format(time.RFC3339),
+		Hours:       hours,
+		Granularity: gran,
 	}
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]
 	}
 
-	// 日点（升序）+ 小时点（升序）拼成一条连续时序。
-	dayKeys := make([]string, 0, len(daySeries))
-	for k := range daySeries {
-		dayKeys = append(dayKeys, k)
+	// 一条序列只有一种粒度。键升序即时间序：小时键 "2006-01-02T15" 与日键
+	// "2006-01-02" 都按字典序单调。
+	keys := make([]string, 0, len(series))
+	for k := range series {
+		keys = append(keys, k)
 	}
-	sort.Strings(dayKeys)
-	for _, k := range dayKeys {
-		snap.Series = append(snap.Series, Point{T: k, Scope: "day", Agg: daySeries[k].finish()})
-	}
-	hourKeys := make([]string, 0, len(hourSeries))
-	for k := range hourSeries {
-		hourKeys = append(hourKeys, k)
-	}
-	sort.Strings(hourKeys)
-	for _, k := range hourKeys {
-		snap.Series = append(snap.Series, Point{T: k, Scope: "hour", Agg: hourSeries[k].finish()})
+	sort.Strings(keys)
+	for _, k := range keys {
+		snap.Series = append(snap.Series, Point{T: k, Scope: gran, Agg: series[k].finish()})
 	}
 
 	if r.path != "" {
@@ -605,11 +679,29 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 			snap.FileBytes = fi.Size()
 		}
 	}
-	// 最早的分片即数据起点。
-	if len(snap.Series) > 0 {
-		snap.Since = snap.Series[0].T
-	}
 	return snap
+}
+
+// seriesKey 返回分片在当前粒度下的时序键；键解析不出来返回空串。
+//
+// 小时粒度：小时分片用自身的小时键。日分片只可能来自 >hourlyKeep 的折叠数据，
+// 正常已被窗口判据挡在外面（小时粒度的窗口最长 7 天）；万一落进来，归到它所在日
+// 的 00:00 小时键上，宁可归位也不静默丢数据。
+// 日粒度：小时分片折到它所在的日历日，与日分片合流——正是旧实现 daySeries 那一段
+// 的算法，区别只是现在**整条序列**统一用它，不再与小时点混排。
+func seriesKey(scope, gran string) string {
+	layout := dayLayout
+	if strings.HasPrefix(scope, "h:") {
+		layout = hourLayout
+	}
+	ts, err := time.ParseInLocation(layout, scopeKey(scope), time.Local)
+	if err != nil {
+		return ""
+	}
+	if gran == GranularityDay {
+		return ts.Format(dayLayout)
+	}
+	return ts.Format(hourLayout)
 }
 
 func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg {
