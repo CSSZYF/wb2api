@@ -726,6 +726,123 @@ func TestAppJSUsageChartTimeAxis(t *testing.T) {
 	}
 }
 
+// TestAppJSUsageWindowWiring 用量视图的「生效窗口 + 粒度单选」接线必须齐全。
+//
+// 背景是用户实测的两个现象：
+//
+//	A. 切换范围时顶部六个汇总数字与「按账号」「按模型」两张表纹丝不动。根因在
+//	   后端（窗口只作用于时序），但前端**没有任何地方显示实际生效的窗口**，用户
+//	   因此无法区分「窗口没生效」与「这段流量本来就一样多」。
+//	B. 柱状图粒度与选择相反（选 30 天横轴是小时标签、选 24 小时横轴是日标签）。
+//	   根因也在后端（小时点与日点混排），前端则靠 `p.scope === 'day'` 逐点猜粒度，
+//	   把混排直接画了出来。
+//
+// 修复后前端只做两件事：把后端给的 granularity 直接用于标签格式与柱宽，把后端给
+// 的 hours（**实际生效值**，非法入参已回退）显示在 usNote 里。此用例把这两条接线
+// 前移——app.js 是 go:embed 静态资源，Go 编译器不校验其内容（同
+// TestAppJSUsageChartTimeAxis）。
+func TestAppJSUsageWindowWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+
+	if !strings.Contains(s, "function usWindowText(") {
+		t.Fatal("app.js 缺少 usWindowText（窗口文案）——usNote 无法显示实际生效的窗口")
+	}
+
+	ru := jsFuncBody(s, "function renderUsage(")
+	if ru == "" {
+		t.Fatal("app.js 缺少函数 renderUsage")
+	}
+	// ① usNote 的窗口文案由响应里的 hours 驱动，不写死、也不由前端再猜下拉框的值
+	//   （下拉框只反映「用户选了什么」，响应里的 hours 才是「实际生效了什么」）。
+	if !strings.Contains(ru, "usWindowText(") || !strings.Contains(ru, "d.hours") {
+		t.Error("renderUsage 未把响应里的 d.hours 经 usWindowText 写进 usNote" +
+			"（用户无法区分「窗口没生效」与「这段流量本来就一样多」）")
+	}
+	// ② 粒度由后端的 granularity 字段单选，前端不逐点猜。
+	if !strings.Contains(ru, "renderUsageChart(d.series || [], d.granularity") {
+		t.Error("renderUsage 未把 d.granularity 传给 renderUsageChart（前端只能自己猜粒度）")
+	}
+
+	chart := jsFuncBody(s, "function renderUsageChart(")
+	if chart == "" {
+		t.Fatal("app.js 缺少函数 renderUsageChart")
+	}
+	if !strings.Contains(chart, "gran === 'day'") {
+		t.Error("renderUsageChart 未按 granularity 决定横轴标签格式（小时 HH:00 / 日 M-D）")
+	}
+	// 反向断言：逐点按 scope 判粒度的写法不得回归——后端一旦返回混合粒度，那写法
+	// 会把 "22:00" 与 "9-17" 两种标签画到同一条轴上（现象 B）。
+	for _, banned := range []string{"p.scope === 'day'", "p.scope !== 'day'"} {
+		if strings.Contains(chart, banned) {
+			t.Errorf("renderUsageChart 仍逐点用 %s 猜粒度：混排时两种标签会同轴", banned)
+		}
+	}
+}
+
+// TestAppJSUsageWindowTextMapping 窗口文案的换算（纯 JS，用 node 实跑函数体）：
+// 24/72/168/720 必须分别写成「近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天」，与下拉框
+// 选项逐字一致；窗口未知（0/undefined，如旧后端不带 hours）时返回空串，由调用方
+// 省略前缀，而不是显示「近 0 小时」。无 node 环境时跳过。
+func TestAppJSUsageWindowTextMapping(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping JS logic check")
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := jsFuncFull(string(js), "function usWindowText(")
+	if fn == "" {
+		t.Fatal("app.js 缺少 usWindowText")
+	}
+	script := fn + `
+const out = {
+  h1: usWindowText(1),
+  h24: usWindowText(24),
+  h72: usWindowText(72),
+  h168: usWindowText(168),
+  h720: usWindowText(720),
+  h1440: usWindowText(1440),
+  off: usWindowText(0),
+  undef: usWindowText(undefined),
+};
+console.log(JSON.stringify(out));
+`
+	fp := filepath.Join(t.TempDir(), "us_window_check.js")
+	if err := os.WriteFile(fp, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, fp).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node 运行失败: %v\n%s", err, out)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("node 输出解析失败: %v\n%s", err, out)
+	}
+	// 与 index.html 下拉框的选项文案逐字对齐，用户切了之后看到的字就是它。
+	for k, want := range map[string]string{
+		"h1":    "近 1 小时",
+		"h24":   "近 24 小时",
+		"h72":   "近 3 天",
+		"h168":  "近 7 天",
+		"h720":  "近 30 天",
+		"h1440": "近 60 天",
+	} {
+		if got[k] != want {
+			t.Errorf("usWindowText → %q, want %q", got[k], want)
+		}
+	}
+	if got["off"] != "" || got["undef"] != "" {
+		t.Errorf("窗口未知时文案必须为空（省略前缀），得到 %q / %q", got["off"], got["undef"])
+	}
+}
+
 // TestAppJSAuthWatchWiring schedule.auth_watch_* 的面板接线必须齐全：CFG_MAP 映射
 // （否则表单值与后端对不上）+ 开关与数字输入项存在。
 //

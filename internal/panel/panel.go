@@ -690,21 +690,25 @@ func (p *Panel) cooldownProbeRun(w http.ResponseWriter, r *http.Request) {
 // helpers
 // ---------------------------------------------------------------------------
 
-// usage 返回逐请求用量聚合。hours 查询参数控制小时粒度时序窗口（默认 72，
-// 上限 1440=60 天）；更早的数据自动折叠为日点，因此长期趋势不会丢。
+// usage 返回逐请求用量聚合。hours 查询参数是窗口长度（小时），同时作用于汇总、
+// 三张表与时序序列；缺省 72（近 3 天），上限 1440（60 天）。
+//
+// 这里刻意**不做**合法性判断：一律交给 Snapshot 统一回退（0 表示「未指定」，由它
+// 取缺省窗口）。旧实现在这里「>1440 就钳到 1440」，而 Snapshot 内部「>1440 就回退
+// 72」——两套规则并存时，响应里的生效窗口与实际统计口径可能不一致，用户看到的
+// 数字对不上自己选的范围。回退策略只保留一处。
+//
+// 响应里的 hours 是**实际生效**值（非法入参已回退），前端据此显示「窗口：近 N 天」。
 func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Usage == nil {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
 		return
 	}
-	hours := 72
+	hours := 0 // 0 = 未指定，由 Snapshot 取缺省窗口
 	if v := r.URL.Query().Get("hours"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil {
 			hours = n
 		}
-	}
-	if hours > 1440 {
-		hours = 1440
 	}
 	// 昵称仅用于展示，取自池快照（不含任何凭证）。
 	nicks := map[string]string{}

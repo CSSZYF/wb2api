@@ -46,6 +46,10 @@ func TestAddAndTotals(t *testing.T) {
 }
 
 // Rollup 把超出 hourlyKeep 的小时桶折叠为日桶，且幂等：重复折叠不重复计数。
+//
+// 「不重复计数」走 Stats(0)（不限窗口的全量口径）验证：折叠后的日桶在 100 天前，
+// 已落在面板窗口（最长 60 天）之外，Snapshot 看不到它——但幂等是**账本层面**的
+// 性质，必须用全量口径验，不能被窗口掩盖成「看起来对」。
 func TestRollupIdempotent(t *testing.T) {
 	r := New("")
 	old := time.Now().AddDate(0, 0, -100) // 100 天前，超出 90 天小时保留
@@ -54,18 +58,20 @@ func TestRollupIdempotent(t *testing.T) {
 	r.Add(time.Now(), "cn", "u", "m", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
 
 	r.Rollup(time.Now())
-	after := r.Snapshot(24, nil)
-	if after.Totals.Requests != 3 || after.Totals.PromptTokens != 15 {
-		t.Fatalf("折叠后 totals = %d/%d, want 3/15", after.Totals.Requests, after.Totals.PromptTokens)
+	after := r.Stats(0)
+	if after.Total.Requests != 3 || after.Total.PromptTokens != 15 {
+		t.Fatalf("折叠后 totals = %d/%d, want 3/15", after.Total.Requests, after.Total.PromptTokens)
 	}
-	if len(after.Series) != 2 || after.Series[0].Scope != "day" || after.Series[1].Scope != "hour" {
-		t.Fatalf("series = %+v, want 日点在前 + 小时点在后", after.Series)
+	// 窗口内那一份照旧可见：折叠不得把它并进日桶或重复计数。
+	snap := r.Snapshot(24, nil)
+	if snap.Totals.Requests != 1 || snap.Totals.PromptTokens != 1 {
+		t.Fatalf("24h 窗口 totals = %d/%d, want 1/1", snap.Totals.Requests, snap.Totals.PromptTokens)
 	}
 
 	r.Rollup(time.Now())
-	again := r.Snapshot(24, nil)
-	if again.Totals.Requests != 3 || again.Totals.PromptTokens != 15 {
-		t.Fatalf("二次折叠后 totals = %d/%d, want 3/15（幂等被破坏）", again.Totals.Requests, again.Totals.PromptTokens)
+	again := r.Stats(0)
+	if again.Total.Requests != 3 || again.Total.PromptTokens != 15 {
+		t.Fatalf("二次折叠后 totals = %d/%d, want 3/15（幂等被破坏）", again.Total.Requests, again.Total.PromptTokens)
 	}
 }
 
@@ -88,18 +94,208 @@ func TestFlushLoadRoundtrip(t *testing.T) {
 	}
 }
 
-// Snapshot 把小时窗口外的细粒度并入日点，时序不出现空洞。
-func TestSnapshotStitching(t *testing.T) {
+// 窗口必须作用于**汇总与两张表**：窗口内与窗口外的桶混在一起时，totals 与
+// by_account / by_model 只能含窗口内那一份。
+//
+// 这是现象 A 的回归护栏。旧实现只把 hours 用在时序上（hourFrom 只筛
+// hourSeries），total / realmAgg / acctAgg / modelAgg 对**全部**桶无条件累加，
+// 于是切换范围时顶部六个汇总数字与「按账号」「按模型」两张表逐字不变，只有
+// 柱状图在变——用户原话「底下的那个显示条没有变化只有条形显示柱有变化」。
+func TestSnapshotWindowAppliesToTotalsAndTables(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now.Add(-48*time.Hour), "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true) // 窗口(24h)外 → 日点
-	r.Add(now, "cn", "u", "m", Delta{PromptTokens: 3, HasPromptTokens: true}, true)                    // 窗口内 → 小时点
-	s := r.Snapshot(24, nil)
-	if len(s.Series) != 2 || s.Series[0].Scope != "day" || s.Series[1].Scope != "hour" {
-		t.Fatalf("series = %+v", s.Series)
+	// 窗口内（hours=24）：一个账号、一个模型，数值小。
+	r.Add(now, "cn", "uid-in", "model-in", Delta{
+		PromptTokens: 10, HasPromptTokens: true,
+		CompletionTokens: 5, HasCompletion: true,
+		LatencyMs: 100, HasLatency: true,
+	}, true)
+	// 窗口外（48 小时前）：另一个账号、另一个模型、数值大，且是**失败尝试**。
+	// 混进来会让下面每一项都翻好几倍，一眼可辨。
+	r.Add(now.Add(-48*time.Hour), "cn", "uid-out", "model-out", Delta{
+		PromptTokens: 9999, HasPromptTokens: true,
+		CompletionTokens: 9999, HasCompletion: true,
+		LatencyMs: 9000, HasLatency: true,
+	}, false)
+
+	s := r.Snapshot(24, map[string]string{"uid-in": "窗口内", "uid-out": "窗口外"})
+
+	if s.Totals.Requests != 1 || s.Totals.Errors != 0 {
+		t.Errorf("totals req/err = %d/%d, want 1/0（窗口外的桶必须被排除）", s.Totals.Requests, s.Totals.Errors)
 	}
-	if s.Series[0].PromptTokens != 5 || s.Series[1].PromptTokens != 3 {
-		t.Fatalf("series tokens = %d/%d, want 5/3", s.Series[0].PromptTokens, s.Series[1].PromptTokens)
+	if s.Totals.PromptTokens != 10 || s.Totals.CompletionTok != 5 {
+		t.Errorf("totals pt/ct = %d/%d, want 10/5", s.Totals.PromptTokens, s.Totals.CompletionTok)
+	}
+	// 均值分母同样要裁剪：窗口外的 9000ms 若进分母，这里会变成 4550。
+	if s.Totals.AvgLatencyMs != 100 {
+		t.Errorf("totals avg latency = %v, want 100（窗口外样本不得进均值分母）", s.Totals.AvgLatencyMs)
+	}
+
+	if len(s.ByAccount) != 1 || s.ByAccount[0].Key != "uid-in" {
+		t.Fatalf("by_account = %+v, want 仅 uid-in", s.ByAccount)
+	}
+	if s.ByAccount[0].PromptTokens != 10 || s.ByAccount[0].Requests != 1 {
+		t.Errorf("by_account 行 = %+v, want prompt=10 requests=1", s.ByAccount[0])
+	}
+
+	if len(s.ByModel) != 1 || s.ByModel[0].Key != "model-in" {
+		t.Fatalf("by_model = %+v, want 仅 model-in", s.ByModel)
+	}
+	if s.ByModel[0].PromptTokens != 10 {
+		t.Errorf("by_model 行 prompt = %d, want 10", s.ByModel[0].PromptTokens)
+	}
+
+	// 时序与汇总同口径：窗口内只有 1 个点，点上的量必须等于汇总。
+	var sumPT int64
+	for _, p := range s.Series {
+		sumPT += p.PromptTokens
+	}
+	if sumPT != s.Totals.PromptTokens {
+		t.Errorf("series 的 prompt 合计 = %d, totals = %d（时序与汇总必须同口径）", sumPT, s.Totals.PromptTokens)
+	}
+}
+
+// 窗口必须作用于 by_realm。单独一条：realm 是独立累加器，漏改一处就会出现
+// 「域表与账号表对不上账」——比整块不变更难发现。
+func TestSnapshotWindowAppliesToRealm(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "m1", Delta{PromptTokens: 3, HasPromptTokens: true}, true)
+	r.Add(now.Add(-48*time.Hour), "global", "u2", "m2", Delta{PromptTokens: 700, HasPromptTokens: true}, true)
+
+	s := r.Snapshot(24, nil)
+	if len(s.ByRealm) != 1 || s.ByRealm[0].Key != "cn" {
+		t.Fatalf("by_realm = %+v, want 仅 cn（窗口外的 global 必须被排除）", s.ByRealm)
+	}
+	if s.ByRealm[0].PromptTokens != 3 {
+		t.Errorf("by_realm prompt = %d, want 3", s.ByRealm[0].PromptTokens)
+	}
+	// 三张表与 totals 必须同口径：窗口内只有一个域，域表请求数应等于汇总请求数。
+	if s.ByRealm[0].Requests != s.Totals.Requests {
+		t.Errorf("by_realm 与 totals 不同口径：%d vs %d", s.ByRealm[0].Requests, s.Totals.Requests)
+	}
+}
+
+// 粒度单选：按窗口只取**一种**粒度，不再把小时点与日点拼在同一条轴上。
+//
+// 规则：窗口 <= 7 天（168h）→ 只用小时点；更宽 → 只用日点。阈值见
+// granularityHourMaxHours 的注释（为什么是 7 天）。
+//
+// 这是现象 B 的回归护栏。旧实现把「窗口内的小时点」与「窗口外的日点」拼成一条
+// 序列：选「近 30 天」横轴全是小时标签（22:00 / 11:00），选「近 24 小时」横轴
+// 全是日标签（9-17 / 9-18），tooltip 里还混着 "(day)"——用户无法判断一根柱子
+// 代表一小时还是一天。
+func TestSnapshotSingleGranularity(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 一个桶在窗口内、一个在 48 小时前：旧实现会把后者折成日点塞进同一条轴。
+	r.Add(now, "cn", "u1", "m1", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
+	r.Add(now.Add(-48*time.Hour), "cn", "u1", "m1", Delta{PromptTokens: 2, HasPromptTokens: true}, true)
+
+	for _, tc := range []struct {
+		name     string
+		hours    int
+		wantGran string
+		wantPts  int
+	}{
+		// 24 小时窗口：48 小时前的桶在窗口外 → 只剩 1 个小时点。
+		{"近 24 小时只用小时点", 24, "hour", 1},
+		// 3 天 / 7 天：仍在小时粒度区间内，48 小时前的桶是小时点（不折成日点）。
+		{"近 3 天只用小时点", 72, "hour", 2},
+		{"近 7 天（阈值上限）只用小时点", 7 * 24, "hour", 2},
+		// 30 天：越过阈值 → 整条序列改用日点，两个桶折到各自所在的日历日。
+		// 48 小时跨度必然跨两个日历日，点数因此稳定为 2。
+		{"近 30 天只用日点", 720, "day", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := r.Snapshot(tc.hours, nil)
+			// 合法窗口必须原样生效，并如实回报（前端据此显示「窗口：近 N 天」）。
+			if s.Hours != tc.hours {
+				t.Errorf("hours=%d want %d（合法窗口不得被改写）", s.Hours, tc.hours)
+			}
+			if s.Granularity != tc.wantGran {
+				t.Errorf("granularity=%q want %q（粒度由后端单选并显式回报）", s.Granularity, tc.wantGran)
+			}
+			if len(s.Series) != tc.wantPts {
+				t.Fatalf("series=%d 点 want %d: %+v", len(s.Series), tc.wantPts, s.Series)
+			}
+			for _, p := range s.Series {
+				if p.Scope != tc.wantGran {
+					t.Errorf("点 %s 的 scope=%q want %q（一条序列里不得出现第二种粒度）", p.T, p.Scope, tc.wantGran)
+				}
+				// 键格式必须跟着粒度走：前端直接拿它渲染横轴标签
+				// （小时粒度 "HH:00"、日粒度 "M-D"）。
+				if tc.wantGran == "day" && len(p.T) != len("2006-01-02") {
+					t.Errorf("日点键 %q 不是 2006-01-02 格式", p.T)
+				}
+				if tc.wantGran == "hour" && len(p.T) != len("2006-01-02T15") {
+					t.Errorf("小时点键 %q 不是 2006-01-02T15 格式", p.T)
+				}
+			}
+		})
+	}
+}
+
+// 窗口外的桶既不进汇总也不进时序；但账本本身不受影响（全量口径仍看得见）。
+//
+// 旧实现会把窗口外的桶折成日点留在时序里（并因此让整张图的横轴变成日期标签），
+// 那是现象 B 的直接来源；这里把「窗口外 = 彻底不出现」钉死。
+func TestSnapshotWindowExcludesOutOfWindowPoints(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 100 天前的桶：折叠后会变成日桶，永久保留在账本里。
+	r.Add(now.AddDate(0, 0, -100), "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true)
+	r.Add(now, "cn", "u", "m", Delta{PromptTokens: 3, HasPromptTokens: true}, true)
+	r.Rollup(now)
+
+	s := r.Snapshot(24, nil)
+	if len(s.Series) != 1 {
+		t.Fatalf("series = %+v, want 仅窗口内的 1 个点（100 天前的日桶不得混进来）", s.Series)
+	}
+	if s.Series[0].PromptTokens != 3 || s.Series[0].Scope != "hour" {
+		t.Errorf("series[0] = %+v, want 窗口内的小时点 pt=3", s.Series[0])
+	}
+	if s.Totals.PromptTokens != 3 || s.Totals.Requests != 1 {
+		t.Errorf("totals pt/req = %d/%d, want 3/1（窗口外的日桶同样不进汇总）",
+			s.Totals.PromptTokens, s.Totals.Requests)
+	}
+	// 账本没有被窗口裁剪：全量口径（/v1/stats 的缺省语义）仍然看得到折叠后的日桶。
+	if got := r.Stats(0).Total.PromptTokens; got != 8 {
+		t.Errorf("Stats(0) prompt=%d want 8（窗口只裁剪面板视图，不动账本）", got)
+	}
+}
+
+// 非法 hours 回退到缺省窗口（72 = 近 3 天），且回退结果必须与**显式传 72 逐字
+// 一致**——回退不是「换个窗口算」，而是真的按 72 小时算。
+func TestSnapshotInvalidHoursFallsBack(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 24 小时内一个桶、48 小时前一个桶：缺省窗口（72h）两个都该在。
+	r.Add(now, "cn", "u1", "m1", Delta{PromptTokens: 10, HasPromptTokens: true}, true)
+	r.Add(now.Add(-48*time.Hour), "cn", "u1", "m1", Delta{PromptTokens: 20, HasPromptTokens: true}, true)
+
+	base := r.Snapshot(72, nil)
+	if base.Totals.PromptTokens != 30 {
+		t.Fatalf("显式 72 小时窗口 prompt=%d want 30（用例前提不成立）", base.Totals.PromptTokens)
+	}
+	for _, hours := range []int{0, -1, -72, 24*60 + 1, 999999999} {
+		s := r.Snapshot(hours, nil)
+		if s.Hours != 72 {
+			t.Errorf("hours=%d 回退后 Hours=%d want 72（响应必须给出实际生效的窗口）", hours, s.Hours)
+		}
+		if s.Granularity != GranularityHour {
+			t.Errorf("hours=%d 回退到 72 后 granularity=%q want %q", hours, s.Granularity, GranularityHour)
+		}
+		if s.Totals != base.Totals {
+			t.Errorf("hours=%d 的汇总 %+v != 显式 72 的 %+v", hours, s.Totals, base.Totals)
+		}
+		if len(s.Series) != len(base.Series) {
+			t.Errorf("hours=%d 的 series=%d 点 want %d", hours, len(s.Series), len(base.Series))
+		}
+	}
+	// 上限本身（1440 = 60 天）是合法窗口，不得被当成非法值回退。
+	if s := r.Snapshot(24*60, nil); s.Totals.PromptTokens != 30 || s.Hours != 24*60 {
+		t.Errorf("hours=1440（上限）应原样生效，得到 prompt=%d hours=%d", s.Totals.PromptTokens, s.Hours)
 	}
 }
 

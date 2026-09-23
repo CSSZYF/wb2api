@@ -221,6 +221,36 @@ func TestStatsWindowFilter(t *testing.T) {
 	}
 }
 
+// 面板快照的窗口不得渗进 Stats：/v1/stats 缺省是**全量累计**（对外契约，社区面板
+// 按「至今累计」对账），只有显式 ?hours= 才裁剪。
+//
+// 这条守的是两套口径的边界：本仓里 Snapshot（面板视图，按 hours 窗口化）与
+// Stats（/v1/stats，缺省全量）读的是同一份桶，将来有人图省事「统一口径」时这个
+// 用例会立刻红——那正是需要停下来讨论的改动，而不是顺手改掉的细节。
+func TestStatsUnaffectedBySnapshotWindow(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "in-window", Delta{PromptTokens: 10, HasPromptTokens: true, LatencyMs: 1, HasLatency: true}, true)
+	r.Add(now.Add(-48*time.Hour), "cn", "u1", "out-window", Delta{PromptTokens: 999, HasPromptTokens: true, LatencyMs: 1, HasLatency: true}, true)
+
+	// 先按 24 小时窗口拉一次面板快照：它必须裁剪。
+	snap := r.Snapshot(24, nil)
+	if snap.Totals.PromptTokens != 10 {
+		t.Fatalf("Snapshot(24) prompt=%d want 10（面板窗口必须生效）", snap.Totals.PromptTokens)
+	}
+	// 再查 /v1/stats 的缺省口径：仍是全量，两个模型都在。
+	if got := r.Stats(0).Total.PromptTokens; got != 1009 {
+		t.Errorf("Stats(0) prompt=%d want 1009（/v1/stats 缺省全量，不得被面板窗口影响）", got)
+	}
+	if got := len(r.Stats(0).Models); got != 2 {
+		t.Errorf("Stats(0) models=%d want 2", got)
+	}
+	// 显式给 hours 时才裁剪（既有语义不变）。
+	if got := r.Stats(24).Total.PromptTokens; got != 10 {
+		t.Errorf("Stats(24) prompt=%d want 10（显式窗口照旧生效）", got)
+	}
+}
+
 // 落盘→恢复后统计口径不变（新字段随桶一起持久化）。
 func TestStatsSurvivesFlushLoad(t *testing.T) {
 	path := t.TempDir() + "/usage.json"
