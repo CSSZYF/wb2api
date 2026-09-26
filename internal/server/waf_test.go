@@ -129,7 +129,7 @@ func TestApplyErrorPolicyWafRetryAfter(t *testing.T) {
 
 	reset := time.Now().Add(5 * time.Minute) // > 75s 抖动上限，验证确实取头值
 	ue := &upstream.Error{Kind: upstream.ErrWafBlock, Status: 403, RetryAfter: 5 * time.Minute}
-	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", ue)
+	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", ue, nil)
 	st, _ := p.Status("u1")
 	if !st.Cooling || st.Disabled {
 		t.Fatalf("WAF+retry-after must soft-cool without disable: %+v", st)
@@ -147,7 +147,7 @@ func TestApplyErrorPolicySoftRateRetryAfter(t *testing.T) {
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
 	ue := &upstream.Error{Kind: upstream.ErrSoftRate, Status: 429, RetryAfter: 3 * time.Minute}
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", ue)
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", ue, nil)
 	st, _ := p.Status("u1")
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("429+retry-after must soft-cool: %+v", st)
@@ -172,7 +172,7 @@ func TestApplyErrorPolicySoftRateBodyResetBeatsHeader(t *testing.T) {
 	ts := bodyReset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
 	body := `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`
 	ue := &upstream.Error{Kind: upstream.ErrSoftRate, Status: 429, RetryAfter: 1 * time.Minute} // 头值与文案明显不同
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "glm-5.3", ue)
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "glm-5.3", ue, nil)
 	st, _ := p.Status("u1")
 	if d := st.Until.Sub(bodyReset); d < -time.Second || d > time.Second {
 		t.Errorf("until=%v want ~bodyReset=%v (body reset must beat header)", st.Until, bodyReset)
@@ -226,7 +226,7 @@ func TestChatWafEscalatesSoftStreak(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: time.Minute})
 
-	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil)
+	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil, nil)
 	st1, _ := p.Status("u1")
 	if st1.SoftStreak != 1 {
 		t.Fatalf("first WAF should set soft_streak=1, got %d", st1.SoftStreak)
@@ -237,7 +237,7 @@ func TestChatWafEscalatesSoftStreak(t *testing.T) {
 
 	// 等第一次冷却到期后再触发 → streak=2，时长翻倍（120s 抖动界 [90s,150s]）。
 	p.Cooldown("u1", pool.CoolSoft, 0, "force expiry")
-	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil)
+	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil, nil)
 	st2, _ := p.Status("u1")
 	if st2.SoftStreak != 2 {
 		t.Fatalf("second WAF should set soft_streak=2, got %d", st2.SoftStreak)
@@ -254,10 +254,10 @@ func TestChatWafProbeNoEscalation(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: time.Minute})
 
-	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil)
+	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil, nil)
 	before, _ := p.Status("u1")
 	for n := 0; n < 3; n++ {
-		h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil)
+		h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil, nil)
 	}
 	after, _ := p.Status("u1")
 	if after.SoftStreak != before.SoftStreak {
@@ -348,7 +348,7 @@ func TestWafCooldownMsgFmt(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p})
-	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil)
+	h.applyErrorPolicy("u1", upstream.ErrWafBlock, "", "", nil, nil)
 	st, _ := p.Status("u1")
 	if st.Reason != "waf 403 block" {
 		t.Errorf("reason=%q want %q", st.Reason, "waf 403 block")

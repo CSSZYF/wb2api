@@ -103,11 +103,65 @@ func TestClassify(t *testing.T) {
 		// 须归 ErrSoftRate（否则只换号不冷却，坏号留在池内反复被选中）。
 		{400, `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at 2026-09-18 09:31:32 UTC+8"}`, ErrSoftRate},
 		{200, `usage exceeds frequency limit`, ErrSoftRate},
+		// 11135 invalid_image_data（图片数据无效）→ ErrInvalidImage：请求级**终态**
+		// （同一张图换任何账号都被拒），判在通用 ErrClient 兜底之前。此前落 ErrClient
+		// → applyErrorPolicy default 喂 NoteFailures → 每个账号各记一次连败 → 达阈
+		// 全池降权 10 分钟（用户实测的 503 自伤来源）。
+		{400, body11135, ErrInvalidImage},
+		{400, `{"code":11135,"msg":"x"}`, ErrInvalidImage},
+		{400, `{"extError":{"code":"invalid_image_data"}}`, ErrInvalidImage},
+		{400, `Please start a new conversation, replace the image, and try again.`, ErrInvalidImage},
+		// 只认请求级 4xx（与 11115 同口径 isInvalidImageStatus）：429/5xx 语义更权威
+		// （限流/服务端故障），在上方各自状态码层已短路。
+		{413, `{"code":11135,"msg":"x"}`, ErrInvalidImage},
+		{404, `{"code":11135,"msg":"x"}`, ErrInvalidImage},
+		{429, `{"code":11135,"msg":"x"}`, ErrSoftRate},
+		{500, `{"code":11135,"msg":"x"}`, ErrServer},
+		// 11135 撞在 requestId 上不算（codeMarker 只认 code 字段）。
+		{400, `{"requestId":"11135","msg":"ok"}`, ErrClient},
+		// 11133 model_param_invalid → ErrBadParams：**不罚号但仍轮转**（不同账号可能
+		// 路由到不同后端、模型能力/权限不同——11102 的 (账号,模型) 负缓存是既有证据），
+		// 轮转仍有价值；但绝不能落 ErrClient（那里喂连败，N 账号轮转 = N 次计数）。
+		{400, body11133, ErrBadParams},
+		{400, `{"code":11133,"msg":"Invalid request parameters"}`, ErrBadParams},
+		{400, `{"extError":{"code":"model_param_invalid"}}`, ErrBadParams},
+		{400, `The request parameters do not meet the current model requirements`, ErrBadParams},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d,%q)=%v want %v", c.status, c.body, got, c.want)
 		}
+	}
+}
+
+// TestErrFingerprint 错误指纹（同一错误形态的请求级去重键）：取业务 code
+// （顶层 code，缺省回落 extError.code），**不含 requestId**——上游每个响应都带
+// 每次请求都不同的 requestId，整 body 比对永远不等，去重会失效。判不出 → 空串
+// （调用方保守处理：不去重，不吞计数）。
+func TestErrFingerprint(t *testing.T) {
+	cases := []struct {
+		name, body, want string
+	}{
+		{"顶层 code 数字", `{"code":11148,"msg":"m","requestId":"r1"}`, "11148"},
+		{"顶层 code 字符串", `{"code":"400001","msg":"m"}`, "400001"},
+		{"extError.code 回落", `{"msg":"m","extError":{"code":"invalid_image_data"}}`, "invalid_image_data"},
+		{"requestId 不参与", `{"requestId":"r1","msg":"m"}`, ""},
+		{"非 JSON", `<html>403</html>`, ""},
+		{"空 body", ``, ""},
+		{"code 为 null", `{"code":null,"msg":"m"}`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ErrFingerprint(c.body); got != c.want {
+				t.Errorf("ErrFingerprint(%q)=%q want %q", c.body, got, c.want)
+			}
+		})
+	}
+	// 同一错误形态、不同 requestId → 同指纹（去重键的语义核心）。
+	a := ErrFingerprint(`{"code":11148,"msg":"tool calls and tool results do not match","requestId":"rq-1"}`)
+	b := ErrFingerprint(`{"code":11148,"msg":"tool calls and tool results do not match","requestId":"rq-2"}`)
+	if a == "" || a != b {
+		t.Errorf("同一错误形态不同 requestId 必须同指纹: %q vs %q", a, b)
 	}
 }
 
