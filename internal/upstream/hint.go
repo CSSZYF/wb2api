@@ -25,9 +25,12 @@ import (
 //   - Model / ModelInCatalog / ModelSupportsImages：模型目录对该模型的
 //     supports_images 声明（目录未收录 → 不做「不支持」判定，防查不到误判成不支持）。
 //
-// 判定次序：11133/11135 上游业务码**先于** Kind 表——实测这两族归 ErrClient/
-// ErrBadParams 皆有可能（Classify 词表不含 11133），hint 层自带判定（hint 是补充
-// 说明非权威分类，误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
+// 判定次序：11133/11135 上游业务码**先于** Kind 表——这两族的 hint 依赖请求侧
+// 上下文（11133 的「模型不支持图片」指向要 HasImage + 目录证据），且历史上
+// Classify 词表不含 11133（归 ErrClient/ErrBadParams 皆有可能）；hint 层自带判定
+// 是补充说明非权威分类，误判代价只是多一条中性补充说明。其余走 Kind 一对一映射。
+// （11135 现已由 Classify 判为 ErrInvalidImage；形态分支同时接受该 Kind，两者共用
+// 同一句文案。）
 func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	// 11133 model_param_invalid 家族（图片回归实测：不支持图片的模型传图，或任意
 	// 参数被模型供应商拒绝）。只有请求确实带图、且目录能对该模型做出「不支持图片」
@@ -39,7 +42,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "request parameters were rejected by the model provider; check message format and model capabilities"
 	}
 	// 11135 invalid_image_data 家族（图片数据无效，Discussion #77 实测形态）。
-	if isInvalidImageData(msg) {
+	// 条件里带上 Kind：Classify 现已把 11135 归 ErrInvalidImage（请求级终态），
+	// 形态分支与 Kind 分支共用**同一句文案**（不引入第二套措辞）；kind 命中而 body
+	// 未命中 marker（如 uerr.Msg 被截断到 200 字符）时仍能给出该 hint。
+	if isInvalidImageData(msg) || kind == ErrInvalidImage {
 		return "image data rejected by upstream; use a real/valid image, may need a new conversation"
 	}
 	switch kind {
@@ -65,6 +71,7 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "request content was rejected by content policy; adjust the prompt and retry"
 	default:
 		// ErrNone/ErrNotFound/ErrServer/ErrBadParams/ErrClient 等未覆盖形态：无 hint。
+		// （ErrInvalidImage 已在上方 11135 形态分支覆盖，不走 Kind 表。）
 		return ""
 	}
 }

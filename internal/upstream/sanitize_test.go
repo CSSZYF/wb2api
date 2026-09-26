@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -367,4 +368,116 @@ func TestChatStreamWireBodySanitizeDisabled(t *testing.T) {
 func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
+}
+
+// TestImagePartByteIdenticalThroughPipeline 图片 part 逐字节透传锁定（图片数据排查）。
+//
+// 结论（代码路径证据）：出站净化管线**不改动 image part 的任何字节**。三条可能
+// 碰到 part 的路径各自的作用面都不含 image_url：
+//   - sanitizeContent：只对 part 的 "text" 键（string 形态）调 sanitizeText，
+//     image_url part 没有 text 键 → 连 hasFingerprint 预检都不会对它执行；
+//   - zeroWidthContent：同样只认 part 的 "text" 键，且只作用于 system 角色消息；
+//   - promoteReasoningParts：只移除 type=="reasoning" 的 part（image part 按原
+//     map 引用保留在数组里），不重排、不扁平化；
+//   - repackToolResultBlocks / cleanupOrphanToolCalls：按 role/tool_call_id 整条
+//     消息级重排/删除，不触碰 content part。
+//
+// 本测试把该结论钉死：出站 wire body 里三个 image part 的 url/detail 与输入逐字节
+// 相同（base64 data URL 连**原始 wire 字节**都相同）。
+//
+// 为什么值得锁：图片是用户数据，改一个字节就可能让上游判 invalid_image_data
+// （11135「图片无法识别」）。若这破坏由网关自己造成，在网关侧完全不可见——
+// 只有把「出站 == 入站」写成断言才能钉住。
+func TestImagePartByteIdenticalThroughPipeline(t *testing.T) {
+	const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+	pngURL := "data:image/png;base64," + pngB64
+	// 对抗样本：非 base64 data URL，且**整串命中净化面**（身份句 + 零宽字符 +
+	// header 键名 + 可改写的模板句）。净化层若把 url 当普通文本处理，这里会被
+	// 改写/剥离/插入 U+200B——测试立刻红。
+	fpURL := "data:image/svg+xml;utf8," + ccIdentity + "\u200b x-anthropic-billing-hdr " + ccBranch
+	httpURL := "https://cdn.example.com/img?w=64&h=64&sig=a+b/c="
+
+	in := `{"model":"glm-5.2","messages":[` +
+		`{"role":"system","content":"` + ccIdentity + ` ` + ccBranch + ` x-anthropic-billing-hdr: v1 "},` +
+		`{"role":"assistant","content":[` +
+		`{"type":"reasoning","text":"think: ` + ccIdentity + `"},` +
+		`{"type":"image_url","image_url":{"url":"` + pngURL + `","detail":"high"}}]},` +
+		`{"role":"user","content":[` +
+		`{"type":"text","text":"what is this"},` +
+		`{"type":"image_url","image_url":{"url":"` + fpURL + `"}},` +
+		`{"type":"image_url","image_url":{"url":"` + httpURL + `"}}]}]}`
+
+	// fixture 自检：字面量必须真的含指纹形态与零宽字符（防测试文件本身被改写而静默失效）。
+	if !strings.Contains(in, "x-anthropic-billing-hdr") || !strings.Contains(in, ccIdentity) ||
+		!strings.Contains(in, "\u200b") {
+		t.Fatalf("fixture 构造异常（字面量被改写）: %s", in)
+	}
+
+	out := PrepareBodyOptRealmHistory([]byte(in), "cn", true, true, ReasoningHistoryFull, nil, nil)
+
+	// 1) 原始 wire 字节：base64 data URL 是纯 base64 字符集（JSON 无需转义任何字符）
+	//    → 必须**逐字节**原样出现在出站 body 里（不是「解码后相同」，是 wire 上相同）。
+	if !bytes.Contains(out, []byte(pngURL)) {
+		t.Errorf("base64 image url 未逐字节出现在出站 wire body:\n%s", out)
+	}
+
+	// 2) 逐 part 值级：解出出站 body，image part 的 url/detail 与输入逐字节相同。
+	//    （http URL 里的 & 会被 encoding/json 转义为 \u0026——那是 JSON 编码层的
+	//    无损转义，上游 JSON 解析后拿到的字符串与输入逐字节相同，故对含 & 的样本
+	//    按**解码值**断言；对 image 数据本身零影响。）
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("outbound body not json: %v\n%s", err, out)
+	}
+	var urls, details []string
+	for _, m := range got["messages"].([]any) {
+		mm, _ := m.(map[string]any)
+		parts, _ := mm["content"].([]any)
+		for _, p := range parts {
+			pp, ok := p.(map[string]any)
+			if !ok || pp["type"] != "image_url" {
+				continue
+			}
+			iu, _ := pp["image_url"].(map[string]any)
+			u, _ := iu["url"].(string)
+			urls = append(urls, u)
+			if d, ok := iu["detail"].(string); ok {
+				details = append(details, d)
+			}
+		}
+	}
+	want := []string{pngURL, fpURL, httpURL}
+	if len(urls) != len(want) {
+		t.Fatalf("出站 image part 数=%d want %d: %q", len(urls), len(want), urls)
+	}
+	for i := range want {
+		if urls[i] != want[i] {
+			t.Errorf("image part[%d] url 被改写:\n got=%q\nwant=%q", i, urls[i], want[i])
+		}
+	}
+	if len(details) != 1 || details[0] != "high" {
+		t.Errorf("image part detail 被改写: %v", details)
+	}
+	// 零宽字符必须原样保留（零宽净化只作用于 system 的文本 part，不碰 image url）。
+	if !strings.Contains(urls[1], "\u200b") {
+		t.Errorf("image url 里的零宽字符被剥离: %q", urls[1])
+	}
+
+	// 3) 同时确认净化**确实执行了**（排除「管线提前 return、什么都没动」的假绿）：
+	//    system 文本的指纹被剥离/改写、被插入零宽字符；reasoning part 被提升为顶层
+	//    字段且 image part 仍留在 content 数组里（结构搬移不丢图片）。
+	sys, _ := got["messages"].([]any)[0].(map[string]any)["content"].(string)
+	if strings.Contains(sys, "x-anthropic-billing-hdr") || strings.Contains(sys, ccIdentity) {
+		t.Errorf("system 指纹未净化（管线未真正执行）: %q", sys)
+	}
+	if !strings.Contains(sys, "\u200b") {
+		t.Errorf("零宽净化未执行（system 文本应被插入 U+200B）: %q", sys)
+	}
+	asst := got["messages"].([]any)[1].(map[string]any)
+	if rc, _ := asst["reasoning_content"].(string); !strings.Contains(rc, "think") {
+		t.Errorf("reasoning part 未提升为 reasoning_content: %v", asst)
+	}
+	if parts, _ := asst["content"].([]any); len(parts) != 1 {
+		t.Errorf("提升 reasoning part 后 content 应只剩 image part: %v", asst["content"])
+	}
 }

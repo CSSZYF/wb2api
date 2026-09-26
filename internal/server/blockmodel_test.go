@@ -96,7 +96,7 @@ func TestApplyErrorPolicyModelBlockedNoAccountCooldown(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: time.Minute})
-	h.applyErrorPolicy("u1", upstream.ErrModelBlocked, `{"code":11102}`, "glm-5.2", nil)
+	h.applyErrorPolicy("u1", upstream.ErrModelBlocked, `{"code":11102}`, "glm-5.2", nil, nil)
 	st, _ := p.Status("u1")
 	if st.Cooling || st.Disabled || st.BreakerFails != 0 {
 		t.Fatalf("ErrModelBlocked 不得冷却/禁用/喂熔断: %+v", st)

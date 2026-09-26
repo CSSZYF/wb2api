@@ -25,7 +25,7 @@ func TestApplyErrorPolicyErrClientFeedsConsecutiveFails(t *testing.T) {
 	// 前阈-1 次：只计数，不冷却不熔断。
 	for n := 0; n < 2; n++ {
 		ue := &upstream.Error{Kind: upstream.ErrClient, Status: 400, Msg: `{"code":1,"msg":"unknown business error"}`}
-		h.applyErrorPolicy("u1", upstream.ErrClient, `{"code":1,"msg":"unknown business error"}`, "", ue)
+		h.applyErrorPolicy("u1", upstream.ErrClient, `{"code":1,"msg":"unknown business error"}`, "", ue, nil)
 	}
 	st, _ := p.Status("u1")
 	if st.Cooling || st.Disabled || st.BreakerFails != 0 {
@@ -36,7 +36,7 @@ func TestApplyErrorPolicyErrClientFeedsConsecutiveFails(t *testing.T) {
 	}
 	// 达阈第 3 次：降权（Cooling 呈 degrade 形态），仍不熔断不禁用。
 	ue := &upstream.Error{Kind: upstream.ErrClient, Status: 400, Msg: `x`}
-	h.applyErrorPolicy("u1", upstream.ErrClient, `x`, "", ue)
+	h.applyErrorPolicy("u1", upstream.ErrClient, `x`, "", ue, nil)
 	st, _ = p.Status("u1")
 	if !st.Cooling || st.Reason != "consecutive failures" || st.CoolKind != "degrade" {
 		t.Fatalf("达阈应触发降权: %+v", st)
@@ -51,7 +51,7 @@ func TestApplyErrorPolicyErrNoneNotFed(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p})
-	h.applyErrorPolicy("u1", upstream.ErrNone, "", "", nil)
+	h.applyErrorPolicy("u1", upstream.ErrNone, "", "", nil, nil)
 	st, _ := p.Status("u1")
 	if st.ConsecutiveFails != 0 {
 		t.Fatalf("ErrNone 不应喂连败, got %d", st.ConsecutiveFails)
@@ -65,8 +65,8 @@ func TestApplyErrorPolicyClassifiedErrorsNotFed(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: time.Minute})
 
-	h.applyErrorPolicy("u1", upstream.ErrServer, "boom", "", &upstream.Error{Kind: upstream.ErrServer, Status: 500, Msg: "boom"})
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "rate limit", "", &upstream.Error{Kind: upstream.ErrSoftRate, Status: 429, Msg: "rate limit"})
+	h.applyErrorPolicy("u1", upstream.ErrServer, "boom", "", &upstream.Error{Kind: upstream.ErrServer, Status: 500, Msg: "boom"}, nil)
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "rate limit", "", &upstream.Error{Kind: upstream.ErrSoftRate, Status: 429, Msg: "rate limit"}, nil)
 	st, _ := p.Status("u1")
 	if st.ConsecutiveFails != 0 {
 		t.Fatalf("权威分类错误不应喂连败（惩罚已存在，不重复计罚）, got %d", st.ConsecutiveFails)
@@ -96,7 +96,7 @@ func TestApplyErrorPolicyWafAndNotFoundNotFed(t *testing.T) {
 		{upstream.ErrPromptTooLong, "prompt is too long"},
 	}
 	for _, c := range cases {
-		h.applyErrorPolicy("u1", c.kind, c.body, "glm-5.2", &upstream.Error{Kind: c.kind, Status: 400, Msg: c.body})
+		h.applyErrorPolicy("u1", c.kind, c.body, "glm-5.2", &upstream.Error{Kind: c.kind, Status: 400, Msg: c.body}, nil)
 	}
 	st, _ := p.Status("u1")
 	if st.ConsecutiveFails != 0 {

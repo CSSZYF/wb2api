@@ -732,6 +732,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer st.done()
 
 	tried := map[string]bool{}
+	// 请求级错误去重（见 errDedup）：本请求内已喂过连败的错误指纹。ErrClient
+	// （未知 4xx）分支继续轮转，若不去重，一个请求级 4xx 会在 N 个账号上各记一次
+	// 连败——一个请求就能把整池推向降权阈值（与 11135 修复前的自伤面同形）。
+	errDedup := newErrDedup()
 	var lastErr error
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
@@ -1033,7 +1037,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// （此前会落到 503 no_healthy_account + lastErr 泄露 11128 与账号语义）。
 				// 不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError），但 content_blocked
 				// 是本请求的终态——换任何账号都会撞同一审核，轮转纯属浪费时间。
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr, errDedup)
 				fail(acct.UID)
 				msg := upstream.ContentBlockedClientMessage(string(respBody))
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg,
@@ -1049,10 +1053,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
 			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
 			if kind == upstream.ErrPromptTooLong {
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr, errDedup)
 				fail(acct.UID)
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				return
+			}
+			// 11135「invalid_image_data」：请求级**终态**——图片数据是否可识别是请求的
+			// 属性（同一张图换任何账号都被上游拒），与 11115/内容策略拦截同哲学：立即
+			// 透传上游原文回客户端，**不罚号不轮转**。
+			// 此前该形态落 Classify 的通用 4xx 兜底 ErrClient → applyErrorPolicy default
+			// 分支喂连败计数（NoteFailures）+ 逐号轮转 → 每个账号各记一次连败 → 达阈
+			// （默认 5）全体降权 10 分钟，即用户实测的「一张坏图换来 503 all accounts
+			// unavailable (cooling/disabled)」。请求级错误的证据不指向任何单个账号，
+			// 不该由账号池承担代价。
+			// applyErrorPolicy ErrInvalidImage 分支零动作（不冷却/不熔断/不 NoteError、
+			// 不喂连败），fail 只释放租约；error-passthrough：message 装上游 body 原文
+			// （code/extError/displayMsg/actions 原样，含上游 zh 文案——上游原文是最有
+			// 价值的错误信息，客户端必须看到，禁止固定词覆盖）。
+			if kind == upstream.ErrInvalidImage {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr, errDedup)
+				fail(acct.UID)
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_image_data", invalidImageMessage(string(respBody)),
+					h.hintOf(upstream.ErrInvalidImage, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				return
 			}
@@ -1060,7 +1084,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 要求原文全量）+ Kind/Status（末端映射与冷却时长共用）+ RetryAfter
 			// （末端 429 映射与冷却对齐共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr, errDedup)
 			fail(acct.UID)
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
 			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，IP 被拦而非账号）
@@ -1274,7 +1298,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //     （同一 body 换任何号都超限）。零动作（不冷却/不熔断/不 NoteError、不喂连败，
 //     同 ErrContentBlocked 待遇），chatCompletions 已直接透传原文返回不轮转——
 //     该分支只为文档完备，不指望走到换号路径。
+//   - ErrInvalidImage → 11135「invalid_image_data」：请求级**终态**（图片数据无效是
+//     请求的问题，同一张图换任何号都被拒）。零动作（不冷却/不熔断/不 NoteError、
+//     不喂连败，同 ErrContentBlocked/ErrPromptTooLong 待遇），chatCompletions 已直接
+//     透传原文返回不轮转——该分支只为文档完备，不指望走到换号路径。
 //   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
+//     11133 model_param_invalid 也归本类（轮转有价值：不同账号可能路由到不同后端、
+//     模型能力/权限不同；但绝不喂连败——轮转 N 个号 = N 次计数）。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
 //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
@@ -1283,16 +1313,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池——
 //     「不知道原因的兜底」，与冷却「知道原因的惩罚」并存取更长者不叠加（healthy
 //     或门；带权威分类的错误不喂连败，防重复计罚）。ErrNone 零防御路径不喂。
+//     同一请求内**同一错误指纹**只喂首个账号（dedup，见 errDedup）：ErrClient 分支
+//     继续轮转，不去重的话一个请求级 4xx 会在 N 个账号上各记一次连败——一个请求
+//     就能把整池推向降权（与 11135 修复前的自伤面同形）。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
 // 携带的模型名（出站裸名：6004 记模型豁免、11102 记 (账号,模型) 负缓存）。uerr 是
 // ChatStreamContext 返回的分类信封（可携带 RetryAfter，P1-2）；防御路径下为 nil，
 // 冷却时长回落既有计算。
 //
+// dedup 是**单请求**的错误去重状态（nil = 不去重，单元调用/防御路径合法）：只作用于
+// default 分支 ErrClient 的连败喂入（见 errDedup 与 default 分支注释），其余分类不读它。
+//
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；余额恢复解冻（ReenableIfCredits→reviveCoolingLocked）
 // 仅对硬冷却放行（issue #199 收窄：软冷却/模型级冷却不被余额刷新/签到解冻），且只清冷却、不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
+func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error, dedup *errDedup) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
@@ -1368,11 +1404,23 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked
 		// 待遇），chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备，
 		// 不指望走到换号路径。
+	case upstream.ErrInvalidImage:
+		// 11135「invalid_image_data」：请求级**终态**（图片数据无效是请求的问题，
+		// 同一张图换任何号都被拒，与 11115 同哲学）。零动作（不冷却/不熔断/
+		// 不 NoteError/不喂连败，同 ErrContentBlocked/ErrPromptTooLong 待遇），
+		// chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备。
+		// 为什么零动作：此前该形态落 ErrClient → 本函数 default 喂连败 + 逐号轮转，
+		// 一张坏图让每个账号各记一次连败、达阈全池降权 10 分钟（用户实测 503）。
+		// 图片是否可识别与账号健康无关，不该由账号池承担代价。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
+		// 11133 model_param_invalid 同归本类（Classify 见 isModelParamInvalid）：它可能
+		// 是「该模型不支持图片」这类与账号无关的参数拒绝，也可能是账号侧后端差异——
+		// 轮转仍有价值（11102 的 (账号,模型) 负缓存证明同模型在不同账号上可用性不同），
+		// 但绝不能喂连败：本分支零动作即天然满足（ErrClient 的连败喂入不经过这里）。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
 		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
@@ -1386,8 +1434,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
 		// 注意「只换号不罚」的既有语义不变：NoteFailures 不是惩罚（不冷却/不熔断/
 		// 不 Disable/不 NoteError），只是「记录以便达阈降权」，且成功一次即清零回池。
+		//
+		// 请求级去重（dedup，见 errDedup）：同一请求内**同一错误指纹**只喂首个账号。
+		// ErrClient 分支继续轮转，不去重则一个请求级 4xx 在 N 个账号上各记一次连败
+		// ——一个请求就能把整池推向降权（与 11135 修复前的自伤面同形）。指纹取业务
+		// code（ErrFingerprint，不含逐请求变化的 requestId）；判不出指纹时保守喂。
 		if kind == upstream.ErrClient {
-			h.cfg.Pool.NoteFailures(uid)
+			if dedup.claimErrClient(upstream.ErrFingerprint(body)) {
+				h.cfg.Pool.NoteFailures(uid)
+			}
 		}
 	}
 }
@@ -1416,6 +1471,54 @@ func promptTooLongMessage(body string) string {
 		return "prompt is too long"
 	}
 	return body
+}
+
+// invalidImageMessage 11135 透传 message：上游 body 原文（含 code/extError/
+// displayMsg/requestId/actions，客户端自行排查）；空 body 兜底为可读分类短文案
+// （不编造原文、不用本地调度固定词覆盖）。
+func invalidImageMessage(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return "invalid image data"
+	}
+	return body
+}
+
+// errDedup 单请求内的错误去重状态（chatCompletions 每请求新建，见 applyErrorPolicy
+// 的 dedup 参数）。
+//
+// 解决的自伤面（issue #114 连败降权的反向代价）：ErrClient（未知 4xx）在
+// applyErrorPolicy default 分支喂连败计数，而该分支**继续轮转**——同一个请求级 4xx
+// 依次打到 N 个账号上，N 个账号就各记一次连败，一个请求即可把整个池子推向降权
+// 阈值（默认 5 次 → 降权 10 分钟），与 11135 修复前的自伤面同形。
+// 一个请求内**重复出现的同一错误形态**不构成对后续账号的独立证据（同一请求在别的
+// 账号上复现，恰恰说明它是请求级的），故只喂首个账号。
+//
+// 边界（有意收窄）：只影响「喂不喂连败」这一个动作——轮转/冷却/熔断/禁用等任何
+// 既有语义都不变；不同错误形态（不同业务 code）各自独立计数（不同错误是不同证据，
+// 未被吞掉）；指纹判不出（非 JSON/无 code）一律喂（保守，不吞计数）。带权威分类的
+// 错误（ErrServer/ErrSoftRate/ErrBadParams/ErrInvalidImage/…）根本不走本表。
+type errDedup struct {
+	errClient map[string]bool
+}
+
+// newErrDedup 建单请求去重状态。
+func newErrDedup() *errDedup { return &errDedup{errClient: map[string]bool{}} }
+
+// claimErrClient 报告本次 ErrClient 失败是否应喂连败：同一请求内首次出现的错误
+// 指纹返回 true 并记账，重复出现返回 false。nil 接收者/空指纹（判不出形态，如
+// 非 JSON body）一律 true——不去重、不吞计数（保守）。
+func (d *errDedup) claimErrClient(fingerprint string) bool {
+	if d == nil || fingerprint == "" {
+		return true
+	}
+	if d.errClient == nil {
+		d.errClient = map[string]bool{}
+	}
+	if d.errClient[fingerprint] {
+		return false
+	}
+	d.errClient[fingerprint] = true
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -1478,21 +1581,39 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 }
 
 // hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态
-// messages[].content[] {type:"image_url"}）。畸形/其他形态一律 false（hint 侧
-// 宁缺勿滥：判不出带图就不给「模型不支持图片」指向）。
+// messages[].content[] {type:"image_url"}）。
+//
+// 判定只认 part 的 type 字段，不看 url 内容——data: URL（base64 / utf8）与 http(s)
+// URL 两种形态同样命中（11133 的「模型不支持图片」指向只关心「有没有图」）。
+//
+// 逐条消息、逐条 content 独立尽力解析（不整块 Unmarshal 到固定结构）：混合形态
+// （有的消息 content 是字符串、有的是带图数组）下，整块解析会因字符串 content 的
+// 类型错误**整体失败**、函数提前返回 false，从而漏判「请求带图」——11133 的换模型
+// hint 前提随之丢失（实测复现）。单条解析失败只跳过该条，其余消息照常判定。
+//
+// 畸形/其他形态（messages 非数组、content 非数组/非字符串、part 非对象）一律
+// 跳过；全部判不出 → false（hint 侧宁缺勿滥：判不出带图就不给「模型不支持图片」指向）。
 func hasImagePart(body []byte) bool {
 	var peek struct {
-		Messages []struct {
-			Content []struct {
-				Type string `json:"type"`
-			} `json:"content"`
-		} `json:"messages"`
+		Messages []json.RawMessage `json:"messages"`
 	}
 	if json.Unmarshal(body, &peek) != nil {
 		return false
 	}
-	for _, m := range peek.Messages {
-		for _, p := range m.Content {
+	for _, raw := range peek.Messages {
+		var m struct {
+			Content json.RawMessage `json:"content"`
+		}
+		if json.Unmarshal(raw, &m) != nil {
+			continue
+		}
+		var parts []struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(m.Content, &parts) != nil {
+			continue // content 是字符串/null/对象等非数组形态：本条无 part 可判
+		}
+		for _, p := range parts {
 			if p.Type == "image_url" {
 				return true
 			}

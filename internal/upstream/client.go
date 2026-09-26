@@ -38,6 +38,7 @@ const (
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrInvalidImage                  // 11135「invalid_image_data」→ 请求级终态（图片数据无效是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
 	ErrClient                        // 其他 4xx / 业务错误
@@ -63,6 +64,8 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrPromptTooLong:
 		return "prompt_too_long"
+	case ErrInvalidImage:
+		return "invalid_image"
 	case ErrModelBlocked:
 		return "model_blocked"
 	case ErrWafBlock:
@@ -166,6 +169,13 @@ var promptTooLongMarkers = []string{
 
 // isPromptTooLongStatus 11115 只在请求级 4xx 上判（见 promptTooLongMarkers 注释）。
 func isPromptTooLongStatus(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound ||
+		status == http.StatusRequestEntityTooLarge
+}
+
+// isInvalidImageStatus 11135 只在请求级 4xx 上判（与 isPromptTooLongStatus 同口径，
+// 见 Classify 里 11135 分支注释）：429/5xx 的限流/服务端故障语义更权威。
+func isInvalidImageStatus(status int) bool {
 	return status == http.StatusBadRequest || status == http.StatusNotFound ||
 		status == http.StatusRequestEntityTooLarge
 }
@@ -537,15 +547,20 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 //  7. 11115（IsPromptTooLong）—— 「prompt is too long」请求级语义：判在 404/5xx 与
 //     通用 4xx 兜底之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限
 //     与账号无关）。只认 400/404/413（429/5xx 已在上方各自状态码层短路）。
-//  8. 404 / 5xx —— 与限流无关的常规分类。
-//  9. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：WAF 拦截形态
+//  8. 11135（isInvalidImageData）—— 「invalid_image_data」请求级**终态**：判在
+//     404/5xx 与通用 4xx 兜底之前（与第 7 层同位置、同理由：图片数据无效是请求的
+//     属性，与账号无关；落 ErrClient 兜底会喂连败计数并逐号轮转 → 一张坏图把整个
+//     账号池拖降权）。只认 400/404/413，词表复用 hint.go 的 isInvalidImageData。
+//  9. 404 / 5xx —— 与限流无关的常规分类。
+//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：WAF 拦截形态
 //     （WAF 403 修复 P0-1）。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient →
 //     applyErrorPolicy 只换号不罚 → 连环 403。带业务信封的 403 已被上方 1-6 层
 //     捕获（11140 request illegal → ErrAccountFault 禁用语义不变），走不到本层。
 //     插在 404/5xx 之后是「只加不重排」：404/5xx 层只认各自状态码，403 不与之
 //     相交，插入点不改变任何既有分类结果。
-//  10. 内容策略/参数错误/其他 4xx —— 通用兜底（内容策略拦截须先于通用 ErrClient，
-//     前者是误报信号、不罚账号，由网关降级重试处理）。
+//  11. 内容策略/参数错误/其他 4xx —— 通用兜底（内容策略拦截须先于通用 ErrClient，
+//     前者是误报信号、不罚账号，由网关降级重试处理）。11133 model_param_invalid
+//     在参数层归 ErrBadParams（不罚号但仍轮转，理由见该层注释）。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
@@ -597,6 +612,19 @@ func Classify(status int, body string) ErrKind {
 	if IsPromptTooLong(status, body) {
 		return ErrPromptTooLong
 	}
+	// 11135「图片数据无效」（invalid_image_data，Discussion #77 实测形态）——请求级
+	// **终态**：同一张图换任何账号都会被上游拒绝（图片是否可识别是请求的属性，与
+	// 账号健康无关），与 11115/内容策略拦截同哲学。判在通用 ErrClient 兜底之前：
+	// 此前该形态落 ErrClient → applyErrorPolicy default 分支喂连败计数（NoteFailures）
+	// → **每个账号各记一次**（ErrClient 分支继续轮转）→ 达阈（默认 5）全体降权
+	// 10 分钟 → 用户实测的「一张坏图换来 503 all accounts unavailable (cooling/
+	// disabled)」自伤。判定复用 hint.go 的 isInvalidImageData 词表（单一事实来源，
+	// 不另立第二套）。
+	// 只认请求级 4xx（见 isInvalidImageStatus，与 isPromptTooLongStatus 同口径）：
+	// 429 限流、5xx 服务端故障在上方各自状态码层已短路，语义更权威。
+	if isInvalidImageStatus(status) && isInvalidImageData(body) {
+		return ErrInvalidImage
+	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
 	}
@@ -619,6 +647,18 @@ func Classify(status int, body string) ErrKind {
 				return ErrContentBlocked
 			}
 		}
+		// 11133 model_param_invalid（"Invalid request parameters" / 参数被模型供应商
+		// 拒绝）：与下一层的 ErrBadParams 同属「请求参数问题」，**不能落 ErrClient**
+		// ——ErrClient 分支喂连败计数（NoteFailures）且继续轮转，N 个账号就记 N 次，
+		// 一个 11133 请求即可把整个池子推向降权（与 11135 同一自伤面）。
+		// 归 ErrBadParams 的既有语义：不罚号（无冷却/熔断/连败）但**仍然轮转**——
+		// 不同账号可能路由到不同后端、模型能力/权限不同（11102 的 (账号,模型) 负缓存
+		// 正是「同模型在不同账号上可用性不同」的既有证据），轮转仍有价值；与
+		// badParamsMarker 两条互不相交，先后不影响既有分类。判定复用 hint.go 的
+		// isModelParamInvalid（单一事实来源，hint 层已用它给「换模型」指向）。
+		if isModelParamInvalid(body) {
+			return ErrBadParams
+		}
 		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
 		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
 		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
@@ -631,6 +671,40 @@ func Classify(status int, body string) ErrKind {
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
 	return ErrNone
+}
+
+// ErrFingerprint 返回上游错误 body 的**请求级稳定指纹**：同一错误形态的跨账号
+// 去重键（handler 侧 ErrClient 连败喂入去重，见 server.applyErrorPolicy 的 dedup）。
+//
+// 为什么取业务 code 而不是整个 body：上游每个响应都带 **requestId**，每次请求都
+// 不同（11133/11135 的实测原始 body 均含 requestId），整 body 比对永远不等，去重
+// 形同虚设。code 才是「同一错误形态」的稳定标识（11148/60001/… 同码即同因）。
+//
+// 取值顺序：顶层 code → extError.code（上游两处都放业务码，实测 11135 顶层
+// code=11135、extError.code=invalid_image_data）。数字与字符串形态都认
+// （`"code":11148` / `"code":"400001"`）。判不出（非 JSON / 无 code 字段）→ 返回
+// 空串，调用方按「判不出」保守处理（不去重、不吞计数）。
+func ErrFingerprint(body string) string {
+	var env struct {
+		Code     json.RawMessage `json:"code"`
+		ExtError struct {
+			Code json.RawMessage `json:"code"`
+		} `json:"extError"`
+	}
+	if json.Unmarshal([]byte(body), &env) != nil {
+		return ""
+	}
+	for _, raw := range []json.RawMessage{env.Code, env.ExtError.Code} {
+		s := strings.TrimSpace(string(raw))
+		if s == "" || s == "null" {
+			continue
+		}
+		// code 可能是 JSON 字符串（"400001"）或数字（11148）：两种形态归一为裸值。
+		if s = strings.TrimSpace(strings.Trim(s, `"`)); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // apiEnvelope 上游统一信封。
