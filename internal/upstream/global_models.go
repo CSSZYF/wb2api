@@ -1,11 +1,19 @@
-// global 模型目录探测：产出模型名及其窗口 / 能力元数据，但**不产倍率**
-// （PLAN §3.D2「模型名目录 ≠ 倍率表」）。
+// global 模型目录探测：产出模型名及其窗口 / 能力元数据；倍率只在**展示只读快照**
+// 出口透出，不进路由 / 列表口径（PLAN §3.D2「模型名目录 ≠ 倍率表」）。
 //
-// credits 数值一律不进入本包实现——探测端点返回的倍率字段在解析阶段（parseGlobalModelInfos）
-// 即被丢弃，元数据只喂 /v1/models 的 global: 前缀输出，不注入 costTier、不参与选号。
+// 倍率的口径（2026-09-27，对齐 sliver 1dfe750 的只读快照语义）：
+//   - 探测端点返回的 credits 字段**照常解析**，但不进 FetchGlobalModelInfos 的返回值
+//     ——那个出口服务 /v1/models 与路由，PLAN §3.D2 明确倍率不进该路径；
+//   - 倍率单独落在缓存的 credits 旁表里，只经 GlobalModelInfosSnapshot 透出，
+//     供 /v1/stats 的展示侧合入。
 //
-// 2026-09-17 修复：本包原先只产模型名（[]string），导致 handler 的 global 分支拿不到
-// 窗口大小、只能输出裸名单，客户端回退到自身小默认值后**提前触发上下文压缩**。
+// 为什么用旁表而不是直接填进 ModelInfo：同一个 []ModelInfo 类型若"经 Fetch 取到就没有
+// 倍率、经 Snapshot 取到就有"，字段含义随读取口变化，是个认知陷阱（后来者会以为
+// Fetch 也能拿到倍率）。旁表把两种口径的边界摆在类型层面：路由/列表口径的条目恒无
+// 倍率，展示口径只能从快照拿。
+//
+// 2026-09-17 修复（保留）：本包原先只产模型名（[]string），导致 handler 的 global 分支
+// 拿不到窗口大小、只能输出裸名单，客户端回退到自身小默认值后**提前触发上下文压缩**。
 // 现改为产出 []ModelInfo（与 CN 侧同构，上游两端点返回的 JSON 形状一致）。
 package upstream
 
@@ -57,6 +65,11 @@ type fetchGlobalModelsCache struct {
 	models   []ModelInfo // 成功缓存：探测基底 ∪ 静态独有（已去重）；nil = 未探测
 	fetched  time.Time
 	lastFail time.Time
+
+	// credits 倍率旁表（裸 id → 上游原文，如 "x0.79"）。**与 models 同生命周期**：
+	// 同一次探测一起落、一起清。只经 GlobalModelInfosSnapshot 透出，不进 models
+	// （PLAN §3.D2：倍率不进 /v1/models 与路由口径）。
+	credits map[string]string
 }
 
 // globalModelsTTL / globalModelsFailCooldown 探测缓存时长：成功 1h，失败 5min 负缓存。
@@ -100,7 +113,8 @@ func (c *Client) FetchGlobalModels(a *auth.Auth) []string {
 // ② GlobalEnabled 关闭时（逃生门）不得调用——本方法由 globalOn(a) 内部兜底，若账号
 // 因开关回落 cn 则返回静态名单（handler 侧仍零探测）。
 //
-// 返回的 Credits 恒为空（PLAN §3.D2：倍率不进 global 路径）。
+// 返回的 Credits 恒为空（PLAN §3.D2：倍率不进 global 路由/列表口径）。倍率落在
+// 缓存旁表里，只经 GlobalModelInfosSnapshot 透出（/v1/stats 展示侧用）。
 func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 	if !c.globalOn(a) {
 		// 逃生门兜底：账号不路由 global 上游 → 不探测，回落静态名单（零上游调用）。
@@ -122,23 +136,60 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 
 	probed, err := c.probeGlobalModels(a)
 	if err != nil || len(probed) == 0 {
-		// 探测失败：负缓存 + 回落静态名单。
+		// 探测失败：负缓存 + 回落静态名单。倍率旁表一并清空（宁可省略，不可留旧值：
+		// 留下上一轮倍率会让 /v1/stats 展示与当前目录脱节的过期数字）。
 		c.globalModels.Lock()
 		c.globalModels.lastFail = time.Now()
 		c.globalModels.models = nil
+		c.globalModels.credits = nil
 		c.globalModels.Unlock()
 		return staticGlobalModelInfos()
 	}
 
 	// 成功：探测结果为基底（纯动态），静态独有条目仅按 id 补齐（元数据留空）。
 	merged := mergeGlobalModelInfos(probed)
+	// 倍率旁表从**探测结果**建（静态独有条目无倍率：它们上游没返回，倍率未知——
+	// 不编造）。探测结果里的 Credits 字段只在此处被读取，落旁表后即从 models 抹掉。
+	credits := make(map[string]string, len(probed))
+	for i := range merged {
+		if cr := merged[i].Credits; cr != "" {
+			credits[merged[i].ID] = cr
+			merged[i].Credits = "" // D2：路由/列表口径恒无倍率
+		}
+	}
 
 	c.globalModels.Lock()
 	c.globalModels.models = merged
+	c.globalModels.credits = credits
 	c.globalModels.fetched = time.Now()
 	c.globalModels.lastFail = time.Time{}
 	c.globalModels.Unlock()
 	return merged
+}
+
+// GlobalModelInfosSnapshot 只读 global 模型目录快照（TTL 内；含倍率原文）。
+//
+// 语义（对齐 sliver 1dfe750）：**只读、不触发探测**。缓存冷 / 过期 / 未探测 → nil，
+// 绝不发起上游请求——与 FetchGlobalModelInfos 的差异点（那个 miss 即探测，服务
+// /v1/models）。本方法服务 /v1/stats 的倍率透出：统计端点被面板高频轮询，任何
+// 上游调用都会变成对上游的额外压力。
+//
+// 返回的条目是 models 的副本，且把旁表里的倍率填回 Credits——**仅本出口**带倍率
+// （见包注释：字段含义不随读取口漂移的做法是旁表 + 单一展示出口，而不是让 Fetch
+// 也带倍率）。未下发的模型 Credits 保持空串：**缺失 ≠ 免费**，调用方必须整体省略
+// 该字段，不得回填 "x0.00"。
+func (c *Client) GlobalModelInfosSnapshot() []ModelInfo {
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	if len(c.globalModels.models) == 0 || time.Since(c.globalModels.fetched) >= globalModelsTTL {
+		return nil
+	}
+	out := make([]ModelInfo, len(c.globalModels.models))
+	copy(out, c.globalModels.models)
+	for i := range out {
+		out[i].Credits = c.globalModels.credits[out[i].ID]
+	}
+	return out
 }
 
 // staticGlobalModelInfos 静态名单 → []ModelInfo（仅 ID，元数据留空，由调用方经
@@ -227,7 +278,9 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]ModelInfo, error
 //     supportsReasoning / supportsImages / reasoning.*；id 缺省时回退 name；disabled 剔除；
 //   - 窄表：data 为字符串数组 → 仅 ID，元数据留空（窗口由调用方兜底）。
 //
-// credits（倍率）**恒不解析**（PLAN §3.D2：倍率不进 global 路径）。
+// credits（倍率）**照常解析**，但只作旁表来源：调用方 FetchGlobalModelInfos 在落缓存时
+// 把 Credits 摘进旁表并从返回条目里抹掉（PLAN §3.D2：倍率不进 /v1/models 与路由口径），
+// 只有 GlobalModelInfosSnapshot 会把它填回（展示侧）。
 // 解析成功但名单为空 → 返回错误（调用方回落静态，等价"该端点没给全"）。
 func parseGlobalModelInfos(raw []byte) ([]ModelInfo, error) {
 	var env struct {
@@ -242,7 +295,7 @@ func parseGlobalModelInfos(raw []byte) ([]ModelInfo, error) {
 	}
 	trimmed := strings.TrimSpace(string(env.Data))
 	if strings.HasPrefix(trimmed, "[") {
-		// 窄表形态：data 为字符串数组。
+		// 窄表形态：data 为字符串数组（无对象字段 → 无倍率）。
 		var arr []string
 		if err := json.Unmarshal(env.Data, &arr); err != nil {
 			return nil, fmt.Errorf("global models parse (narrow): %w", err)
@@ -267,6 +320,7 @@ func parseGlobalModelInfos(raw []byte) ([]ModelInfo, error) {
 			MaxOutputTokens   int64  `json:"maxOutputTokens"`
 			MaxAllowedSize    int64  `json:"maxAllowedSize"`
 			Disabled          bool   `json:"disabled"`
+			Credits           string `json:"credits"`
 			SupportsReasoning bool   `json:"supportsReasoning"`
 			SupportsImages    bool   `json:"supportsImages"`
 			Reasoning         struct {
@@ -304,7 +358,9 @@ func parseGlobalModelInfos(raw []byte) ([]ModelInfo, error) {
 			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			SupportsReasoning:  m.SupportsReasoning,
 			SupportsImages:     m.SupportsImages,
-			// Credits 故意留空：PLAN §3.D2，倍率不进入 global 路径。
+			// Credits 在此解析，但只作旁表来源：调用方落缓存时摘进 credits 旁表
+			// 并从返回条目抹掉（PLAN §3.D2：倍率不进 /v1/models 与路由口径）。
+			Credits: strings.TrimSpace(m.Credits),
 		})
 	}
 	if len(out) == 0 {

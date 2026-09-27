@@ -51,6 +51,18 @@ type StatsModel struct {
 	Credit       float64 `json:"credit"`
 	CreditPerReq float64 `json:"credit_per_req"`
 
+	// Credits 上游积分倍率**原文**（如 "x0.79"），与 /v1/models 的 credits 同源同值
+	// （模型目录只读快照，由 server 侧出口合入，不参与本文件任何聚合）。
+	//
+	// 与上面的 Credit / CreditPerReq 是**两回事**：那两个是真实扣费观测（来自上游
+	// usage 的 credit 字段，是"这次实际扣了多少"）；本字段是目录里的牌价倍率。
+	// 二者不可互相换算，也不得因为本字段存在而改动前者的取值口径。
+	//
+	// **缺失 ≠ 免费**：目录未下发 / 缓存冷 / 查不到条目时字段为空串，JSON 整体省略
+	// （omitempty）。绝不输出 "x0.00" 或空串占位——把未知倍率显示成 0 会被读成
+	// "该模型免费"，据此做容量与成本决策就全错了。
+	Credits string `json:"credits,omitempty"`
+
 	LastSeen *time.Time `json:"last_seen,omitempty"`
 }
 
