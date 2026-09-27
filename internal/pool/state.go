@@ -347,8 +347,22 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	return nil
 }
 
-// AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
-// 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
+// AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表，按**选号顺序**
+// 输出（Pool.Order() 的口径，见 order.go）：有自定义顺序（state.json 顶层
+// account_order）时按该顺序，无自定义顺序时按 UID 升序（改动前的行为，零回归）。
+// 供会话粘性路由（internal/session）做快路径命中校验 + 分配候选；无可用返回空切片。
+//
+// 为什么是「选号顺序」而不是「UID 升序」（顺序填充式选号上线后暴露的分配缺陷）：
+// 本列表的**首元素**就是粘性路由给新会话分配的账号（session.Router.assign 取候选列表
+// 第一个）。此前这里排 UID 升序，于是即使开了 pool.pick_mode=sequential，顺序第一的号
+// 也永远排不到首位——新会话被哈希分散到各个号，「绝大头在第一个号」的顺序填充诉求在
+// 粘性路径上完全落空（顺序模式只在「无会话键 → Pool.Pick」这条路上生效）。
+//
+// 过滤保序：健康/在途过滤只**剔除**元素，不重排其余账号的相对次序（排序统一在过滤后
+// 做一次）。这一条正是顺序模式「满了溢出到下一个号」在粘性路径上的落点——顺序第一的
+// 号在途占满时从列表消失，首元素自然变成顺序里的下一个号。
+//
+// 排序走 sortByOrderLocked（无自定义顺序时即改动前的 sort.Strings 原路径，见 order.go）。
 func (p *Pool) AvailableUIDs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -363,13 +377,14 @@ func (p *Pool) AvailableUIDs() []string {
 		}
 		uids = append(uids, uid)
 	}
-	sort.Strings(uids)
+	p.sortByOrderLocked(uids)
 	return uids
 }
 
 // AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
 // 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）。
 // 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
+// 排序口径与 AvailableUIDs 同源（sortByOrderLocked → Pool.Order()），过滤保序。
 func (p *Pool) AvailableUIDsForModel(model string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -384,7 +399,7 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 		}
 		uids = append(uids, uid)
 	}
-	sort.Strings(uids)
+	p.sortByOrderLocked(uids)
 	return uids
 }
 
