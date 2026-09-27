@@ -889,6 +889,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch"><span class="lb">零宽字符脱敏</span>
               <input type="checkbox" name="zerowidth_sanitize">
               <span class="hint">在 system 消息的指纹词内插入 U+200B，可见文本不变、只破坏逐字匹配（默认关）</span></div>
+            <div class="switch"><span class="lb">上下文超限自动下调 max_tokens 重试</span>
+              <input type="checkbox" name="ptl_max_tokens_retry">
+              <span class="hint">上游回 11115「prompt is too long」且报文里带真实 token 数与上限值时，按超出量下调 max_tokens 重试一次（同一账号、只改这一个字段）；算不出/不适用则保持原样，失败也退回首次原文。默认开；即时生效</span></div>
             <div class="switch"><span class="lb">透传客户端 IP</span>
               <input type="checkbox" name="passthrough_ip">
               <span class="hint">向上游注入 X-Forwarded-For / X-Real-IP；默认关（反代安全边界）；需重启</span></div>

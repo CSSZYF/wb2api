@@ -211,6 +211,23 @@ type Config struct {
 		// 不像 prompt.mode 那样 fail fast：这是个默认关闭的性能开关，拼错一个词就让
 		// 网关起不来，代价远大于收益。
 		ReasoningHistory string `json:"reasoning_history"`
+		// PTLMaxTokensRetry 11115「prompt is too long」时按错误里的真实数字下调
+		// max_tokens 重试一次的开关（**默认 true**）。
+		//
+		// 为什么默认开是安全的：本项只在 11115 时生效，且**失败路径逐字退回首次的原始
+		// 上游错误**（客户端看到的报错与关掉本项时完全一致）——最坏情形只是多打一次
+		// 上游；能算就重试，算不出/不适用一律保持现状（不轮转账号、不记任何惩罚）。
+		//
+		// 假设的诚实说明：依据是实测「max_tokens=128000 + 约 95 万 token 输入 → 11115 报
+		// 1083265 > 1048576；同内容 max_tokens=20000 时被上游计为 955192，
+		// 1083265-955192=128073 ≈ max_tokens」，**强烈提示**上游把 max_tokens 也算进上下文
+		// 上限检查，但**未 100% 证实**（另有一次 max_tokens=1048576 + 极小输入返回 200，
+		// 说明要么不计入、要么 max_tokens 被截到模型上限后再判）。故本项定位是**安全兜底**
+		// 而非结论：真正的语义仍以上游原文为准（透传纪律不变）。
+		//
+		// 判定与下调规则见 internal/upstream/ptl_overshoot.go（含安全余量与下限理由）。
+		// 热生效：面板保存后经 server.Handler.SetPTLMaxTokensRetry 立即生效，无需重启。
+		PTLMaxTokensRetry bool `json:"ptl_max_tokens_retry"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -367,6 +384,9 @@ func Default() *Config {
 	// 历史推理裁剪默认 full（零回归）：这是"改写出站历史"的开关，与上面两个脱敏开关
 	// 同类——默认必须与加本键前逐字节一致，由用户按需在面板/配置里显式切档。
 	c.Features.ReasoningHistory = upstream.ReasoningHistoryFull
+	// 11115 下调 max_tokens 重试默认**开**：只在 11115 时生效、失败逐字退回首次原文
+	// （客户端报错口径不变），最坏情形只是多打一次上游——详见 Features 字段注释。
+	c.Features.PTLMaxTokensRetry = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403
@@ -575,6 +595,12 @@ func applyEnv(c *Config) {
 	// 档位字符串直接覆盖（归一化在 normalize()，与 JSON 同口径）。
 	if v := os.Getenv("WB2A_REASONING_HISTORY"); v != "" {
 		c.Features.ReasoningHistory = v
+	}
+	// 11115 下调 max_tokens 重试开关（默认 true；只有 true/false/1/0 等合法值生效）。
+	if v := os.Getenv("WB2A_PTL_MAX_TOKENS_RETRY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.PTLMaxTokensRetry = b
+		}
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
