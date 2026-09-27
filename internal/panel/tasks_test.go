@@ -20,7 +20,11 @@ import (
 // 首次 GET（accept-all 的待办枚举）恒回 not_accepted，保证列表里确实有待接受的
 // 码；之后的 GET（acceptVerified 的回读）才按 registered 作答。
 // 返回的 *int64 记录 accept 请求次数（用于断言"失败重试一次"）。
-func acceptFakePanel(t *testing.T, registered *atomic.Bool) (*httptest.Server, *int64) {
+//
+// autoRegisterOnRetry=true 时第 2 次 accept 起自动落账，模拟"服务端延迟生效"——
+// 这条路径**不依赖测试侧 goroutine 与重试赛跑**（那种写法在 CI 慢机器上会 flaky，
+// 实测翻车过）。要验证"永远不落账"的失败路径就传 false。
+func acceptFakePanel(t *testing.T, registered *atomic.Bool, autoRegisterOnRetry bool) (*httptest.Server, *int64) {
 	t.Helper()
 	var attempts, lists int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -30,7 +34,12 @@ func acceptFakePanel(t *testing.T, registered *atomic.Bool) (*httptest.Server, *
 		}
 		switch {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/tasks/accept"):
-			atomic.AddInt64(&attempts, 1)
+			if autoRegisterOnRetry && atomic.AddInt64(&attempts, 1) >= 2 {
+				registered.Store(true)
+				st = "accepted"
+			} else if !autoRegisterOnRetry {
+				atomic.AddInt64(&attempts, 1)
+			}
 			// 无论真假都回 200 + OK（旧口径下会被判成"接受成功"）。
 			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"results":[` +
 				`{"task_code":"chat_5","status":"` + st + `"}]}}`))
@@ -81,7 +90,7 @@ func postAcceptAll(t *testing.T, pn *Panel) (int, map[string]any) {
 // 同时断言失败后重试了一次（accept 请求共 2 次）。
 func TestTaskAcceptAllNotRegisteredNotCounted(t *testing.T) {
 	var registered atomic.Bool // 恒 false：模拟服务端始终未落账
-	srv, attempts := acceptFakePanel(t, &registered)
+	srv, attempts := acceptFakePanel(t, &registered, false)
 	pn := newAcceptTestPanel(t, srv)
 
 	code, got := postAcceptAll(t, pn)
@@ -105,7 +114,7 @@ func TestTaskAcceptAllNotRegisteredNotCounted(t *testing.T) {
 func TestTaskAcceptAllRegisteredCounted(t *testing.T) {
 	var registered atomic.Bool
 	registered.Store(true)
-	srv, attempts := acceptFakePanel(t, &registered)
+	srv, attempts := acceptFakePanel(t, &registered, false)
 	pn := newAcceptTestPanel(t, srv)
 
 	code, got := postAcceptAll(t, pn)
@@ -132,7 +141,7 @@ func TestAcceptVerifiedRetryThenSucceed(t *testing.T) {
 	t.Cleanup(func() { acceptBatchGap = oldGap })
 
 	var registered atomic.Bool
-	srv, attempts := acceptFakePanel(t, &registered)
+	srv, attempts := acceptFakePanel(t, &registered, true)
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", Domain: "www.codebuddy.cn", AccessToken: "tok"})
 	up := upstream.New()
@@ -141,13 +150,8 @@ func TestAcceptVerifiedRetryThenSucceed(t *testing.T) {
 	pn := New(Config{Version: "test", APIKey: "test-key", Pool: p, Upstream: up})
 
 	a := p.AuthByUID("u1")
-	// 第 2 次请求前"上游落账"：模拟服务端延迟生效。
-	go func() {
-		for atomic.LoadInt64(attempts) < 1 {
-			time.Sleep(time.Millisecond)
-		}
-		registered.Store(true)
-	}()
+	// 落账时机由假上游自己控制（第 2 次 accept 起自动 accepted）：模拟"服务端延迟生效"，
+	// 且不依赖测试侧 goroutine 与重试的调度赛跑（那种写法在 CI 慢机器上会 flaky）。
 	accepted, failed := pn.acceptVerified(a, []string{"chat_5"})
 	if len(accepted) != 1 || accepted[0] != "chat_5" {
 		t.Errorf("accepted=%v want [chat_5]（重试后生效）", accepted)
