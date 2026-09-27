@@ -46,6 +46,36 @@ var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
 // 去掉结尾标点后两种形态一并覆盖（替换串同样不带标点，让原有标点原样保留）。
 // 注意仍要求 "You are Claude Code, " 前缀，不做更宽的子串替换，
 // 以免误伤 TestExactMatchOnlyVariantNotTouched 所保护的零散文本。
+// sanitizeOmOJuniorRe OmO（OhMyOpenCode）Sisyphus-Junior 归属尾巴指纹。
+//
+// 上游依据：hub eae2076（fix: sanitize OmO Sisyphus-Junior 11128 fingerprint）。
+// 上游 WAF 对这段**连续短语**精确匹配，命中返回 11128（Illegal API invocation
+// from an unapproved channel）。上游 A/B 实测给的三条性质（原文：the match is
+// case-insensitive, survives surrounding prefix/suffix text, and stops matching
+// when the phrase structure is changed）：
+//  1. 大小写不敏感 → 用 (?i)；
+//  2. 短语前后包着别的文本照样命中 → 不做行首/行尾锚定；
+//  3. **把短语结构改掉（拆开）就不命中**——这是判据不是缺陷：上游匹配的是整段
+//     连续短语，中间插词/换标点/换行即已破坏指纹。故本正则要求逐字连续，
+//     有意**不**放宽成单词级匹配（"OhMyOpenCode" 或 "Sisyphus-Junior" 单独出现
+//     上游是接受的，见下方替换注释）。
+var sanitizeOmOJuniorRe = regexp.MustCompile(`(?i)Sisyphus-Junior - Focused executor from OhMyOpenCode`)
+
+// sanitizeOmORewrite 替换串：只摘掉归属尾巴 " from OhMyOpenCode"，保留身份名
+// "Sisyphus-Junior - Focused executor"——不是整句删除（照上游的改法，上游原文：
+// dropping the framework attribution）。
+//
+// 有意保持窄面：上游注释明确「do not globally remove "OhMyOpenCode" or
+// "Sisyphus-Junior", because either token alone is accepted by the upstream」——
+// 所以**不**把匹配放宽到单词级，正常讨论这两个词（用户正文、代码文本）一字不动。
+//
+// 误伤面（如实记录）：既有净化管线**没有**「只在特定位置/形态净化」的机制——
+// sanitizeText 对 content（所有角色）、tool_calls.arguments、reasoning_content、
+// reasoning 一律执行（只有零宽脱敏限定 system，见 zerowidth.go）。因此任何消息里
+// 出现这段连续短语都会丢掉尾巴。取舍：尾巴是框架归属元数据、不承载用户语义，
+// 身份名与其余文本逐字保留；而两个单词单独出现时完全不动，误伤面很窄。
+const sanitizeOmORewrite = "Sisyphus-Junior - Focused executor"
+
 var sanitizeRewrites = [][2]string{
 	{
 		"You are Claude Code, Anthropic's official CLI for Claude",
@@ -72,6 +102,11 @@ func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
 		return text
 	}
+	// OmO 归属尾巴先于既有模板句改写（顺序与上游 eae2076 一致：上游把
+	// SANITIZE_OMO_JUNIOR_RE.sub 放在 SANITIZE_REWRITES 循环之前）。两者作用面不
+	// 重叠（一个是 OmO 身份句、一个是 Claude Code/Codex 模板句），先后无耦合，
+	// 这里只是照抄上游顺序以免留下无谓差异。
+	text = sanitizeOmOJuniorRe.ReplaceAllString(text, sanitizeOmORewrite)
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
@@ -98,7 +133,7 @@ func hasFingerprint(text string) bool {
 			return true
 		}
 	}
-	return sanitizeBareHdrRe.MatchString(text)
+	return sanitizeBareHdrRe.MatchString(text) || sanitizeOmOJuniorRe.MatchString(text)
 }
 
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。

@@ -1,6 +1,7 @@
 // payload.go 改写发往上游的 chat 请求体：
 //  1. 强制 stream:true（上游拒绝非流式）
-//  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101）
+//  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101；
+//     "none" 保留 tools 声明，见 normalizeToolChoice 的上游 4db4e91 依据）
 //  3. max_completion_tokens 别名翻译为 max_tokens（上游只认后者，别名被静默忽略后
 //     回落默认输出上限，见 translateMaxCompletionTokens）
 package upstream
@@ -330,16 +331,38 @@ func ensureConsoleSystem(body []byte) []byte {
 }
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
-//   - "none"            → 删 tool_choice + 删 tools/functions
-//   - {"type":"none"}   → 同上
+//
+// 上游依据：hub 4db4e91（fix(tools): keep the tools declaration when tool_choice
+// is "none"）。**我们此前逐字复刻了上游这个 bug**——旧实现在 "none" 分支里用
+// suppress() 把 tools/functions 一起删掉，而 payload_test.go 里 "none" 出现 0 次、
+// 零测试覆盖，所以它一直没被暴露（连函数注释都把错误行为写成了规格）。
+//
+// 上游实测的故障模式（Agent 死循环）：tool_choice="none" 时删掉整个 tools 声明 →
+// 模型拿不到函数签名、又没有结构化工具通道，却仍被要求完成任务，于是把「调用」
+// 降级成 DSML / 伪 JSON 文本塞进 content（tool_calls 为空、finish_reason=stop）；
+// Agent 客户端解析不到调用只能再追问一轮，模型每轮重复 "I'll do it"，上下文每轮
+// +2 条消息、约 +500 token 线性膨胀。上游 usage.jsonl 实测（deepseek-v4.1-flash
+// + Agent 客户端，用户手动断开）：outcome=client_aborted elapsed_ms=131027
+// gen_ms=128262 usage_missing=true n_msgs=602——n_msgs 从 543 两两爬到 622，
+// prompt_tokens 涨到 297k。
+//
+// 修法：保留工具声明，只让 tool_choice 字段本身表达「本轮不许调用工具」。
+//
+// 为什么保留 tools 是更优取舍：上游实测**并不真正遵守** tool_choice="none"——
+// 保留 tools 后它仍可能返回 tool_calls。但两条路对比：删 tools 会让模型输出不可
+// 解析的文本、Agent 原地空转；留 tools 则走正常 tool_calls 通道，客户端能正常
+// 执行与回填——后者严格更好。确实需要禁止调用时，客户端不传 tools 字段即可。
+//
+// 上游只认字符串：tool_choice 发对象形态会 400 code=11101，所以 "none" 必须以
+// 字符串透传（不得改写成 {"type":"none"}），对象形态则降级为字符串 "none"。
+//
+// 规则：
+//   - "none" / {"type":"none"}（大小写不敏感、容忍前后空格）→ **保留**
+//     tools/functions，tool_choice 写回字符串 "none"
 //   - {"type":"auto"/"required"} → 字符串 "auto"/"required"
 //   - {"type":"function","function":{"name":"x"}} → 字符串 "x"
-//   - 其他对象/非标量 → 删 tool_choice
+//   - 其他对象/非标量 → 删 tool_choice（tools 原样保留）
 func normalizeToolChoice(obj map[string]any) {
-	suppress := func() {
-		delete(obj, "tools")
-		delete(obj, "functions")
-	}
 	tc, present := obj["tool_choice"]
 	if !present {
 		return
@@ -347,16 +370,17 @@ func normalizeToolChoice(obj map[string]any) {
 	switch v := tc.(type) {
 	case string:
 		if strings.EqualFold(strings.TrimSpace(v), "none") {
-			delete(obj, "tool_choice")
-			suppress()
+			// 保留 tools/functions（上游 4db4e91）：只由本字段表达「本轮不许调用」。
+			obj["tool_choice"] = "none"
 		}
 	case map[string]any:
 		typ, _ := v["type"].(string)
 		typ = strings.ToLower(strings.TrimSpace(typ))
 		switch typ {
 		case "none":
-			delete(obj, "tool_choice")
-			suppress()
+			// 同上：保留 tools 声明；上游只认字符串，对象形式必须降级成 "none"，
+			// 否则 11101。
+			obj["tool_choice"] = "none"
 		case "auto", "required":
 			obj["tool_choice"] = typ
 		case "function":
