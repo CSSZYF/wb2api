@@ -28,6 +28,13 @@ func TestPrepareBodyToolChoiceFunctionObject(t *testing.T) {
 	}
 }
 
+// TestPrepareBodyToolChoiceNone tool_choice="none" 保留 tools 声明（上游 4db4e91）。
+//
+// 本用例此前断言的是**旧的反向行为**（tool_choice 与 tools/functions 全删）——
+// 那正是上游 4db4e91 修掉的 Agent 死循环成因（删掉函数签名后模型没有结构化工具
+// 通道，把调用降级成 DSML/伪 JSON 文本塞进 content，客户端解析不到只能反复追问，
+// 上下文线性膨胀到 297k tokens）。旧断言等于把 bug 钉成了规格，故随修复一并反转。
+// 详细用例见 payload_tool_choice_test.go。
 func TestPrepareBodyToolChoiceNone(t *testing.T) {
 	for _, in := range []string{
 		`{"tool_choice":"none","tools":[{}],"functions":[{}]}`,
@@ -36,14 +43,16 @@ func TestPrepareBodyToolChoiceNone(t *testing.T) {
 		out := PrepareBodyOpt([]byte(in), true)
 		var m map[string]any
 		json.Unmarshal(out, &m)
-		if _, ok := m["tool_choice"]; ok {
-			t.Errorf("%s: tool_choice should be deleted", in)
+		if m["tool_choice"] != "none" {
+			t.Errorf("%s: tool_choice=%v want string \"none\" (对象形态上游会 11101)", in, m["tool_choice"])
 		}
-		if _, ok := m["tools"]; ok {
-			t.Errorf("%s: tools should be deleted", in)
+		if _, ok := m["tools"]; !ok {
+			t.Errorf("%s: tools 必须保留（上游 4db4e91）", in)
 		}
-		if _, ok := m["functions"]; ok {
-			t.Errorf("%s: functions should be deleted", in)
+		if strings.Contains(in, "functions") {
+			if _, ok := m["functions"]; !ok {
+				t.Errorf("%s: functions 必须保留", in)
+			}
 		}
 	}
 }
