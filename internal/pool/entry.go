@@ -197,9 +197,10 @@ type entry struct {
 	// 只在 CooldownSoftRate / CooldownSoftForModel（无解析时间分支）**进入一次新冷却**
 	// 时递增——冷却中的兜底探测不推进（旧实现每次探测都翻倍，是"全池被推到 2h 封顶"
 	// 的元凶）。有上游权威重置时间时绝不计数（对齐墙钟即最终时长，无退避）。
-	// 重置点只有三处（都是账号被证明恢复的时刻）：NoteSuccess、人工 Revive、
-	// 以及硬冷却解冻（ReenableIfCredits 对 CoolHard 放行——硬冷却不参与 streak，
-	// 此处清的只是历史软冷却累积；软冷却账号不再被余额刷新/签到解冻，见 issue #199）。
+	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、人工 Revive。
+	// 硬冷却解冻（ReenableIfCredits 对 CoolHard 放行）**不再**清零——退避计数与
+	// 「余额有钱」无关，只由成功或自然到期收敛（吸收上游 602ed1b，见
+	// reviveCoolingLocked 注释）。软冷却账号同样不被余额刷新/签到解冻（issue #199）。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
 	// modelCooldowns 6004 模型级 limit 的**独立**冷却表：model → 该模型的冷却截止/重置。
@@ -284,10 +285,14 @@ type entry struct {
 // coolKind 的账号天然等于 CoolHard。典型反例是仅 6004 模型级冷却的号——
 // CooldownSoftForModel 有解析时间分支只写 modelCooldowns、不写 coolKind/until，
 // 于是它看起来「coolKind==CoolHard」。若只按零值判定，余额刷新会把这类账号误当
-// 硬冷却「解冻」，连带 clearCoolingLocked 清掉 modelCooldowns，模型级豁免被刷新
-// 抹掉（issue #31 语义回归）。叠加 until 非零后，判定精确等于「确有硬冷却被
+// 硬冷却「解冻」（issue #31 语义回归）。叠加 until 非零后，判定精确等于「确有硬冷却被
 // Cooldown/CooldownUntilTomorrow4AM 施加过」：软冷却（CoolSoft）与模型级冷却
 // （until 为零）都被排除。
+//
+// 解冻动作自 602ed1b 起只清 CoolHard 三字段（until/coolKind/reason），不再整域
+// 归零——故本判定不再承担「防误清 modelCooldowns」的职责（reviveCoolingLocked
+// 已无该动作），但收窄口径照旧保留：误判为硬冷却会让账号的 until 被清掉、冷却
+// 提前结束（软冷却号的软冷却时间被余额刷新抹掉），语义仍然错。
 //
 // 不要求 until 尚未到期：自然到期后的硬冷却残留（coolKind=CoolHard + 已过期的
 // until + 残留 reason）本就该被余额刷新清理（余额恢复是硬冷却的恢复条件），

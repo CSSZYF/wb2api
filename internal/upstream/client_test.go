@@ -1508,21 +1508,22 @@ func TestFetchModelsReadBodyError(t *testing.T) {
 
 // TestChatStreamSuccessThenNoShadowedCancelNilPanic 成功分支不再触碰外层 shadowed
 // cancel：删掉外层 `var cancel context.CancelFunc` 后，成功路径只依赖内层 := 的
-// cancel（已移交 monitorBody），不得 panic。同时覆盖 404 换路径重试后成功的情形
-// （循环尾兜底代码已删，靠各出口 return）。
+// cancel（已移交 monitorBody），不得 panic。
+//
+// 迁移说明（吸收 03ce06d 的 #119 项）：本测原覆盖「404 换 console 路径重试后成功」，
+// 但 global chat 已收敛为 /v2 单路径（见 chatPaths 与 global_chat_path_test.go 的
+// 理由：console 挂 WAF body 规则，兜底会把路径级 404 升级成账号级惩罚）。故此处改为
+// 直接断言 /v2 成功路径的既有语义（单次请求、无 panic、rc 可用）；「404 不得回落
+// console」由 TestChatStreamGlobalDoesNotFallbackToConsole 覆盖。
 func TestChatStreamSuccessThenNoShadowedCancelNilPanic(t *testing.T) {
-	paths := 0
+	var paths []string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
-		paths++
-		if strings.Contains(r.URL.Path, "console") {
-			// 兜底路径：直接成功
-			return &http.Response{
-				StatusCode: 200,
-				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
-			}, nil
-		}
-		return jsonResp(404, `{}`), nil
+		paths = append(paths, r.URL.Path)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
 	})
 	c.ChatBaseCN = "https://global.example"
 	c.GlobalEnabled = true
@@ -1532,7 +1533,7 @@ func TestChatStreamSuccessThenNoShadowedCancelNilPanic(t *testing.T) {
 	}
 	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if err != nil {
-		t.Fatalf("global 404 → fallback 成功路径不应报错: %v", err)
+		t.Fatalf("global 成功路径不应报错: %v", err)
 	}
 	if status != 200 {
 		t.Fatalf("status=%d want 200", status)
@@ -1541,8 +1542,8 @@ func TestChatStreamSuccessThenNoShadowedCancelNilPanic(t *testing.T) {
 		t.Fatal("rc must not be nil on success")
 	}
 	rc.Close()
-	if paths < 2 {
-		t.Errorf("expected 404 fallback retry, paths hit=%d", paths)
+	if len(paths) != 1 || paths[0] != "/v2/chat/completions" {
+		t.Errorf("请求路径=%v want 仅 /v2/chat/completions（单路径，无 fallback）", paths)
 	}
 }
 

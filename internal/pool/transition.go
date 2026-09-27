@@ -13,9 +13,11 @@
 //	manualDisabled     ← setManualDisabledLocked（面板运维端点；只置位不清其他维度）
 //	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked（整域）清，
-//	                     单模型提前解冻走 clearModelCooldownLocked（ClearModelCooldown）
+//	                     单模型提前解冻走 clearModelCooldownLocked（ClearModelCooldown）；
+//	                     reviveCoolingLocked（余额恢复解冻）**不清**——余额恢复不构成限流解除证据（602ed1b）
 //	breakerUntil       ← recordBreakerFailureLocked（NoteError 唯一喂入）；NoteSuccess 清
-//	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/Revive/reviveCoolingLocked（仅硬冷却）清
+//	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/Revive 清
+//	                     （reviveCoolingLocked 不清：退避计数与余额无关）
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
 //	accountFaultFails  ← NoteAccountFault；ClearAccountFault/NoteSuccess/ReviveDisabled/Revive 清
 //	consecutiveFails   ← NoteFailures（degrade.go，唯一喂入）；NoteSuccess/Revive 清
@@ -34,9 +36,12 @@
 //     二者都不清对方，并存时 /status 分别透出（见 entry.go Status.manual_disabled /
 //     disabled 注释）。禁用/停用都不碰冷却与熔断维度——解除后拿到的是这段时间里
 //     真实发生过的状态，而不是被清空的一刀切。
-//   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked、Revive 与
-//     reviveCoolingLocked（余额恢复解冻，issue #199 收窄后仅硬冷却）共用，
-//     对冷却域的处置因此永远一致。
+//   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked 与 Revive 共用
+//     （禁用是终态、人工解冻是无条件恢复，两者都该整域归零）。
+//     reviveCoolingLocked（余额恢复解冻）**不再**走整域归零：它只解冻 CoolHard
+//     （余额恢复正是硬冷却的权威恢复证据），软限流退避与模型级台账各有自身恢复
+//     时刻，不得被 5 分钟一次的余额刷新周期任务抹掉（吸收上游 602ed1b，详见
+//     reviveCoolingLocked 注释）。
 package pool
 
 import "time"
@@ -63,8 +68,9 @@ func (e *entry) clearCoolingLocked() {
 // 「其他被限流模型已恢复」的证据，故 modelCooldowns 必须原样保留。
 //
 // softStreak 一并清零：它与 until/coolKind 同属冷却域（见 entry.softStreak 注释），
-// 且本次清账的触发条件正是「账号刚被上游实测证明可用」——与 NoteSuccess /
-// reviveCoolingLocked 的恢复语义一致（恢复即清零，退避回基数）。
+// 且本次清账的触发条件正是「账号刚被上游实测证明可用」——与 NoteSuccess 的恢复
+// 语义一致（恢复即清零，退避回基数）。注意这与 reviveCoolingLocked 不同：那个的
+// 证据只是「余额有钱」，不构成限流已解除的证据，故保留 softStreak（602ed1b）。
 // 熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
 // 连败降权（consecutiveFails/degradeUntil）同样不动：本函数的触发条件是「冷却已到期
 // 且上游实测可用」，而降权的独立证据链是「ErrClient/传输层连败」——探活请求成功
@@ -171,8 +177,8 @@ func (p *Pool) setManualDisabledLocked(e *entry, disabled bool, reason string) {
 	p.dirty.Store(true)
 }
 
-// reviveCoolingLocked 只清冷却域（until/coolKind/reason/softStreak/modelCooldowns）
-// 并更新 credits/creditsTotal，不动熔断器（fails/retryCount/breakerUntil）。
+// reviveCoolingLocked 余额恢复解冻：只清**余额耗尽冷却**（CoolHard 的
+// until/coolKind/reason）并更新 credits/creditsTotal。
 //
 // 调用方只有 ReenableIfCredits（余额刷新/签到），且**仅对硬冷却（CoolHard）**放行
 // （issue #199 收窄）：硬冷却的恢复条件正是「余额恢复」，签到到账即解冻；
@@ -180,12 +186,29 @@ func (p *Pool) setManualDisabledLocked(e *entry, disabled bool, reason string) {
 // 不构成解冻依据——旧实现无条件解冻会让软冷却账号被刷新解冻 → 再撞 429 循环。
 // 人工强制解冻走 Revive（无条件恢复，不受本收窄影响）。
 //
-// 熔断器不动的原因：余额恢复只证明 billing 通道健康，不证明 chat 通道健康，熔断
-// （连续 5xx 信号）不应被签到覆盖。softStreak 属冷却域（与 until/coolKind 同域），
-// 随冷却一并清零——与「解冻只清冷却不清熔断」的既有 C5 语义一致；硬冷却（CoolHard）
-// 本就不参与 streak，这里清的是历史软冷却累积。调用方必须已持有 p.mu。
+// 为什么不再走 clearCoolingLocked 整域归零（吸收上游 602ed1b，issue #127/#153）：
+// 余额刷新周期任务（默认每 5 分钟，RunBalanceRefreshNow）对 expiring==0 的账号
+// 反复到达这里，整域归零会把 **6004 模型级台账**（对齐上游重置墙钟）与
+// **CoolSoft 软限流 + softStreak 退避计数**一并抹掉——任何限流冷却的实际寿命都被
+// 压到一个刷新周期（≤5min）内：撞限号被误判健康后重新选中再撞 429，全池冷却保护
+// 形同虚设。上游两号池实测指纹：expiring==0 的号每 5 分钟被抹一次台账，expiring>0
+// 的号走 SetCreditsDetailed 幸免，两号行为不对称。
+//
+// 各维度的**权威恢复证据**（本函数的清理边界即由此划出）：
+//   - CoolHard until/coolKind/reason ← 余额恢复（本函数照旧解冻，remain>0 即证据）；
+//   - CoolSoft / softStreak ← 上游重置墙钟到期或 NoteSuccess（成功是最强证据）；
+//     余额有钱与该模型/账号的限流是否解除无关，故保留（由自然到期或成功收敛）；
+//   - modelCooldowns（6004 台账）← 上游重置墙钟到期、探测成功或人工 Revive；
+//   - 熔断器（fails/retryCount/breakerUntil）← 余额恢复只证明 billing 通道健康，
+//     不证明 chat 通道健康，故照旧不动（C5 语义不变）。
+//
+// 调用方必须已持有 p.mu。
 func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
 	e.credits = credits
 	e.creditsTotal = total
-	e.clearCoolingLocked()
+	if e.coolKind == CoolHard {
+		e.until = time.Time{}
+		e.coolKind = 0
+		e.reason = ""
+	}
 }

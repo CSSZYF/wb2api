@@ -382,7 +382,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
-| `server.max_body_mb` | `32` | **网关侧内存护栏**（MB，0 / 负数启动报错），**不是上游限制**——上游没有可观测的 body 上限，此值只防单请求把进程内存吃爆。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。默认 32 而非更小：多图会话每轮 base64 重发历史图片（膨胀约 37%），8MB 常态误伤。**面板在线修改即时生效** |
+| `server.max_body_mb` | `0` | 请求体上限（MB）。**默认 0 = 不预拦截**：请求体完整读入后交上游自然响应（上游错误信息量更大；多图/长上下文会话不再撞网关上限）。配 >0 则启用**网关侧内存护栏**（**不是上游限制**——上游没有可观测的 body 上限，此值只防单请求把进程内存吃爆），超限直接返回 **413 `request_body_too_large`**，不把半截请求喂给上游；负数启动报错。**面板在线修改即时生效**（置 0 = 关闭）|
 | `server.max_rotate` | `3` | 单请求最多换号次数（0 / 负数回落默认 3）。池内账号多时（如 4-8 个）默认 3 次试不满所有号，可调大让单请求覆盖更多账号；上限大于池内账号数时试遍即止。**面板在线修改即时生效** |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
@@ -475,7 +475,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
-请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。请求体的网关侧截断已由 `server.max_body_mb`（默认 32MB）的 413 消灭，剩余的 `11101` 只可能是客户端发来的畸形 JSON。
+请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。网关默认不做请求体预拦截与截断（`server.max_body_mb=0`），剩余的 `11101` 只可能是客户端发来的畸形 JSON。
 
 **11140 为什么阈值化**：`request illegal` 的根因**至今未定**——本仓历史上两次归因互斥（一次归为出站请求头 / UA 平台段，一小时后归为账号状态），现场也没有任何账号因 11140 被禁过、没有真实报文可分辨「内容审核拦截」与「账号级封禁」。代价不对称：误判「不罚号」只多一次轮换（有界），误判「禁用」则永久摘掉健康账号并需人工登录（无界）。故照 12153 的既有先例（一次即禁曾误杀 13 个健康号，后改为连续 3 次）改为连续 `accountFaultThreshold`（3）次才禁，未达阈值回落软冷却；计数 `account_fault_fails` 随 `state.json` 持久化，任意成功即清零。若将来拿到真实 11140 报文能区分审核与封禁，可再加第二层判定。
 
@@ -611,8 +611,8 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 32 MiB（网关内存护栏，可配） |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）；每模型带 `supported_efforts`/`default_effort` 实际思考档位（上游有返回时） |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体默认无网关上限（`server.max_body_mb=0` = 不预拦截，可配 >0 启用内存护栏）|
+| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，CN 目录缓存 10min / global 目录 1h；失败回落静态表 + 5min 负缓存）；每模型带 `supported_efforts`/`default_effort` 实际思考档位（上游有返回时） |
 | `GET /v1/stats` | Bearer（`api_key` 非空时） | 请求统计：按模型聚合 token / 缓存 / 延迟（可选 `?hours=N` 窗口）。只读本地用量快照，不打上游 |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -838,19 +838,21 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 多图会话请求体超限怎么办？
 
-请求体超过 `server.max_body_mb`（默认 32 MB）时网关直接返回 `413 request_body_too_large`：
+网关**默认不设请求体上限**（`server.max_body_mb=0` = 不预拦截，对齐上游）：任意大小的请求体都会完整读入并转发上游，超限类问题由上游自然返回错误——其响应信息量更大（能看到上游的真实策略），网关不再以 413 提前拦截。
+
+若运维显式配了护栏（`server.max_body_mb` > 0），超限时返回 `413 request_body_too_large`：
 
 ```json
-{"error":{"message":"请求体超过网关内存护栏 32 MB：这是网关侧上限（防止单请求吃爆进程内存），不是上游限制；默认 32 MB，可在面板「请求体上限」或 server.max_body_mb 调大（保存即时生效）。多图会话易触发：历史图片每轮以 base64 重发（膨胀约 37%），请压缩图片或调大上限后重试","type":"api_error","code":"request_body_too_large"}}
+{"error":{"message":"请求体超过网关内存护栏 32 MB：这是网关侧上限（防止单请求吃爆进程内存），不是上游限制；网关默认不设该上限（server.max_body_mb=0 = 不预拦截，大请求交上游自然响应），当前值由运维显式配置——可在面板「请求体上限」调大或置 0 关闭（保存即时生效）。多图会话易触发：历史图片每轮以 base64 重发（膨胀约 37%），请压缩图片或调大上限后重试","type":"api_error","code":"request_body_too_large"}}
 ```
 
-- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身的内存护栏（上游没有可观测的 body 上限，此值只防单请求把进程内存吃爆）
-- 为什么多图容易触发：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体（编码再膨胀约 37%），几张 MB 级截图叠两三轮就会破默认值
-- 收到 `413` 即表示是请求体本身超限：面板「配置 → 请求体上限」在线调大**保存后即时生效，无需重启**（issue #17）；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
-- 为什么默认是 32 MB 而不是更大：网关没有入站并发闸门，实测单请求峰值内存约为 body 的 **5 倍**，护栏放得越宽越容易 OOM；同时 32 MB 已远高于常规多图会话（含 base64 膨胀后）的实际占用
-- 为什么不是「交给上游报错就行」：上游对超大 body 不返回可用的 413（表现为连接被掐断 / 上游 unmarshal 报 `unexpected EOF`），而网关此时已经把请求算到账号头上——旧版因此**罚了无辜账号**。预拦截是为了「要么放行要么明确 413」，不让截断的请求喂给上游
-- 上游真实上限未实测（32 MB 以上的请求从未穿过网关），建议按需调大，若上游回 413 再回调
-- 要么放行要么明确 `413`，网关不再把半截请求体喂给上游
+- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是运维自己配的网关内存护栏（上游没有可观测的 body 上限，此值只防单请求把进程内存吃爆）
+- 为什么多图容易触发：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体（编码再膨胀约 37%），几张 MB 级截图叠两三轮就会顶到护栏
+- 收到 `413` 即表示是请求体超限：面板「配置 → 请求体上限」在线**调大或置 0 关闭，保存后即时生效，无需重启**（issue #17）；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
+- 想开护栏时怎么选值：网关没有入站并发闸门，实测单请求峰值内存约为 body 的 **5 倍**，护栏放得越宽越容易 OOM——按机器可用内存估算，而不是照抄默认值（默认已是不拦）
+- 为什么默认改为不拦（上游 e34cfa4/a0aae43，PR #159）：上游对超大 body 的响应比网关的固定 413 更有信息量，网关提前拦截反而挡住了上游真实行为；且旧实现下多图会话（每轮 base64 重发）常态误伤
+- 客户端中途断流导致的半截 body 在读入阶段即报 `400 invalid_request`，不会把截断 JSON 喂给上游（issue #41 语义保留在读错误路径）
+- 网关侧**不做**请求体截断：要么完整放行，要么（配了护栏时）明确 `413`
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
 
@@ -912,7 +914,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 断言 | 出处 |
 |---|---|
 | `prompt.mode` 默认 `passthrough` | `cmd/server/config.go` 的 `Default()`（`c.Prompt.Mode = "passthrough"`）|
-| 请求体上限默认 32 MB（网关内存护栏，非上游限制） | `cmd/server/config.go:295`（`Default()`，取自 `server.DefaultMaxBodyBytes`）；413 判定 `internal/server/handler.go:710`、文案 `internal/server/handler.go:688`（`bodyTooLargeMsg`） |
+| 请求体上限默认 0 = 不预拦截（>0 才是网关内存护栏） | `cmd/server/config.go` 的 `Default()`（取自 `server.DefaultMaxBodyBytes`）；读体与 413 判定 `internal/server/handler.go` 的 `chatCompletions`、文案 `bodyTooLargeMsg` |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |

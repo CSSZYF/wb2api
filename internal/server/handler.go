@@ -33,9 +33,14 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
-	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 DefaultMaxBodyBytes（32MB）。
-	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
-	// 这是**网关侧内存护栏**，不是上游限制（413 文案口径见 bodyTooLargeMsg）。
+	// MaxBodyBytes 聊天请求体大小上限（字节）；<=0 = **不预拦截**（DefaultMaxBodyBytes）。
+	//
+	// 语义（吸收上游 73fe1f8）：默认**不做**网关侧预拦截，大请求完整读入后交由上游
+	// 自然响应——上游错误信息量更大（能看到上游到底是什么策略），网关提前 413 反而
+	// 挡住上游真实行为；多图/长上下文会话（历史图片每轮 base64 重发）不再撞网关上限。
+	// 显式配置 >0 时仍保留一道**网关侧内存护栏**（不是上游限制）：超限直接 413
+	// request_body_too_large（不把半截请求喂给上游，issue #41）。护栏的口径与关闭方式
+	// 见 bodyTooLargeMsg；配置项 server.max_body_mb 保留（删键会让老配置静默失效）。
 	MaxBodyBytes int64
 	// ReadTimeout 入站请求体读取窗口（http.Server.ReadTimeout 的同口径值）；
 	// <=0 兜底 DefaultReadTimeout（300s）。运行期经 SetReadTimeout 热改，
@@ -166,13 +171,13 @@ type Handler struct {
 }
 
 // SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
-// n<=0 与 NewHandler 兜底口径一致：回落 DefaultMaxBodyBytes（32MB）。
+// n<=0 = 关闭预拦截（存 0，与 NewHandler 兜底口径一致，见 DefaultMaxBodyBytes）。
 //
-// 本方法只改运行期原子镜像，与默认值（config 侧 Default()）无关——默认值变更不影响
-// 此处的注入路径，故 v1.9.17 的 8→32 改动不触碰热改语义。
+// 负值同样按"关闭"处理：负的字节上限没有合理语义，若静默当成极小值会把所有请求
+// 打成 413（最坏的反向风险）；0/负值都表达"不设护栏"。
 func (h *Handler) SetMaxBodyBytes(n int64) {
-	if n <= 0 {
-		n = DefaultMaxBodyBytes
+	if n < 0 {
+		n = 0
 	}
 	h.maxBodyBytes.Store(n)
 }
@@ -186,13 +191,16 @@ func (h *Handler) SetMaxRotate(n int) {
 	h.maxRotate.Store(int64(n))
 }
 
-// DefaultMaxBodyBytes 聊天请求体上限的兜底值（与 config 侧 Default() 同口径，32MB）。
-// 单一来源供 handler 与 cmd 两侧共用，避免"配置默认 32、handler 兜底 8"这类漂移
-// （与 DefaultReadTimeout 同一处理风格）。
+// DefaultMaxBodyBytes 聊天请求体上限的默认值（与 config 侧 Default() 同口径）。
+// 单一来源供 handler 与 cmd 两侧共用，避免"配置默认一个数、handler 兜底另一个数"
+// 的静默漂移（与 DefaultReadTimeout 同一处理风格）。
 //
-// 这是**网关侧内存护栏**，不是上游限制：上游没有可观测的 body 上限，本值只防
-// "单请求把进程内存吃爆"。32MB 的取舍见 cmd/server/config.go 的 MaxBodyMB 字段注释。
-const DefaultMaxBodyBytes = 32 << 20
+// **0 = 不预拦截**（吸收上游 73fe1f8）：请求体完整读入后交上游自然响应，网关不再
+// 以 413 提前拦截。历史上本值是 32MB（再早 8MB）的网关内存护栏；上游实测裁定
+// 「上游的错误响应信息量更大，网关提前 413 反而挡住上游真实行为」，本仓跟进默认
+// 行为但**保留配置项**（server.max_body_mb >0 时仍是一道可显式开启的护栏）——
+// 删键会让既有 config.json 里的显式设置静默失效（issue #17 反复强调的失效模式）。
+const DefaultMaxBodyBytes = 0
 
 // DefaultReadTimeout 入站 body 读取窗口的兜底值（与 config 侧 Default() 同口径）。
 // 单一来源供 handler 与 cmd 两侧共用，避免"配置默认 300、handler 兜底 60"这类漂移。
@@ -296,8 +304,11 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	if cfg.MaxBodyBytes <= 0 {
-		cfg.MaxBodyBytes = DefaultMaxBodyBytes // 请求体上限兜底 32MB（与 config 侧 Default() 同口径）
+	if cfg.MaxBodyBytes < 0 {
+		cfg.MaxBodyBytes = 0 // 负值按"不预拦截"处理（见 SetMaxBodyBytes 注释）
+	}
+	if cfg.MaxBodyBytes == 0 {
+		cfg.MaxBodyBytes = DefaultMaxBodyBytes // 0 = 不预拦截（与 config 侧 Default() 同口径）
 	}
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = DefaultReadTimeout // 入站读窗口兜底 300s
@@ -443,11 +454,15 @@ var dynamicModelsCache struct {
 }
 
 const (
-	dynamicModelsTTL        = time.Hour
+	// dynamicModelsTTL 模型目录缓存时长（吸收上游 79bc5af）。曾是 1h；缩到 10min
+	// 对齐「面板实时、API 缓存」的漂移痛点（上游 PR #38 报告）：目录新增模型时
+	// 面板立即可见，公开 /v1/models 最多滞后一个 TTL。再短就不值得——每次失效
+	// 都是 2 次上游探测（企业端点 + /v3/config）。
+	dynamicModelsTTL        = 10 * time.Minute
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-// models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
+// models 返回模型列表：优先动态（缓存 10min，见 dynamicModelsTTL），失败回退静态表。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
@@ -633,6 +648,10 @@ func (h *Handler) realmAvailable(realm string) bool {
 // fetchGlobalModelInfos 拉 global realm 模型目录（探测 ∪ 静态独有 id，1h 缓存 +
 // 5min 负缓存），返回带窗口 / 能力元数据的条目。GlobalEnabled=false 时 modelList 已不
 // 进入本分支（逃生门在调用方 gate）。
+//
+// global 侧 TTL 维持 1h（不随 CN 目录一起缩到 10min）：同一份缓存同时喂 /v1/stats
+// 的倍率只读快照（GlobalModelInfosSnapshot），统计端点被面板高频轮询——缩短 TTL
+// 会让高频轮询反复触发上游探测，与「统计端点零上游压力」的设计相悖。
 func (h *Handler) fetchGlobalModelInfos() []upstream.ModelInfo {
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
 	if acct == nil {
@@ -648,11 +667,18 @@ func (h *Handler) fetchGlobalModelInfos() []upstream.ModelInfo {
 	return h.cfg.Upstream.FetchGlobalModelInfos(acct)
 }
 
-// fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
+// fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），
+// 缓存 10min（dynamicModelsTTL，吸收上游 79bc5af；曾为 1h）。
 // 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
 //
 // 强制 realm=cn 选号：本表是 CN 目录（/console 家族），拿 global 账号去打
-// global 域的同名路径会吃到 500/解析失败（v1.x 面板"拉取模型 500"的根因之一）。
+// global 域的同名路径会吃到 500/解析失败（v1.x 面板"拉取模型 500"的根因之一；
+// 上游 PR #38 报告的正是无 realm 过滤的 Pool.Pick 会选中 global 号）。
+//
+// 缓存 + 5min 负缓存按既有语义**保留**（上游 #38 原案整体删除缓存被拒）：公开端点
+// 逐请求实时拉取 = 每次 2 个上游探测，客户端周期性刷新模型列表会持续打上游；
+// 上游故障时无冷却窗口，客户端重试即放大请求量——负缓存正是为此设计；且
+// cachedModelsSnapshot（gateway_hint 判定）依赖缓存写入。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
@@ -702,22 +728,21 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 }
 
 // bodyTooLargeMsg 413 的客户端文案（独立函数便于测试直接盯住口径，不必构造
-// 超限请求体）。
+// 超限请求体）。**仅在显式配置了护栏（max_body_mb > 0）时可达**——默认不预拦截
+// （吸收上游 73fe1f8），故文案不必再解释"默认多少"，而要说清"这是你自己配的"。
 //
-// 口径（v1.9.17 修正）：旧文案「请求体超过 N MB 上限」容易被读成**上游**的限制，
-// 用户据此去压图片或以为模型不支持，方向全错。本项自始至终是网关侧的内存护栏
-// ——上游没有可观测的 body 上限，这个值只防"单请求把进程内存吃爆"。故文案明确
-// 三点：①网关侧护栏、非上游限制；②默认 32 MB 且可调（面板即时生效）；③常见
-// 成因（多图会话每轮 base64 重发历史图片）。
+// 口径（v1.9.17 修正，2026-09 跟进上游后再调）：
+//   - 旧文案「请求体超过 N MB 上限」容易被读成**上游**的限制，用户据此去压图片或
+//     以为模型不支持，方向全错——故保留「网关侧护栏、不是上游限制」的措辞；
+//   - 默认已改为**不预拦截**，收到 413 只可能是运维自己配了 server.max_body_mb，
+//     故文案给的是**关闭方式**（置 0）而不是"默认 32 MB"；
+//   - 常见成因（多图会话每轮 base64 重发历史图片）保留，指向"调大或关闭"两条路。
 //
 // 注意 "37%%" 的转义：本串是 fmt 格式串，字面百分号必须写成 %%，否则 "%），" 会被
 // 当成动词渲染成 "%!)(MISSING)"（go vet 会报 unknown verb，但 go build 不报——
 // 改文案时务必跑 vet）。
-//
-// 「默认 32 MB」的数值与 handler 侧兜底同源（DefaultMaxBodyBytes），与 config 侧
-// Default() 的一致性由 config_test.go 的漂移断言盯住。
 func bodyTooLargeMsg(limit int64) string {
-	return fmt.Sprintf("请求体超过网关内存护栏 %d MB：这是网关侧上限（防止单请求吃爆进程内存），不是上游限制；默认 32 MB，可在面板「请求体上限」或 server.max_body_mb 调大（保存即时生效）。多图会话易触发：历史图片每轮以 base64 重发（膨胀约 37%%），请压缩图片或调大上限后重试", limit>>20)
+	return fmt.Sprintf("请求体超过网关内存护栏 %d MB：这是网关侧上限（防止单请求吃爆进程内存），不是上游限制；网关默认不设该上限（server.max_body_mb=0 = 不预拦截，大请求交上游自然响应），当前值由运维显式配置——可在面板「请求体上限」调大或置 0 关闭（保存即时生效）。多图会话易触发：历史图片每轮以 base64 重发（膨胀约 37%%），请压缩图片或调大上限后重试", limit>>20)
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -735,17 +760,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
-	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
-	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
-	// unmarshal 报 unexpected EOF，网关却罚号轮空）。
+	// 请求体读取：limit > 0 时按「内存护栏」预拦截（LimitReader 读 limit+1 探测超限，
+	// 超限 413，不把截断的半截 JSON 喂上游——issue #41）；limit <= 0（默认，吸收上游
+	// 73fe1f8）时**无上限直读**，超限类问题交由上游自然响应（其响应信息量更大，
+	// 能看到上游到底是什么策略）。
 	// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。文案口径见 bodyTooLargeMsg。
+	//
+	// 两种模式下读错误路径的语义都保留：#41 的截断防御——读 body 出错就地 400，
+	// 不把半截 JSON 喂上游 unmarshal（那会让上游报 unexpected EOF，网关却冤枉罚号）。
 	limit := h.maxBodyBytes.Load()
-	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	var body []byte
+	var err error
+	if limit > 0 {
+		body, err = io.ReadAll(io.LimitReader(r.Body, limit+1))
+	} else {
+		body, err = io.ReadAll(r.Body)
+	}
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", readBodyErrMsg(err, h.readTimeoutValue()))
 		return
 	}
-	if int64(len(body)) > limit {
+	if limit > 0 && int64(len(body)) > limit {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", bodyTooLargeMsg(limit))
 		return
 	}
@@ -802,15 +837,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 轮级兜底聚合键：无会话键的客户端（OpenAI 兼容协议——dsh / Codex / Cherry
-	// Studio 等请求体里既无 conversationId 也无 metadata）sessKey 恒空，会话头族的
-	// 聚合主键只能逐请求新生成，agent 多轮在上游用量明细里仍是一条请求一条记录。
-	// 这里按 body 里最后一条 user 消息派生轮级键（同轮内所有上游调用同键）。
+	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，换
+	// user 消息换键）。#170 起**带会话键的客户端也统一走轮级**（吸收上游 03ce06d 的
+	// #170 项，上游原始提交 b9ac0d3）：X-Conversation-Request-ID 是上游后台的轮级
+	// 聚合主键，官方桌面 CLI 每次 USER_PROMPT_SUBMIT 清空重生成——同轮复用、跨轮必换。
+	// 此前带会话键的客户端走 RequestIDForKey(sessKey) 会话级聚合（跨轮同值，继承自
+	// merge-base 的上游旧形态），会把整段会话几十轮并成一条记录、每轮明细丢失。
 	// 必须在下方 prompt.Rewrite 之前取——改写会动 messages 内容，之后取会让键漂移。
-	turnKey := ""
-	if sessKey == "" {
-		turnKey = session.TurnKey(body)
-	}
+	turnKey := session.TurnKey(body)
 
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
 	// 同理——下方 prompt.Rewrite / rewriteModel 会动 body，之后取会让形态漂移）。
@@ -938,18 +972,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// RequestID）。
 	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造）；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先，否则按
-	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
-	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
+	//     **轮级**生成（#170 统一轮级，吸收上游 03ce06d）：带会话键客户端走
+	//     sessKey:turnKey 复合键（会话段入键防跨会话同轮文本互撞），无会话键走纯
+	//     turnKey；turnKey 空态（无 user 消息/无可签名内容）回落会话级，都空则请求级
+	//     随机——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
+	} else if turnKey != "" && sessKey != "" {
+		// 轮级复合键：会话段入键防不同会话的同轮文本共用聚合键。
+		chatMeta.ConversationRequestID = session.TurnRequestID(sessKey + ":" + turnKey)
+	} else if turnKey != "" {
+		// 无会话键客户端：纯轮级键（既有语义不变，存量键值零漂移）。
+		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
 	} else if sessKey != "" {
+		// 残留空态兜底（无 user 消息/无可签名内容）：会话级聚合好于请求级随机。
 		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
 	} else {
-		// 无会话键客户端：轮级兜底——同轮内 tool call 多轮 / 换号重试 / 降级重发
-		// 共享同键，用户发下一条消息自动换键。
-		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
+		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
+		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
@@ -1893,7 +1935,7 @@ func hasImagePart(body []byte) bool {
 //
 // 目录查询只读既有缓存快照（cachedModelsSnapshot），**不触发上游拉取**：错误路径
 // 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
-// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 1h 未
+// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 10min 未
 // 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
 //
 // 只查 CN 动态目录（dynamicModelsCache）：其 supports_images 来自上游探测真值。

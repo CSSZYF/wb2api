@@ -72,7 +72,7 @@ func TestChatInvalidImageTerminalNoRotateNoPenalty(t *testing.T) {
 	if e.Error.Message != body11135User {
 		t.Errorf("message 非逐字原文:\n got=%q\nwant=%q", e.Error.Message, body11135User)
 	}
-	if e.Error.GatewayHint == nil || !strings.Contains(*e.Error.GatewayHint, "image data rejected") {
+	if e.Error.GatewayHint == nil || !strings.Contains(*e.Error.GatewayHint, "image request was rejected") {
 		t.Errorf("gateway_hint=%v want image-data hint", e.Error.GatewayHint)
 	}
 	// 不轮转：多账号池也只打第一个号（同一张坏图换任何账号都被拒，轮转纯属浪费）。

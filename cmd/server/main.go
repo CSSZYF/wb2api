@@ -363,8 +363,9 @@ func main() {
 		// 的请求必须在 60s 内传完（>1.1Mbps 稳定上行），而 460KB+ 上下文经 TUN 代理 +
 		// 跨境链路的上传耗时波动极大——超时即 i/o timeout，用户对话被拦腰截断
 		// （v1.9.13 生产事故）。300s 下 8MB 只需 27KB/s 上行。
-		// 注：max_body_mb 默认已在 v1.9.17 从 8MB 提到 32MB——同窗口下 32MB 需约
-		// 109KB/s 稳定上行，慢链路用户调大 max_body_mb 时应同步调大本项。
+		// 注：请求体已默认无网关侧上限（max_body_mb 默认 0 = 不预拦截，吸收上游
+		// 73fe1f8）——本项现在是**唯一**的大 body 闸门，慢链路用户应显式调大它；
+		// 若显式开了 max_body_mb 护栏，本项取值要大于该体积在常规带宽下的上传耗时。
 		// 这里的值是**启动兜底**：面板改该项后由 handler 逐请求重设读截止即时生效
 		// （见 handler.armBodyReadDeadline），无需重启；本字段仍保留，覆盖 handler
 		// 未挂到的路径（如面板自身端点）并作为「连接建立 → 首个请求」的初值。
@@ -427,8 +428,8 @@ func startupListen(cfg *Config) (net.Listener, error) {
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	// 入站读窗口透出：慢链路上传大上下文被掐断时，这一行是排查起点
 	// （server.read_timeout_seconds，面板可热改）。
-	log.Printf("[server] 入站请求体读取窗口 %ds（server.read_timeout_seconds，面板修改即时生效）；请求头上限 30s；请求体上限 %dMB",
-		cfg.Server.ReadTimeoutSeconds, cfg.Server.MaxBodyMB)
+	log.Printf("[server] 入站请求体读取窗口 %ds（server.read_timeout_seconds，面板修改即时生效）；请求头上限 30s；请求体上限 %s",
+		cfg.Server.ReadTimeoutSeconds, bodyLimitDesc(cfg.Server.MaxBodyMB))
 	return ln, nil
 }
 
@@ -519,6 +520,16 @@ func listenPort(listen string) string {
 		}
 	}
 	return p
+}
+
+// bodyLimitDesc 启动日志里的请求体上限描述（吸收上游 73fe1f8 后的口径）：
+// 0 = 不预拦截（默认，大请求交上游自然响应）；>0 = 网关侧内存护栏 N MB。
+// 独立函数便于测试盯住"日志别再说成默认 32MB"这一易回退口径。
+func bodyLimitDesc(maxBodyMB int) string {
+	if maxBodyMB <= 0 {
+		return "不预拦截（server.max_body_mb=0，交上游自然响应）"
+	}
+	return fmt.Sprintf("%dMB 网关内存护栏", maxBodyMB)
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL

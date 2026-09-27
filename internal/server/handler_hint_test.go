@@ -194,7 +194,7 @@ func TestChat11135Hint(t *testing.T) {
 	if !strings.HasSuffix(e.Error.Message, body11135Real) {
 		t.Errorf("message must carry verbatim 11135 body: %q", e.Error.Message)
 	}
-	if e.Error.GatewayHint == nil || !strings.Contains(*e.Error.GatewayHint, "image data rejected") {
+	if e.Error.GatewayHint == nil || !strings.Contains(*e.Error.GatewayHint, "image request was rejected") {
 		t.Errorf("gateway_hint=%v want image-data hint", e.Error.GatewayHint)
 	}
 }

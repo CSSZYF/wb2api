@@ -159,13 +159,12 @@ func TestChatStickyExplicitConversationIDUnchanged(t *testing.T) {
 // 此前 TurnKey 返回空串 → 出站 X-Conversation-Request-ID 退化成请求级随机
 // （同轮内换号/重试各发一个 ID，上游用量明细碎片化）。
 //
-// 注意本仓键链与上游的**结构差异**（实测确认，非猜测）：上游无内容派生键，
-// 无会话标识的请求走轮级兜底（TurnKey → TurnRequestID，跨轮换 ID）；本仓有第 4 位
-// 内容派生键（d- 前缀），这类请求走**会话级**（RequestIDForKey(d-键)，跨轮恒同 ID，
-// 粒度更粗但聚合更紧——同一对话的全部轮并成一条）。本用例钉的是"非空且稳定"：
+// 语义随 #170 统一轮级更新（吸收上游 03ce06d，详见 handler_turn_id_test.go）：
+// 带内容派生键（d- 前缀）的请求同样按**轮级**聚合——同轮同键、跨轮换键。
+// 本用例钉的是纯图片轮的键派生本身可用（原为空串 → 请求级随机）：
 //   - 同 body 两次出站 → 同 ID（原为各自随机的两个 ID）；
-//   - 会话推进（历史追加、首条 user 不变）→ 仍同 ID（会话级语义）；
-//   - 换图（新会话）→ 换 ID。
+//   - 会话推进（末条 user 换文本）→ 换 ID（轮级）；
+//   - 换图（新会话 + 新轮文本）→ 换 ID。
 func TestChatImageOnlyTurnAggregation(t *testing.T) {
 	var ids []string
 	p := testPoolWith(&auth.Auth{UID: "a1", AccessToken: "at-1", ExpiresAt: 9999999999})
@@ -203,15 +202,15 @@ func TestChatImageOnlyTurnAggregation(t *testing.T) {
 	if len(ids[0]) != 32 {
 		t.Errorf("聚合 ID 应为 32 hex（可作 B3 TraceId）: %q", ids[0])
 	}
-	// 会话推进：本仓走内容派生（会话级）→ 跨轮仍同 ID（比上游轮级粒度更粗）。
+	// 会话推进（末条 user 换文本）→ 轮级换 ID（#170 统一轮级）。
 	next := `{"model":"glm-5.2","stream":true,"messages":[` +
 		`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]},` +
 		`{"role":"assistant","content":"答"},{"role":"user","content":"继续"}]}`
 	if code := postChat(t, h, next); code != 200 {
 		t.Fatalf("code=%d", code)
 	}
-	if len(ids) != 3 || ids[2] != ids[0] {
-		t.Errorf("纯图会话推进应复用同一（会话级）聚合 ID: first=%q next=%q", ids[0], ids[2])
+	if len(ids) != 3 || ids[2] == "" || ids[2] == ids[0] {
+		t.Errorf("会话推进（新轮）应换聚合 ID: first=%q next=%q", ids[0], ids[2])
 	}
 	// 换图 = 新会话 → 换 ID。
 	otherImg := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":[` +
