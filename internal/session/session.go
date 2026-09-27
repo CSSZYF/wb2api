@@ -4,7 +4,9 @@
 // 但改为纯内存 + redisstore 异步镜像：
 //   - 命中走 RLock 快查（绝大多数请求已绑定）；
 //   - 未命中/失效走写锁 re-check 后分配，避免同 key 并发重复分配（TOCTOU 防护）；
-//   - 分配优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
+//   - 分配按选号模式分两支（见 Config.Sequential）：
+//     weighted（缺省）优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
+//     sequential 取候选列表第一个（pool.AvailableUIDs 已按 pool.Order() 排序）——集中填充；
 //   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
 //   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
 package session
@@ -44,6 +46,14 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// Sequential 选号模式（pool.pick_mode=sequential）的**启动初值**：与 TTL 同口径，
+	// New 时写入 Router.sequential（原子），此后运行期一律经 Router.Sequential()/
+	// SetSequential() 读写，本字段不再被读取——面板热改 pick_mode（saveConfig →
+	// SetSequential）改的是原子值，不回写配置结构。
+	//
+	// 语义：true 时新会话的分配取候选列表**第一个**（不再哈希分散），与选号侧
+	// pickSequentialLocked 的"集中填充"同源；false（零值，缺省）逐字节保持改动前行为。
+	Sequential bool
 }
 
 // Router 会话粘性路由器。
@@ -58,6 +68,10 @@ type Router struct {
 	// 同一把锁会把两件无关的事耦合起来（且快路径读锁下无法安全写 TTL）。
 	// 0 = 未初始化（理论不可达：New 一定写入非正值兜底后的默认 30m）。
 	ttlNanos atomic.Int64
+	// sequential 当前生效的选号模式（pool.pick_mode=sequential）。与 ttlNanos 同口径：
+	// 独立 atomic，面板热改（SetSequential）与分配读侧（ResolveForModel 慢路径）零耦合。
+	// false（零值）= weighted（缺省，改动前行为）。
+	sequential atomic.Bool
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -74,6 +88,7 @@ func New(cfg Config) *Router {
 	}
 	r := &Router{entries: map[string]entry{}, cfg: cfg}
 	r.ttlNanos.Store(int64(cfg.TTL))
+	r.sequential.Store(cfg.Sequential)
 	return r
 }
 
@@ -98,6 +113,25 @@ func (r *Router) SetTTL(d time.Duration) {
 		d = 30 * time.Minute
 	}
 	r.ttlNanos.Store(int64(d))
+}
+
+// Sequential 返回当前生效的选号模式是否为 sequential（原子读，任意时刻安全）。
+func (r *Router) Sequential() bool {
+	return r.sequential.Load()
+}
+
+// SetSequential 热更新选号模式（面板保存 pool.pick_mode 路径调用：cmd/server
+// saveConfig → SetSequential）。true = sequential：新会话分配取候选列表第一个
+// （集中填充），false = weighted：双段策略 + 哈希分散（改动前行为）。
+//
+// 语义是"对新分配生效、不做追溯"：已存在的绑定不因模式切换而改绑（粘性优先于模式，
+// 与 SetTTL 的"下一次判定才按新值算"同口径）；下一次**新会话分配**才按新模式挑号。
+//
+// 为什么用 atomic 而不是 mu：与 SetTTL 同理——分配读点在 ResolveForModel 慢路径，
+// 面板保存配置在另一个 goroutine（请求期），原子值让两侧零耦合、无锁竞争；
+// 且本开关只有"两种取值"、无需与 entries 同锁对齐。
+func (r *Router) SetSequential(on bool) {
+	r.sequential.Store(on)
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -215,6 +249,59 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 		return "", false
 	}
 
+	uid := r.assign(key, uids)
+
+	prev, existed := r.entries[key]
+	r.entries[key] = entry{uid: uid, lastActive: now}
+	if existed && prev.uid != uid {
+		r.cfg.Store.DelBind(key)
+	}
+	r.cfg.Store.SetBind(key, uid, r.TTL())
+	return uid, true
+}
+
+// assign 从可用候选列表（有序）中挑一个账号给会话 key。调用方必须已持 r.mu 写锁，
+// 且 uids 非空。
+//
+// 两种模式的语义分野（只换"怎么挑候选"这一件事，与 pool 侧 PickMode 的分野同形）：
+//
+// ── sequential（pool.pick_mode=sequential）──────────────────────────────
+// 取 uids[0]，即"顺序第一的可用号"。
+//
+//   - 为什么是第一个：uids 来自 pool.AvailableUIDs(ForModel[Realm])，它已按
+//     Pool.Order()（state.json 顶层 account_order，面板拖拽排序的权威次序）排序，
+//     且已过滤"不健康 / 在途占满"的账号。所以 uids[0] 就是"顺序里第一个此刻真能用的
+//     号"，而顺序第一的号满了/冷却时它自然从列表消失、uids[0] 变成下一个号——
+//     溢出语义**不需要在本函数里写任何逻辑**（与 pickSequentialLocked 同源）。
+//   - 为什么不哈希：顺序模式的语义就是「集中填充」——"保证绝大头在第一个号就行了，
+//     也就是填充模式"（用户原话）。哈希取模的作用恰恰是**反方向**的散列，两者矛盾：
+//     保留哈希会让新会话继续被分散到各个号，顺序第一的号只拿到 1/N 的会话，
+//     顺序模式在"带会话键的客户端"（也就是绝大多数客户端）上完全失效。
+//
+// **双段策略（"空闲账号优先"）在 sequential 下被显式跳过**（即方案 (a) 跳过 idle 段
+// 直接用全池顺序第一个，而不是 (b) 保留 idle 段只改取法）。理由：
+//   - 该策略的原意（见下方 weighted 分支）是"避免多个会话挤在同一个号"——它服务的是
+//     **加权模式**下"打散热点、摊开负载"的目标；
+//   - 顺序模式的目标与之**正好相反**：集中填满第一个号再用下一个。若保留 idle 段，
+//     顺序第一的号一旦被任何会话绑定就退出 idle，新会话会被推到后面的号上——
+//     修复前实测（候选列表已按 order 排好、40 个新会话）顺序第一的号只拿到 20 个，
+//     其余 20 个被散到第二个号，正是用户投诉的"每次挑不同账号"。
+//     故 sequential 下"已绑定"不是"不可用"：`bound` 是会话维度的占用，
+//     而本模式关心的是**账号维度**的在途额度（已由 uids 的 inFlightFull 过滤承载）。
+//   - 副作用是有界的：被绑定的会话继续粘着自己的号（粘性命中路径不受本函数影响），
+//     集中带来的额外成本只是"多一两个请求落在同一个号上"——与用户澄清一致
+//     （"反正只是多一个两个请求而已"）。
+//
+// ── weighted（缺省，改动前行为）──────────────────────────────────────────
+// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池；段内 FNV-1a
+// 哈希取模（同一 key 稳定落同一个号）。本分支与引入 pick_mode 前**逐字节相同**。
+//
+// 为什么 sequential 用原子读而不是持锁读：本函数已持 r.mu 写锁，而模式开关是
+// 独立 atomic（见 SetSequential 注释）——读它不需要也不应该借用 entries 的锁。
+func (r *Router) assign(key string, uids []string) string {
+	if r.sequential.Load() {
+		return uids[0]
+	}
 	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
 	bound := map[string]bool{}
 	for _, v := range r.entries {
@@ -230,15 +317,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	if len(pool2) == 0 {
 		pool2 = uids
 	}
-	uid := pool2[hashIndex(key, len(pool2))]
-
-	prev, existed := r.entries[key]
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	if existed && prev.uid != uid {
-		r.cfg.Store.DelBind(key)
-	}
-	r.cfg.Store.SetBind(key, uid, r.TTL())
-	return uid, true
+	return pool2[hashIndex(key, len(pool2))]
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。

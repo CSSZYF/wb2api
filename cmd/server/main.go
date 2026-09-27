@@ -122,15 +122,9 @@ func main() {
 		redisMode = "upstash"
 	}
 	if cfg.SessionSticky.Enabled {
-		sessRouter = session.New(session.Config{
-			TTL:        cfg.SessionTTL,
-			GCInterval: cfg.SessionGCInterval,
-			Store:      store,
-			Available:  p.AvailableUIDs,
-			// realm 感知闭包：显式前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
-			// 裸名的域归属走同一 RealmRouter（单域部署落唯一可用域），与请求路由零漂移。
-			AvailableForModel: realmAwareAvailableForModel(p, cfg.realmRouter(p)),
-		})
+		// 装配（含 pool.pick_mode → 粘性侧的顺序开关）见 wiring.go 的 newSessionRouter：
+		// 与 cmd/server 的接线测试共用同一份，避免"测试另写装配"漏掉接线回归。
+		sessRouter = newSessionRouter(cfg, p, store)
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
 		defer sessRouter.StopGC()
@@ -563,6 +557,8 @@ func panelListenPath(listen string) string {
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetDegrade/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights/SetPickMode
+//     （pool.pick_mode 另需 session.Router.SetSequential：粘性侧的新会话分配是**另一条**
+//     分配路径，见函数内注释）
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetAuthWatchInterval/SetCooldownProbeInterval
 //   - session_sticky.ttl → session.Router.SetTTL（原子热改；gc_interval 不在此列，
 //     GC ticker 已在 StartGC 时按旧值启动，重建风险大 → 仍列为重启项）
@@ -637,7 +633,17 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 选号模式热改（pool.pick_mode）：原子写，**下一次选号**即按新模式（已发出的请求
 	// 不追溯改选号口径）。池内顺序（account_order）不在此处：它由面板拖拽端点
 	// POST /panel/api/accounts/order 直接写池并落盘，与 config 无关。
+	//
+	// 两处都要热改（同一模式的**两条分配路径**，缺一即"改了配置但一半流量照旧"）：
+	//   - pool.SetPickMode：无会话键的请求走 Pool.Pick 的 healthy 段挑选；
+	//   - sess.SetSequential：带会话键的**新会话分配**（session.Router.assign）。
+	//     粘性命中路径不受影响（已绑定的会话继续粘着，与模式无关）。
+	// sess 为 nil 表示粘性关闭（session_sticky.enabled=false，main 未建 Router）——
+	// 跳过热应用即可（此时本就没有粘性分配路径）。
 	p.SetPickMode(PickMode(newCfg.Pool.PickMode))
+	if sess != nil {
+		sess.SetSequential(PickMode(newCfg.Pool.PickMode) == pool.PickSequential)
+	}
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,

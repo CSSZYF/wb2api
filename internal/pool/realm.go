@@ -2,7 +2,6 @@
 package pool
 
 import (
-	"sort"
 	"time"
 )
 
@@ -23,7 +22,8 @@ func (p *Pool) HasRealm(realm string) bool {
 }
 
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
-// realm=="" 退化为 AvailableUIDs（现状语义）。
+// realm=="" 退化为 AvailableUIDs（现状语义）。排序口径同 AvailableUIDs
+// （sortByOrderLocked → Pool.Order()），域过滤保序。
 func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -41,12 +41,13 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 		}
 		uids = append(uids, uid)
 	}
-	sort.Strings(uids)
+	p.sortByOrderLocked(uids)
 	return uids
 }
 
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
 // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
+// 排序口径同 AvailableUIDs（sortByOrderLocked → Pool.Order()），域过滤/健康过滤保序。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -64,6 +65,6 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 		}
 		uids = append(uids, uid)
 	}
-	sort.Strings(uids)
+	p.sortByOrderLocked(uids)
 	return uids
 }

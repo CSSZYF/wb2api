@@ -2,8 +2,31 @@ package main
 
 import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
+
+// newSessionRouter 按配置装配会话粘性路由（main 与 cmd/server 的接线测试共用，
+// 避免"测试里另写一份装配"导致接线回归测不到）。
+//
+// 两处依赖值得单独说明：
+//   - AvailableForModel：realm 感知闭包（见 realmAwareAvailableForModel）——粘性候选
+//     必须与请求路由同一套域归属，否则 global 号会被分给 CN 请求；
+//   - Sequential：pool.pick_mode 的粘性侧镜像。**这条接线是 v1.9.26 的缺陷所在**：
+//     顺序模式只改了 Pool.Pick 的挑选方式，而"新会话绑到哪个号"走的是
+//     session.Router.assign（另一条分配路径），缺了这条接线时带会话键的客户端
+//     （绝大多数）仍被哈希分散到各号，顺序模式形同未开。
+func newSessionRouter(cfg *Config, p *pool.Pool, store redisstore.Store) *session.Router {
+	return session.New(session.Config{
+		TTL:               cfg.SessionTTL,
+		GCInterval:        cfg.SessionGCInterval,
+		Store:             store,
+		Available:         p.AvailableUIDs,
+		AvailableForModel: realmAwareAvailableForModel(p, cfg.realmRouter(p)),
+		Sequential:        PickMode(cfg.Pool.PickMode) == pool.PickSequential,
+	})
+}
 
 // realmAwareAvailableForModel 构造会话粘性路由按模型可用口径的 realm 感知闭包。
 //
