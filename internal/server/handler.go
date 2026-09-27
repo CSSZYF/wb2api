@@ -1302,7 +1302,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
 				break
 			}
-			if !rotateBackoff(i, r.Context()) {
+			// 429 立即换下一个号（不退避，首字延迟优先）；WAF 403 与其余分类照常退避。
+			// 判据与分野理由见 backoff.go 的 backoffWorthwhile/rotateBackoffKind。
+			if !rotateBackoffKind(i, r.Context(), kind) {
 				break // ctx 取消：终止轮转（分类错误换号退避，WAF P0-2）
 			}
 			continue
@@ -1485,7 +1487,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
 // kind 是唯一权威分类（来自 upstream.Classify / ChatStreamContext 的 *Error 信封），
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：调用方已
-// 准备好 lastErr 并打算 continue 换号（continue 前由 rotateBackoff 退避）。
+// 准备好 lastErr 并打算 continue 换号（continue 前经 rotateBackoffKind 按 kind
+// 决定是否退避：429 不退避、其余含 WAF 403 照常退避，见 backoff.go 的 backoffWorthwhile）。
 //
 // 路径清单，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
@@ -1572,6 +1575,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
+		// 本次换号**不退避**（rotateBackoffKind 放行 ErrSoftRate）：用户语义是
+		// 「临时 429 重试一次后仍 429 就立即切下一个号」，切的是另一个账号，
+		// 上游频控按账号计，等待只会抬高首字延迟（见 backoffWorthwhile）。
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族（本仓 v1.9.7
@@ -1690,6 +1696,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // ±25% 抖动），ctx 取消（客户端断连/优雅停机）返回 false——调用方立即终止轮转
 // （客户端已走，换号重试无意义）。退避是「换号前歇一下」让上游频控窗口滑过；
 // 正常单号请求（首次成功）不经过本函数，零开销。
+//
+// **429（ErrSoftRate）不走本函数**：分类错误路径经 rotateBackoffKind 按 kind 分流，
+// 429 立即换下一个号（首字延迟优先），WAF 403 等其余分类仍走本函数退避——分野理由
+// 见 backoff.go 的 backoffWorthwhile。其余三条轮转路径（抢名额失败 / refresh 失败 /
+// 传输层错误）不经分类判定，一律沿用本函数（既有语义不变）。
 func rotateBackoff(i int, ctx context.Context) bool {
 	d := backoffAfter(i)
 	if d <= 0 {

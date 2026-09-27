@@ -2,9 +2,11 @@
 package pool
 
 import (
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -104,11 +106,184 @@ func (p *Pool) logRealmFallbackLocked(realm string, a *auth.Auth, reqModel strin
 	return a
 }
 
+// PickMode 选号模式（config pool.pick_mode 的运行期镜像）。
+//
+// 两种模式的分野是「候选集怎么挑」这一件事，其余谓词（tried / healthy /
+// healthyForModel / inFlightFull / realm 过滤 / 全冷却兜底 / 跨域回落）逐一相同——
+// 模式只换 healthy 段的挑选方式，不换任何过滤条件与兜底语义。
+type PickMode int
+
+const (
+	// PickWeighted 三因子加权随机（**缺省**，零值即本模式）：改动前的既有行为，
+	// 逐字节不变。Top5 短名单 + 加权抽签 + minPickGap 防并发撞号 + LRU 兜底。
+	PickWeighted PickMode = iota
+	// PickSequential 顺序填充式：按 Pool.Order() 从上到下取**第一个**合格账号，
+	// 靠 inFlightFull 过滤实现「并发满了临时溢出给下一个号、并发降回来它重新成为
+	// 首选」的语义（顺序遍历是确定性的，不需要任何额外逻辑）。
+	PickSequential
+)
+
+// SetPickMode 注入选号模式（main 从 config pool.pick_mode 解析后调用；
+// 面板改配置后热生效，下一次选号即按新模式）。未知值由调用方（config）归一化，
+// 本入口只做「枚举外的值一律当缺省 weighted」的兜底。
+func (p *Pool) SetPickMode(m PickMode) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch m {
+	case PickSequential:
+		p.pickMode = PickSequential
+	default:
+		p.pickMode = PickWeighted
+	}
+}
+
+// PickMode 返回当前生效的选号模式（供面板/运维接口回显）。
+func (p *Pool) PickMode() PickMode {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.pickMode
+}
+
 // pickHealthyLocked 在 healthy 候选集中选号（realm 谓词为硬过滤）；无候选返回 nil，
 // 交由 pick 决定是否跨域回落或走全冷却兜底。调用方必须已持 p.mu 写锁：跨域回落要在
 // 同一临界区内做多次候选扫描，中间不得释放锁——否则两次扫描之间池状态变化会让
 // 「回落」判定与候选集不一致。
 func (p *Pool) pickHealthyLocked(tried map[string]bool, now time.Time, reqModel, realm string) *auth.Auth {
+	if p.pickMode == PickSequential {
+		return p.pickSequentialLocked(tried, now, reqModel, realm)
+	}
+	return p.pickWeightedHealthyLocked(tried, now, reqModel, realm)
+}
+
+// seqSkip 顺序模式下被跳过的账号及其原因（仅供溢出日志组装，不参与选号判定）。
+type seqSkip struct {
+	uid    string
+	reason string
+}
+
+// pickSequentialLocked 顺序填充式选号：按 Pool.Order() 从上到下遍历，返回第一个
+// 同时满足 tried 未标记 / healthy(ForModel) / 未占满在途 的账号。
+//
+// 三条需求的实现方式（都不需要额外状态机）：
+//   - 需求 2「并发满 = 临时溢出」：inFlightFull 过滤天然实现——顺序靠前的号满了就
+//     落到下一个；并发降回来后它重新是第一个合格候选（顺序遍历确定性保证）。
+//   - 需求 3「用完（带恢复时间的 429）= 真正切换」：applyErrorPolicy 的
+//     CooldownSoftRate/CooldownSoftForModel 已把冷却写进 until/modelCooldowns，
+//     healthy/healthyForModel 为 false，顺序遍历自然跳过；到期后重新首选。
+//   - 需求 4「临时 429 重试一次后仍 429 立即切下一个」：handler 的 tried 集合 +
+//     本函数跳过 tried —— 轮转天然落到下一个号（配合需求 5 的不退避，切换零延迟）。
+//
+// 为什么 sequential 分支**跳过 minPickGap 过滤**（minPickGap 只服务加权模式）：
+// 那个 100ms 窗口的语义是「同一账号在极短窗口内不重复被选中」，它针对的是加权模式的
+// **随机抽签**——随机源可能在连续多次选号里反复抽中同一个号，靠时间窗把它挤开。
+// 顺序模式下选号是**确定性**的：同一个号被连续选中不是缺陷，而正是需求本身
+// （"一个号一个号地用，把这个号的额度用完再下一个"）。若在顺序模式保留该过滤，
+// 同一个号在前一次选中的 100ms 内会因 `now.Sub(e.lastUsed) < minPickGap` 被跳过，
+// 落到**下一个号**——制造出「明明没满却跳到下一个号」的假溢出，正好破坏顺序语义
+// （并发未满时请求被分散到后面的号，用户看到的仍是"每次挑不同账号"）。
+// 另注：minPickGap 的实现把 lastUsed 在锁内即时置为 now，且候选全被窗口挡住时走
+// LRU 兜底（可能选中窗口外的其他号）——这两条在顺序模式下都是反向语义。
+// 故本分支不做该过滤，且不读也不写 lastUsed 之外的任何窗口判定。
+//
+// 溢出日志（需求 6）：只有当**顺序靠前的合格形态账号被跳过**时才打一条，
+// 避免每次选号都刷屏。触发情形两类：在途占满（inflight_full）、冷却/禁用等不健康
+// （unhealthy）。跳过原因取每个被跳过账号的首个判据（顺序：tried → healthy → inflight）。
+func (p *Pool) pickSequentialLocked(tried map[string]bool, now time.Time, reqModel, realm string) *auth.Auth {
+	order := p.effectiveOrderLocked()
+	var chosen *entry
+	// skipped 收集被跳过的账号及其原因（仅在真的选中了后面的号时才打日志：
+	// 无候选返回 nil 时由 pick 决定跨域回落/兜底，那些路径有自己的日志）。
+	var skipped []seqSkip
+	for _, uid := range order {
+		e := p.byUID[uid]
+		if tried != nil && tried[uid] {
+			// 请求级轮换：本请求已经试过该号（含临时 429 重试一次后的第二次尝试），
+			// 直接跳过——需求 4 的「还是 429 就立即切下一个」靠这里落地。
+			skipped = append(skipped, seqSkip{uid, "tried"})
+			continue
+		}
+		e.pruneExpiredModelCooldowns(now) // 惰性清理过期模型级冷却（防 map 膨胀）
+		if realm != "" && e.a.Realm() != realm {
+			skipped = append(skipped, seqSkip{uid, "realm"})
+			continue
+		}
+		healthy := e.healthy(now)
+		if reqModel != "" {
+			healthy = e.healthyForModel(now, reqModel)
+		}
+		if !healthy {
+			// 需求 3：带恢复时间的 429 已在 applyErrorPolicy 写成 until/模型级冷却，
+			// 此处自然跳过（reason 文案区分账号级与模型级，便于用户验证）。
+			skipped = append(skipped, seqSkip{uid, "unhealthy"})
+			continue
+		}
+		if p.inFlightFull(e) {
+			// 需求 2：并发满 → 临时溢出给下一个号（不冷却、不惩罚，并发降回来即首选）。
+			skipped = append(skipped, seqSkip{uid, "inflight_full"})
+			continue
+		}
+		chosen = e
+		break
+	}
+	if chosen == nil {
+		return nil // 无合格候选：交给 pick 跨域回落 / 全冷却兜底
+	}
+	p.logSequentialSkipsLocked(skipped, chosen)
+	chosen.lastUsed = now // 与加权路径同口径：供面板/观测看到"最近被选中"
+	p.pickSeq++
+	chosen.usedSeq = p.pickSeq
+	return chosen.a
+}
+
+// logSequentialSkipsLocked 顺序模式下发生溢出时打一条日志（需求 6 可观测）：
+// 用户据此验证「顺序靠前的号因为满/冷却被跳过、本次落到哪个号」。
+// 只在**确实跳过了账号且最终选中了更靠后的号**时打；一次选号至多一条（不刷屏），
+// 且每个被跳账号的原因用 `uid=... reason=...` 逐项列出。
+// 在途占满额外带 `(在途/上限)` 便于用户核对并发档位（maxInFlight 按 realm 分档）。
+//
+// **纯 realm 跳过不打日志**：混合池下顺序里排在前面的是另一域的号时，按域过滤的
+// 每次请求都会跳过它们（reason=realm）——那是分池路由的正常形态，不是溢出，照打会
+// 把每次请求都刷成一行。判据取「至少一个非 realm 的跳过原因」（tried / unhealthy /
+// inflight_full 三类才是溢出/切换信号），有它时整条 skip 列表（含 realm 项）一并
+// 列出，用户能看到完整的跳过链路。
+// 调用方必须已持 p.mu 写锁（读 inFlight/上限字段与选号同一时刻快照）。
+func (p *Pool) logSequentialSkipsLocked(skipped []seqSkip, chosen *entry) {
+	overflow := false
+	for _, s := range skipped {
+		if s.reason != "realm" {
+			overflow = true
+			break
+		}
+	}
+	if !overflow {
+		return // 顺序第一直接命中，或仅因 realm 过滤跳过：正常路径零噪音
+	}
+	var b strings.Builder
+	b.WriteString("pool: sequential skip")
+	for _, s := range skipped {
+		b.WriteString(" uid=")
+		b.WriteString(s.uid)
+		b.WriteString(" reason=")
+		b.WriteString(s.reason)
+		if s.reason == "inflight_full" {
+			// 带在途/上限：maxInFlight 未设（0=不限）时 inFlightFull 恒 false，
+			// 不会走到这里；limit>0 才有 inflight_full 这条原因。
+			e := p.byUID[s.uid]
+			if e != nil {
+				fmt.Fprintf(&b, "(%d/%d)", e.inFlight.Load(), p.inFlightLimit(e))
+			}
+		}
+	}
+	b.WriteString(" -> next uid=")
+	b.WriteString(chosen.a.UID)
+	log.Print(b.String())
+}
+
+// pickWeightedHealthyLocked 三因子加权随机的 healthy 段选号（**改动前原实现，
+// 逐字保留**）：Top5 短名单 + 加权抽签 + minPickGap 防并发撞号 + LRU 兜底。
+// 由 pickHealthyLocked 在 PickWeighted 模式（缺省）下调用——本函数体与
+// pick_mode 引入前逐字节相同，保证默认部署零回归。
+func (p *Pool) pickWeightedHealthyLocked(tried map[string]bool, now time.Time, reqModel, realm string) *auth.Auth {
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {

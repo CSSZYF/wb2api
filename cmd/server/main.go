@@ -110,6 +110,10 @@ func main() {
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	// 选号模式（pool.pick_mode，缺省 weighted = 改动前行为）：sequential 时按账号列表
+	// 顺序（state.json 顶层 account_order）填充式选号，某号在途满则临时溢出给下一个。
+	// 面板改配置后经 saveConfig 热生效（无需重启）。
+	p.SetPickMode(PickMode(cfg.Pool.PickMode))
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -558,7 +562,7 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetDegrade/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights
+//   - pool.* → pool.SetBreaker/SetDegrade/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights/SetPickMode
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetAuthWatchInterval/SetCooldownProbeInterval
 //   - session_sticky.ttl → session.Router.SetTTL（原子热改；gc_interval 不在此列，
 //     GC ticker 已在 StartGC 时按旧值启动，重建风险大 → 仍列为重启项）
@@ -630,6 +634,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
+	// 选号模式热改（pool.pick_mode）：原子写，**下一次选号**即按新模式（已发出的请求
+	// 不追溯改选号口径）。池内顺序（account_order）不在此处：它由面板拖拽端点
+	// POST /panel/api/accounts/order 直接写池并落盘，与 config 无关。
+	p.SetPickMode(PickMode(newCfg.Pool.PickMode))
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,

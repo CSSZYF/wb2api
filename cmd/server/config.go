@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -272,6 +273,19 @@ type Config struct {
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
 		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
 		ExpiringSoon string `json:"expiring_soon"`
+		// PickMode 选号模式：
+		//   - "weighted"（缺省）：三因子加权随机（Top5 短名单 + 加权抽签），
+		//     即本键引入前的既有行为，逐字节不变；
+		//   - "sequential"：**顺序填充式**——按账号列表顺序（面板可拖动排序，
+		//     持久化在 state.json 顶层 account_order）从上到下取第一个合格账号。
+		//     某号在途占满（pool.max_in_flight / max_in_flight_global）时临时溢出给
+		//     下一个号，并发降回来后它重新成为首选（顺序靠前优先，不是轮转）；
+		//     收到带恢复时间的 429（applyErrorPolicy 的 ErrSoftRate 分支）时该号
+		//     冷却到恢复时刻、自然被跳过。用于解决「每次挑不同账号请求」引发的
+		//     频繁 429。
+		// 非法值（空/未知）回落 weighted 并记 warn——与 features.reasoning_history
+		// 同风格：本键的缺省方向必须与改动前逐字节一致（静默失败的方向是"保持旧行为"）。
+		PickMode string `json:"pick_mode"`
 	} `json:"pool"`
 
 	// Models 网关对外模型名协议（/v1/models 的 id 形态 + 裸名归属域）。
@@ -415,6 +429,8 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	// 选号模式缺省 weighted：与加本键前逐字节一致（顺序模式是用户显式选择的行为变更）。
+	c.Pool.PickMode = PoolPickModeWeighted
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -633,6 +649,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_DEGRADE_COOLDOWN_MAX"); v != "" {
 		c.Pool.DegradeCooldownMax = v
 	}
+	// 选号模式（weighted/sequential）：归一化在 normalize()，与 JSON 同口径
+	// （非法值同样回落 weighted + warn，env 不做第二套校验）。
+	if v := os.Getenv("WB2A_PICK_MODE"); v != "" {
+		c.Pool.PickMode = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -811,7 +832,49 @@ func (c *Config) normalize() error {
 		log.Printf("features.reasoning_history: %q 不是合法档位（full/last/blank），已按 full 处理", c.Features.ReasoningHistory)
 		c.Features.ReasoningHistory = upstream.ReasoningHistoryFull
 	}
+	// pool.pick_mode：合法值归一化（大小写/首尾空白不敏感）；非法值（空串/未知）
+	// **回落 weighted 并记 warn**，不 fail fast——理由见字段注释：缺省方向必须与
+	// 加本键前逐字节一致，静默失败的方向是"保持旧行为"（不会把用户没要求的顺序模式
+	// 悄悄打开，也不会因为拼错一个词就让网关起不来）。
+	if mode, ok := NormalizePickMode(c.Pool.PickMode); ok {
+		c.Pool.PickMode = mode
+	} else {
+		log.Printf("pool.pick_mode: %q 不是合法模式（weighted/sequential），已按 weighted 处理", c.Pool.PickMode)
+		c.Pool.PickMode = PoolPickModeWeighted
+	}
 	return c.normalizePrompt()
+}
+
+// pool.pick_mode 的合法值（JSON 字符串形态，小写）。
+const (
+	// PoolPickModeWeighted 三因子加权随机（缺省）。
+	PoolPickModeWeighted = "weighted"
+	// PoolPickModeSequential 顺序填充式选号。
+	PoolPickModeSequential = "sequential"
+)
+
+// NormalizePickMode 归一化 pool.pick_mode：大小写/首尾空白不敏感，返回归一化值与
+// 是否合法。空串视为**非法**（由调用方回落 weighted 并 warn）——空串与"键缺席"
+// 在 Default() 已填默认值的前提下无法区分，统一走 warn 分支对排查更友好
+// （若用户手写 "pick_mode": "" 是明确的配置错误信号）。
+func NormalizePickMode(s string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case PoolPickModeWeighted:
+		return PoolPickModeWeighted, true
+	case PoolPickModeSequential:
+		return PoolPickModeSequential, true
+	default:
+		return "", false
+	}
+}
+
+// PickMode 把归一化后的配置字符串映射为 pool 的枚举（未知一律缺省 weighted，
+// 与 NormalizePickMode 的兜底同口径——本函数不负责报错/告警）。
+func PickMode(cfgVal string) pool.PickMode {
+	if mode, ok := NormalizePickMode(cfgVal); ok && mode == PoolPickModeSequential {
+		return pool.PickSequential
+	}
+	return pool.PickWeighted
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom 模式）。
