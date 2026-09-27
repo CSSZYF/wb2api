@@ -1294,3 +1294,165 @@ func TestAppJSReasoningHistoryWiring(t *testing.T) {
 		}
 	}
 }
+
+// TestAppJSDragOrderWiring 账号拖拽排序的前端接线必须齐全：
+//
+//	拖拽手柄（td.drag-handle，最左列 ⠿）→ 四类事件处理器（mousedown 武装 /
+//	dragstart 起拖 / dragover 画线 / drop 落点）→ POST accounts/order →
+//	响应 order 重排 → 失败回滚（toast 报错，不静默吞）。
+//
+// 为什么需要：app.js 是 go:embed 静态资源，Go 编译器与 Go 测试都不校验其内容——
+// 少一个事件绑定或把 drop 的 preventDefault 删掉，面板上就是「拖了没反应」（拖拽
+// 连起都起不来，因为 dragover 不 preventDefault 时浏览器不派发 drop），而所有
+// Go 测试仍全绿（同 TestAppJSSyntax）。后端端点 POST /panel/api/accounts/order 的
+// 契约锁定在 account_order_test.go，本用例只锁前端侧的接线。
+func TestAppJSDragOrderWiring(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	for _, must := range []string{
+		`class="drag-handle"`,                                   // 手柄单元格（renderAccounts 内）
+		`'td.drag-handle'`,                                      // 事件目标判据（closest）
+		`'accounts/order'`,                                      // 端点（api() 会补 /panel/api/ 前缀）
+		`dragstart`, `dragover`, `dragleave`, `drop`, `dragend`, // 五类事件绑定
+		`dataTransfer`,           // HTML5 DnD 必需（Firefox 不 setData 不起拖）
+		`getBoundingClientRect`,  // 落点判定依据
+		`function dropBefore(`,   // 半高落点判定
+		`function saveOrder(`,    // 提交 + 回滚
+		`function applyOrder(`,   // 响应回显重排
+		`function inFlightCell(`, // 并发「在途 / 上限」渲染
+		`function inFlightLimitOf(`,
+	} {
+		if !strings.Contains(s, must) {
+			t.Errorf("app.js 缺拖拽排序接线：%s", must)
+		}
+	}
+	// 落点判定必须用**半高**：只用 top 会让整行都判成"插到该行之前"（下半格无法
+	// 插到下一行之前）；用 bottom 则相反。半高是"插到两行之间"的唯一正确判据。
+	body := jsFuncBody(s, "function dropBefore(")
+	if body == "" {
+		t.Fatal("app.js 缺 dropBefore")
+	}
+	if !strings.Contains(body, "height / 2") || !strings.Contains(body, "getBoundingClientRect") {
+		t.Errorf("dropBefore 未按行半高判定落点（插到两行之间会错位）：\n%s", body)
+	}
+	// dragover 必须 preventDefault：否则浏览器根本不派发 drop 事件（HTML5 DnD 规范），
+	// 表现就是"拖得动但松手没反应"。这条是整条链路里最容易漏、最难查的一处。
+	i := strings.Index(s, "addEventListener('dragover'")
+	if i < 0 {
+		t.Fatal("app.js 缺 dragover 处理器")
+	}
+	if head := s[i : i+300]; !strings.Contains(head, "preventDefault") {
+		t.Errorf("dragover 未 preventDefault → drop 永远不会触发：\n%s", head)
+	}
+	// 失败必须回滚 + 报错：拖拽是一次性可见动作，静默失败会让面板显示的顺序与后端
+	// 实际选号顺序不一致（用户以为改了，选号仍按旧序）。
+	sb := jsFuncBody(s, "async function saveOrder(")
+	if sb == "" {
+		t.Fatal("app.js 缺 saveOrder")
+	}
+	if !strings.Contains(sb, "catch") || !strings.Contains(sb, "toast(") {
+		t.Errorf("saveOrder 未在失败时 toast 报错（不得静默吞掉）：\n%s", sb)
+	}
+	if !strings.Contains(sb, "renderAccounts(") {
+		t.Errorf("saveOrder 失败时未回滚 UI（重渲染快照顺序）：\n%s", sb)
+	}
+	// 只在手柄上可拖：draggable 由手柄 mousedown 武装、dragstart 再校验来源。
+	// 常驻 draggable 会让行内 7 个按钮的点击被拖拽吃掉。
+	if !strings.Contains(s, "dragArmed") {
+		t.Error("app.js 缺 dragArmed 闸门（draggable 必须由手柄 mousedown 临时武装，否则行内按钮点击被拖拽吃掉）")
+	}
+	// 顺序渲染必须来自 overview（后端权威顺序），前端不得自建缓存覆盖它。
+	if !strings.Contains(s, "renderAccounts(d.accounts || [])") {
+		t.Error("renderAccounts 未直接渲染 overview.accounts（顺序必须以后端为准，前端不做本地缓存）")
+	}
+
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, must := range []string{
+		`id="accBody"`,                          // 事件委托容器
+		`.acc td.drag-handle`,                   // 手柄样式
+		`tr.drop-before td`, `tr.drop-after td`, // 插入位置提示线
+		`tr.dragging`, // 拖拽中半透明
+	} {
+		if !strings.Contains(h, must) {
+			t.Errorf("index.html 缺拖拽排序接线：%s", must)
+		}
+	}
+}
+
+// TestAppJSConcurrencyColumnWiring 并发可视化（「在途 / 上限」+ 占满高亮 + 顺序模式
+// 横幅）的接线必须齐全：上限分母取自 /panel/api/config 的 pool 段（overview 不带），
+// 渲染进 inFlightCell，占满时挂 .inflight-full（warn 色），顺序模式横幅只在
+// pick_mode=sequential 时显示。
+//
+// 为什么需要：app.js/index.html 是 go:embed 静态资源，Go 编译器不校验其内容——
+// 分母读错档位（global 用了 cn 档）或漏掉 pick_mode 判据，面板上就是「数字看着对、
+// 结论是错的」：用户按显示判断"这个号满了会溢出"，实际后端按另一档在选号。
+func TestAppJSConcurrencyColumnWiring(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	for _, must := range []string{
+		"in_flight", // 在途数来源（overview.accounts[]）
+		"function inFlightCell(",
+		"function inFlightLimitOf(",
+		"inFlightCell(s)",      // renderAccounts 接线
+		"inflight-full",        // 占满高亮类名
+		"max_in_flight",        // cn 档（config.pool）
+		"max_in_flight_global", // global 档
+		"'sequential'",         // pick_mode 判据
+		"function seqModeOn(",  // 顺序模式判定
+		"accSeqNote",           // 顺序模式横幅
+	} {
+		if !strings.Contains(s, must) {
+			t.Errorf("app.js 缺并发可视化接线：%s", must)
+		}
+	}
+	// 分档取值必须按 realm 判：global 走 global 档、其余回落 cn 档——与后端
+	// pool.inFlightLimit 逐字一致（global 档 >0 才生效，否则回落 max_in_flight）。
+	body := jsFuncBody(s, "function inFlightLimitOf(")
+	if body == "" {
+		t.Fatal("app.js 缺 inFlightLimitOf")
+	}
+	if !strings.Contains(body, "'global'") {
+		t.Errorf("inFlightLimitOf 未按 realm 分档（global 必须走 max_in_flight_global）：\n%s", body)
+	}
+	// renderAccounts 里必须在途列的插入点存在（删掉插值 = 列回到纯数字，无上限无高亮）。
+	ra := jsFuncBody(s, "function renderAccounts(")
+	if ra == "" {
+		t.Fatal("app.js 缺 renderAccounts")
+	}
+	if !strings.Contains(ra, "inFlightCell(") {
+		t.Error("renderAccounts 未渲染「在途 / 上限」单元格")
+	}
+
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, must := range []string{
+		`id="accSeqNote"`,    // 顺序模式横幅容器
+		`在途 / 上限`,            // 表头文案
+		`td.inflight-full`,   // 占满高亮样式
+		`name="pick_mode"`,   // 配置页下拉
+		`value="sequential"`, // 下拉项
+		`value="weighted"`,   // 下拉项（缺省）
+	} {
+		if !strings.Contains(h, must) {
+			t.Errorf("index.html 缺并发可视化/选号模式接线：%s", must)
+		}
+	}
+	// CFG_MAP 映射：缺了它下拉只是装饰（保存时 collectConfig 收不到该键，静默不生效）。
+	if !strings.Contains(s, `pick_mode: ['pool', 'pick_mode']`) {
+		t.Error("app.js 缺 pick_mode 的 CFG_MAP 映射（表单值无法读写 pool.pick_mode）")
+	}
+}

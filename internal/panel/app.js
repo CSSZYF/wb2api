@@ -6,6 +6,15 @@ let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+// 账号表拖拽排序的瞬时状态（null = 未在拖拽）：{uid, row}。见「账号拖拽排序」段。
+let dragState = null;
+// 「已武装」的行：手柄 mousedown 时赋值，mouseup/dragend 清空。HTML5 DnD 要求
+// draggable 在拖拽开始**之前**就为 true，而本表只允许从手柄起拖（行内有按钮），
+// 故用它做闸门：只有手柄按下过的行才可能成为拖拽源。
+let dragArmed = null;
+// 在途上限缓存（/panel/api/config 的 pool.max_in_flight / max_in_flight_global）：
+// 账号表「在途 / 上限」列的分母 + sequential 横幅判据。null = 尚未取到（只显示在途数）。
+let poolLimits = null;
 
 const $ = id => document.getElementById(id);
 
@@ -322,10 +331,38 @@ function pkgExpiryState(p, nowMs, winSec) {
     tip: date + ' 到期 · 剩余 ' + days + ' 天' + tail };
 }
 
+/* ── 在途 / 上限（并发可视化）─────────────────────────────────────────
+   分母取值口径与后端 pool.inFlightLimit（internal/pool/pool.go）逐字一致：
+   global 域且 max_in_flight_global>0 → 用 global 档；否则回落 max_in_flight（0 = 不限）。
+   数据源是 /panel/api/config 的 pool 段（overview 不下发这两个上限），缓存在
+   poolLimits，配置页保存后重拉——与后端热生效的值同源。
+   取不到时（poolLimits 为 null）**只显示在途数、不显示分母**：宁可少一个数字，
+   也不谎报「0/3」或「2/0」——上限未知不等于上限为零。 */
+function inFlightLimitOf(realm) {
+  if (!poolLimits) return null;
+  const gl = Number(poolLimits.global) || 0;
+  if (realm === 'global' && gl > 0) return gl;
+  return Number(poolLimits.cn) || 0;
+}
+// 占满 = 该号在途已达上限：顺序模式下新请求会溢出到下一个号，这是该行为唯一的可见信号。
+function inFlightFullOf(n, lim) { return lim != null && lim > 0 && n >= lim; }
+function inFlightCell(s) {
+  const n = s.in_flight || 0;
+  const lim = inFlightLimitOf(s.realm);
+  const full = inFlightFullOf(n, lim);
+  const tip = lim == null ? '在途 ' + n + '（并发上限未知：配置未取到）'
+    : lim > 0 ? '在途 ' + n + ' / 上限 ' + lim + (full ? '（已占满：新请求溢出到下一个号）' : '')
+    : '在途 ' + n + '（未限制并发）';
+  // lim==null 不显示分母；lim==0（0=不限）显示 ∞，不写成「2/0」（那是"超限"的错觉）。
+  const denom = lim == null ? '' : '<span class="of">/' + (lim > 0 ? lim : '∞') + '</span>';
+  return '<td class="num inflight' + (full ? ' inflight-full' : '') + '" title="' + esc(tip) + '">' +
+    n + denom + '</td>';
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -379,13 +416,16 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
-    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
+    return '<tr class="' + cls + '" data-uid="' + esc(s.uid) + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
+      // 拖拽手柄：仅此单元格可起拖（见「账号拖拽排序」段）。draggable 由手柄的
+      // mousedown 武装——直接给 tr 挂 draggable 会让选中文字/点按钮都变成拖拽。
+      '<td class="drag-handle" title="按住拖动调整选号顺序">⠿</td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + modelLimitTag(s.rate_limited_models, frozen) + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div>' + expTag + '</td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
-      '<td class="num">' + (s.in_flight || 0) + '</td>' +
+      inFlightCell(s) +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
         '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
         '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
@@ -431,8 +471,17 @@ async function loadOverview(quiet) {
     const p = $('navPulse');
     p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
+    // sequential 横幅：只在顺序模式显示（加权随机模式下「从上到下溢出」不成立，
+    // 显示它会误导用户以为顺序生效）。文案与 pool/pick.go 的 pickSequentialLocked 语义对齐。
+    const seq = seqModeOn();
+    $('accSeqNote').hidden = !seq;
+    $('accSeqNote').textContent = seq ? '按顺序选号：从上到下，占满溢出到下一个（拖动 ⠿ 调整顺序）' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+    // 顺序保存在途时先不重渲染账号表（见 orderSaving 注释）：overviewData 仍按后端
+    // 最新值覆盖（它是权威来源，不做本地缓存），只是把这一帧渲染推迟到 POST 完成，
+    // 避免"乐观顺序 → 轮询旧顺序 → 响应新顺序"的闪烁。saveOrder 的 finally 会补渲染。
+    if (orderSaving > 0) return;
     renderAccounts(d.accounts || []);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
@@ -476,6 +525,194 @@ $('accBody').addEventListener('click', async ev => {
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
 });
+
+/* ── 账号拖拽排序（选号顺序 → POST /panel/api/accounts/order）──────────────
+   顺序模式（pool.pick_mode=sequential）下选号按 Pool.Order() 从上到下取第一个
+   合格账号；顺序的权威副本在 state.json 顶层 account_order（后端 pool.SetOrder
+   立即落盘）。面板只做「拖动 → POST → 用响应回显的 order 重排」，**前端不缓存
+   顺序**：每次刷新都用 overview.accounts[]（后端已按该顺序输出，见 pool.List →
+   effectiveOrderLocked）整表重渲染，所以刷新后顺序自然还在。
+
+   为什么只在手柄（⠿）上可拖：行内有 7 个按钮，且整行是点击委托区（签到/余额/
+   任务/测试/解冻/禁用/停用/恢复/移除）。若给 tr 常驻 draggable，在行内任意位置
+   按下并移动都会起拖——浏览器一旦进入拖拽就吃掉后续 click，用户按「签到」却拖出
+   一行虚影（按钮静默失效）。故 draggable 由手柄的 mousedown **临时武装**
+   （dragArmed），dragstart 再校验一次来源，mouseup/dragend 立即解除。
+   （不在 mousedown 里 preventDefault：那会抑制浏览器起拖，反而拖不动；手柄用
+   CSS user-select:none 防选中，拖拽开始后浏览器自会取消选区。）
+
+   跨 realm 混排：**允许**跨域拖动、不做分组锁定。理由（与后端选号语义一致）：
+   realm 在选号里是**硬过滤**而不是分组——pickSequentialLocked 遍历 Pool.Order()
+   时对不匹配的域直接跳过（skipped reason="realm"）继续往下找，所以把一个 cn 号
+   拖到 global 号前面并不会挡住 global 请求（它只是被跳过），反之亦然。若前端额外
+   禁止跨域拖拽，等于凭空加一条后端没有的次序规则：用户「从上到下」的直觉被打破，
+   且分组边界（谁先谁后）没有权威依据。自由混排表达力更强——「先把国际版号用满，
+   再落到国内号」这类意图可以直接拖出来。单域部署下混排无意义但也无害。
+
+   落点判定：按行的 getBoundingClientRect() 取**半高**为界——光标在行上半 → 插到
+   该行之前，下半 → 之后；无行满足（光标在末行下半）→ 追加到末尾。取半高而不是
+   整行，是让「插到两行之间」在视觉中线附近翻转，与直觉一致。 */
+
+function accRows() { return Array.from($('accBody').querySelectorAll('tr[data-uid]')); }
+
+// dropBefore 返回「插入到谁之前」的行元素；null = 追加到列表末尾。
+function dropBefore(clientY) {
+  for (const r of accRows()) {
+    const b = r.getBoundingClientRect();
+    if (clientY < b.top + b.height / 2) return r;
+  }
+  return null;
+}
+
+// paintDropLine 画插入位置提示线：目标行上边线；追加（null）画末行下边线。
+function paintDropLine(before) {
+  const rows = accRows();
+  for (const r of rows) r.classList.toggle('drop-before', r === before);
+  const last = rows[rows.length - 1];
+  if (last) last.classList.toggle('drop-after', before === null);
+}
+function clearDropLine() {
+  for (const r of accRows()) r.classList.remove('drop-before', 'drop-after');
+}
+// clearDragUI 清掉拖拽期间的瞬时样式（半透明行 + 提示线）。行元素可能已被刷新
+// 换掉（detached），但样式是挂在元素上的，detached 后无需再清。
+function clearDragUI() {
+  if (dragState && dragState.row) dragState.row.classList.remove('dragging');
+  clearDropLine();
+  dragState = null;
+}
+function disarmDrag() {
+  if (dragArmed) { dragArmed.draggable = false; dragArmed = null; }
+}
+
+// orderSeq 并发拖拽的序号：只有最新一次的响应可以重排列表，否则先发的慢响应会用
+// 旧顺序覆盖后发的快响应（用户看到顺序"跳回去"）。
+let orderSeq = 0;
+// orderSaving 在途的顺序保存数：>0 时 loadOverview 只更新统计不重渲染账号表。
+// 理由：乐观重排已按"后端将要返回的顺序"渲染，而 5s 轮询可能在 POST 落盘前就发出
+// 响应（旧顺序）——不挡一下会看到顺序"闪回去"，用户以为拖拽没生效（几百毫秒后又
+// 自己变回来，更迷惑）。POST 完成即恢复。
+let orderSaving = 0;
+
+// applyOrder 按给定 uid 顺序重排内存里的 accounts 并重渲染。这是**后端权威顺序**
+// 的落地（accounts/order 的响应 order 含被追加到末尾的新号，后端注释明确要求前端
+// 据此立即重排，不必等下一次 overview），不是本地缓存：下一次 overview 整表覆盖。
+function applyOrder(order) {
+  if (!overviewData || !Array.isArray(overviewData.accounts)) return;
+  const by = new Map(overviewData.accounts.map(s => [s.uid, s]));
+  const next = [];
+  for (const uid of order) {
+    const s = by.get(uid);
+    if (s) { next.push(s); by.delete(uid); }
+  }
+  // 响应没提到的（并发下刚被别处删/加的号）保留在末尾，不凭空消失。
+  for (const s of overviewData.accounts) if (by.has(s.uid)) next.push(s);
+  overviewData.accounts = next;
+  renderAccounts(next);
+}
+
+// saveOrder 提交顺序。失败**必须**回滚：拖拽是用户可见的一次性动作，静默吞掉会让
+// 面板显示的顺序与后端实际选号顺序不一致（最坏：用户以为改了，选号仍按旧序），
+// 比「拖了没反应」更难排查。故 catch 里按**拖拽前的顺序**重渲染 + toast 报错。
+//
+// prev 必须由调用方传入（拖拽前的 uid 列表）：applyOrder 已经把 overviewData.accounts
+// 改成乐观顺序，此时再"从 overviewData 回滚"只会滚回乐观顺序，等于没回滚。
+async function saveOrder(uids, prev) {
+  const seq = ++orderSeq;
+  orderSaving++;
+  try {
+    const r = await api('accounts/order', { method: 'POST', body: JSON.stringify({ uids: uids }) });
+    if (seq === orderSeq && r && Array.isArray(r.order)) applyOrder(r.order);
+    // 未知 uid（账号在别处被删）后端不整单拒绝而是过滤 + warning：照实转达，
+    // 别让用户以为"我拖的全部生效了"。
+    if (r && r.warning) toast('选号顺序已保存（' + r.warning + '）', 'warn');
+    else toast('选号顺序已保存', 'ok');
+  } catch (e) {
+    // 回滚到拖拽前的顺序（含"已有更新拖拽在途"的情形：那时不回滚，交给新的一次）
+    if (seq === orderSeq && Array.isArray(prev)) applyOrder(prev);
+    toast('顺序保存失败，已回滚：' + e.message, 'err');
+  } finally {
+    orderSaving--;
+    // 保存期间被挡下的账号表渲染，在这里补一次（用最新 overview 快照整表重排）。
+    if (orderSaving <= 0 && overviewData) renderAccounts(overviewData.accounts || []);
+  }
+}
+
+// ① 武装：只有手柄上按下才让该行可拖。mousedown 同步置 draggable，浏览器在下一次
+//    鼠标移动前读取它，来得及。
+$('accBody').addEventListener('mousedown', ev => {
+  const h = ev.target.closest('td.drag-handle');
+  const tr = h && h.closest('tr[data-uid]');
+  if (!tr) return;
+  dragArmed = tr;
+  tr.draggable = true;
+});
+$('accBody').addEventListener('mouseup', disarmDrag);
+document.addEventListener('mouseup', disarmDrag);
+
+// ② 起拖：再校验一次来源（非手柄武装的行一律拒绝），并给足拖拽所需的 dataTransfer。
+$('accBody').addEventListener('dragstart', ev => {
+  const tr = ev.target.closest('tr[data-uid]');
+  if (!tr || tr !== dragArmed) { ev.preventDefault(); return; }
+  const uid = tr.dataset.uid;
+  if (!uid) { ev.preventDefault(); return; }
+  // 逻辑一律以 uid 为准，不用元素身份：5s 轮询会整表重渲染，正在拖的行元素随时
+  // 可能被替换成新元素（detached），落点计算必须重新查 DOM（见 dropBefore）。
+  dragState = { uid: uid, row: tr };
+  tr.classList.add('dragging');
+  if (ev.dataTransfer) {
+    // Firefox 必须 setData 才真的起拖；内容写 uid，拖到表外也只是无害文本。
+    ev.dataTransfer.setData('text/plain', uid);
+    ev.dataTransfer.effectAllowed = 'move';
+  }
+});
+
+// ③ 悬停：preventDefault 才允许 drop；顺带把提示线画到当前落点。
+$('accBody').addEventListener('dragover', ev => {
+  if (!dragState) return;
+  ev.preventDefault();
+  if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
+  // 提示线只作视觉反馈，落点以 drop 时的坐标重算（不做状态缓存）：dragover 与 drop
+  // 之间行元素可能已被轮询换掉，缓存的元素引用会是 detached 节点。
+  paintDropLine(dropBefore(ev.clientY));
+});
+
+// 拖到表外：dragleave 在单元格之间也会冒泡触发，只有真的离开 tbody 才清线
+// （relatedTarget 仍在表内 = 只是换了一行）。
+$('accBody').addEventListener('dragleave', ev => {
+  if (!dragState) return;
+  if (ev.relatedTarget && $('accBody').contains(ev.relatedTarget)) return;
+  clearDropLine();
+});
+
+// ④ 落下：先乐观重排（用户立刻看到结果），再 POST；失败由 saveOrder 回滚。
+$('accBody').addEventListener('drop', ev => {
+  if (!dragState) return;
+  ev.preventDefault();
+  const uid = dragState.uid;
+  const target = dropBefore(ev.clientY);
+  const beforeUid = target ? target.dataset.uid : null;
+  const cur = accRows().map(r => r.dataset.uid);
+  clearDragUI();
+  disarmDrag();
+  const from = cur.indexOf(uid);
+  if (from < 0) return; // 拖拽期间该号已被移除/换掉：无从重排，交给下一次 overview
+  // 目标下标在**当前列表**上取（含被拖行自身），再换算到"移除被拖行之后"的列表：
+  // 目标在被拖行之后时下标要减 1（被拖行先被摘掉了）。
+  // 不做这一步的话，"把某行拖到自己上半格"（beforeUid === uid，dropBefore 会返回
+  // 被拖行本身）会算出 rest.indexOf(uid) === -1 而退化到**追加末尾**——松手位置
+  // 只偏了几像素，该行却跳到列表最底部。换算后该情形恰好还原为原顺序（不动）。
+  let to = beforeUid ? cur.indexOf(beforeUid) : cur.length;
+  if (to < 0) to = cur.length; // 目标行已被轮询换掉（stale）：退化为追加末尾
+  const rest = cur.filter(u => u !== uid);
+  const at = to > from ? to - 1 : to;
+  const next = rest.slice(0, at).concat([uid], rest.slice(at));
+  if (next.join('\n') === cur.join('\n')) return; // 原地未动：不提交、不落盘
+  applyOrder(next);        // 乐观：立即按用户看到的顺序重排
+  saveOrder(next, cur);    // 落库：失败回滚到 cur（拖拽前的顺序，见 saveOrder 注释）
+});
+
+$('accBody').addEventListener('dragend', () => { clearDragUI(); disarmDrag(); });
 
 $('btnCheckinAll').onclick = async () => {
   try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }
@@ -656,6 +893,7 @@ const CFG_MAP = {
   max_body_mb: ['server', 'max_body_mb'], max_rotate: ['server', 'max_rotate'],
   read_timeout_seconds: ['server', 'read_timeout_seconds'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
+  pick_mode: ['pool', 'pick_mode'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'],
   degrade_cooldown: ['pool', 'degrade_cooldown'], degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
@@ -690,11 +928,22 @@ function put(obj, path, val) {
   o[path[path.length - 1]] = val;
 }
 
-async function loadConfig() {
+// quiet 严格判 === true：本函数被 `$('btnCfgReload').onclick = loadConfig` 直接当
+// 事件处理器用，实参是 MouseEvent（truthy）——松判会把「重新读取」的报错吞掉。
+async function loadConfig(quiet) {
   try {
     const d = await api('config');
     cfgLoaded = d.config;
     $('cfgPath').textContent = d.path || '';
+    // 并发可视化（账号表「在途 / 上限」列）与 sequential 横幅都要读这两项：config 是
+    // 它们唯一的下发处（overview 不带）。每次读配置顺带刷新缓存，保存后 loadConfig()
+    // 会再走一遍，故面板改完即时反映在账号表上（与后端热生效同拍）。
+    const pool = (cfgLoaded && cfgLoaded.pool) || {};
+    poolLimits = { cn: Number(pool.max_in_flight) || 0, global: Number(pool.max_in_flight_global) || 0 };
+    // 上限是账号表「在途 / 上限」的分母：拿到后立即重渲染一次，否则要先等下一次
+    // overview 轮询（5s）才看到分母——用户刚在配置页改完「单账号最大在途」回到
+    // 账号表，会先看到一屏没有分母的旧渲染。
+    if (overviewData) renderAccounts(overviewData.accounts || []);
     const f = $('cfgForm');
     for (const [name, path] of Object.entries(CFG_MAP)) {
       const el = f.elements[name];
@@ -705,7 +954,15 @@ async function loadConfig() {
       else el.value = v == null ? '' : v;
     }
     $('cfgNote').textContent = '';
-  } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
+  } catch (e) { if (quiet !== true) toast('读取配置失败：' + e.message, 'err'); }
+}
+// seqModeOn 当前是否为顺序填充式选号（pool.pick_mode=sequential）。
+// 读的是面板刚拉到的配置（cfgLoaded）；未取到时返回 false——顺序模式是用户显式
+// 选择的行为，缺省必须按加权随机处理（与后端 Default() 的缺省方向一致），
+// 否则「顺序提示」会在没开顺序模式时也显示，误导用户。
+function seqModeOn() {
+  const p = cfgLoaded && cfgLoaded.pool;
+  return !!(p && p.pick_mode === 'sequential');
 }
 function collectConfig() {
   const f = $('cfgForm'), out = {};
@@ -867,6 +1124,10 @@ function refreshVisible() {
 }
 function start() {
   loadOverview(true);
+  // 顺序模式横幅 / 在途上限分母都来自配置，且 start() 在顶层被调用时 go() 已可能
+  // 落到 config 视图（那次 loadConfig 已完成或已在途），此处只补一次幂等的静默读取：
+  // 重复拉取无副作用（loadConfig 只回填表单与缓存），漏拉才会让「在途 / 上限」少分母。
+  loadConfig(true);
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
   checkAuthGate();
