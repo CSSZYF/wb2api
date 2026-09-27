@@ -102,7 +102,12 @@ func TestChatWaf403HtmlBodySoftCools(t *testing.T) {
 }
 
 // TestChat403BusinessEnvelopeNotWaf 403 带业务信封（code/msg）不走 WAF 分支
-// （P0-1 约束：不劫持业务 403——11140 request illegal 维持 ErrAccountFault 禁用）。
+// （P0-1 约束：不劫持业务 403——11140 request illegal 走 ErrAccountFault 路径）。
+//
+// 处置口径在本批改为阈值化（见 server/accountfault_test.go 头注释）：首次 11140
+// **不再禁用**，而是软冷却（reason="account fault (11140)"）。这条测试的判据随之
+// 改为「走的是 ErrAccountFault 的 11140 分支，而不是 WAF 分支」——WAF 分支的
+// reason 是 "waf 403 block"，且 WAF 分支不喂账号级故障计数；用 reason 区分两者。
 func TestChat403BusinessEnvelopeNotWaf(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 403, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, false
@@ -112,11 +117,14 @@ func TestChat403BusinessEnvelopeNotWaf(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	st, _ := p.Status("u1")
-	if !st.Disabled {
-		t.Fatalf("403+request illegal must disable (ErrAccountFault path), got %+v", st)
+	if st.Reason != "account fault (11140)" {
+		t.Fatalf("403+request illegal 应走 ErrAccountFault 的 11140 分支（软冷却），got %+v", st)
 	}
-	if st.Cooling {
-		t.Errorf("11140 disable must not stack cooling: %+v", st)
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Errorf("11140 首次应软冷却: %+v", st)
+	}
+	if st.Disabled {
+		t.Errorf("首次 11140 不得禁用（误杀面，见 accountfault_test.go）: %+v", st)
 	}
 }
 

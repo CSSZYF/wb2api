@@ -2286,13 +2286,14 @@ func TestSnapshotCarriesPersistedNewFields(t *testing.T) {
 	p.SetBreaker(1, time.Hour, 6*time.Hour)
 	p.NoteError("u1") // 熔断：breakerUntil 非零 + retryCount=1
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
-	p.NoteSessionDead("u1") // sessionDeadFails=1
+	p.NoteSessionDead("u1")  // sessionDeadFails=1
+	p.NoteAccountFault("u1") // accountFaultFails=1
 	p.Flush()
 
 	ms.mu.Lock()
 	raw := string(ms.saved)
 	ms.mu.Unlock()
-	for _, want := range []string{"credits_expiring", "breaker_until", "retry_count", "model_cooldowns", "session_dead_fails"} {
+	for _, want := range []string{"credits_expiring", "breaker_until", "retry_count", "model_cooldowns", "session_dead_fails", "account_fault_fails"} {
 		if !strings.Contains(raw, want) {
 			t.Errorf("Redis 快照 missing %s:\n%s", want, raw)
 		}
@@ -2316,12 +2317,16 @@ func TestSnapshotCarriesPersistedNewFields(t *testing.T) {
 	p2.mu.RLock()
 	modelN := len(p2.byUID["u1"].modelCooldowns)
 	sessionFails := p2.byUID["u1"].sessionDeadFails
+	accountFaultFails := p2.byUID["u1"].accountFaultFails
 	p2.mu.RUnlock()
 	if modelN != 1 {
 		t.Errorf("快照恢复 modelCooldowns=%d want 1", modelN)
 	}
 	if sessionFails != 1 {
 		t.Errorf("快照恢复 sessionDeadFails=%d want 1", sessionFails)
+	}
+	if accountFaultFails != 1 {
+		t.Errorf("快照恢复 accountFaultFails=%d want 1", accountFaultFails)
 	}
 }
 

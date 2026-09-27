@@ -216,6 +216,43 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+	// accountFaultFails 连续 11140（ErrAccountFault 的 "request illegal" 形态）计数，
+	// 与 sessionDeadFails **同构**：连续达到 accountFaultThreshold 才 Disable。
+	//
+	// 为什么阈值化（与一次即禁用的旧行为对比）：11140 的**根因至今未定**——
+	//   - 本仓 `38e42de` 把 11140 归因为出站请求头（UA 平台段）；
+	//   - 一小时后 `c487fa2` 把同一 code 归因为**账号状态**；
+	//   两者互斥，不可能同时为真，且都没有新的实测锚定。`7a572fb` 改成 Disable 时
+	//   也没有任何新测量，理由是纯推理（「冷却到期也不会自愈」）。
+	//   - 现场证据：19 个历史实例目录 + 4 个部署目录里**没有任何账号因 11140 被禁过**，
+	//     也没有一份真实 11140 报文可供分辨「内容审核」与「账号封禁」。
+	//   ⇒ 证据强度不足以支撑「永久摘号」这种不可逆处置。
+	//
+	// 代价不对称（选代价小的一侧的判据）：误判「不罚号」的成本 = 多一次轮换（有界，
+	// 且软冷却到期自愈）；误判「Disable」的成本 = 永久摘掉一个健康账号、需人工重新
+	// OAuth 登录（无界）。证据同等薄弱时必须选有界的那一侧。
+	//
+	// 前车之鉴：本仓 `state.go` 顶部已明确记载「一次 12153 即 Disable」导致
+	// 「13 个 disabled 号全部 refresh 成功，是历史误判的受害者」，并因此改成
+	// NoteSessionDead + sessionDeadThreshold=3。11140 旧行为走的是**完全相同**、
+	// 且更激进的模式（11140 连阈值都没有），故照既有形态阈值化而不是自创第二套。
+	//
+	// 死锁面（阈值化的真正代价所在）：disabled 无任何自动清除路径——
+	// NoteSuccess 不清 disabled、ReenableIfCredits 被 !disabled 挡住、冷却探活
+	// （CooldownProbeTargets）跳过 disabled、选号兜底（pickEarliestExpiryLocked）
+	// 排除 disabled。故一旦达阈禁用，只能人工 Revive / 重新登录。
+	// 这正是阈值必须保守、且未达阈时必须回落**有界软冷却**的理由。
+	//
+	// 清零点（与 sessionDeadFails 同口径）：NoteSuccess（成功是账号未死的最强证据）、
+	// ReviveDisabled / Revive（人工复活）。
+	// 持久化（stateAccount.AccountFaultFails）：上游持续 11140 时重启不重学进度；
+	// 清零同样落盘，重启后不残留旧计数。
+	//
+	// 伏笔（将来拿到真实 11140 报文后）：若能把「内容审核拦截」与「账号级封禁」
+	// 区分开（例如审核类带独立 marker/子码、或同 body 换号后仍 11140），可在本计数
+	// 之外再加第二层判定（如审核类直接零动作不计数），届时阈值路径只服务真封禁。
+	// 本批刻意不做该分流：无报文锚定的分流规则就是又一次「纯推理归因」。
+	accountFaultFails int
 	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
 	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
 	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态
@@ -435,6 +472,11 @@ type stateAccount struct {
 	// 「重启后连续计数继续累计」——上游持续 session dead 时重启归零会重学 2 次失败。
 	// 零值省略（omitempty）。
 	SessionDeadFails int `json:"session_dead_fails,omitempty"`
+	// AccountFaultFails 连续 11140（request illegal）计数（判定「账号级故障」是否为
+	// 真封禁的进度）。与 session_dead_fails **同口径**持久化：上游持续 11140 时重启
+	// 不重学进度；清零（成功/人工复活）同样落盘，重启后不残留旧计数。
+	// 零值省略（omitempty）。
+	AccountFaultFails int `json:"account_fault_fails,omitempty"`
 	// ConsecutiveFails 连续失败计数（连败降权进度，见 entry.consecutiveFails）。
 	// 零值也显式写出（运维口径，同 session_dead_fails 的兄弟字段 err_total）。
 	ConsecutiveFails int `json:"consecutive_fails"`
@@ -504,6 +546,26 @@ const (
 // 又不会让真正的死 session 留在池里反复被选中。
 const sessionDeadThreshold = 3
 
+// accountFaultThreshold 连续 11140（ErrAccountFault 的 "request illegal" 形态）达到
+// 该次数才永久禁用；未达阈值由 handler 回落软冷却（到期自愈）。
+//
+// 取值依据（3，与 sessionDeadThreshold 同值）：
+//   - 同值便于运维记忆与排障（两条「连续 N 次才判死」的阈值一致，不必查表）；
+//   - 两类的证据强度同级：12153 是「会临时触发」的已知信号（已实测，13 个误判号），
+//     11140 是**根因未定**的信号（见 entry.accountFaultFails 注释）——根因更不确定
+//     的那一侧没有理由比已被证实会抖动的 12153 更严；本仓既有先例（12153）在同样的
+//     「一次失败即禁」误杀 13 个号之后定的就是 3；
+//   - 与连败降权阈值（defaultDegradeThreshold=5）的分野：那个的终态是**临时出池**
+//     （degradeUntil 到期自动回池，可逆），惩罚更轻、可承受更高阈值；本阈值终态是
+//     不可逆的 Disable（只有人工能解），故取更保守的 3 而非 5。
+//   - 下限约束：不得低于 2（1 等于回到「一次即禁」的误杀行为）。上限约束：不宜比
+//     sessionDeadThreshold 大太多——真封禁的号留在池里会持续被选中并白耗轮换。
+const accountFaultThreshold = 3
+
+// AccountFaultThreshold 暴露连续 11140 的禁用阈值（供 handler 日志/运维文档引用，
+// 与 SessionDeadThreshold 同口径）。
+func AccountFaultThreshold() int { return accountFaultThreshold }
+
 // 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）
 // 的默认参数，与熔断器参数族同风格（SetDegrade 注入，默认值在此）。
 //   - defaultDegradeThreshold=5：比熔断阈值 3 宽——熔断管 5xx（ErrServer，确定性
@@ -523,6 +585,13 @@ const (
 
 // sessionDeadReason 12153 判定为 session 死亡时的持久化 reason。
 const sessionDeadReason = "12153 session dead"
+
+// accountFaultReason 11140（request illegal）达阈判定为真封禁时的持久化 reason。
+// 保留 code 与 msg 关键词（运维一眼看出判死依据），并写明这是「连续多次」后的判定
+// 而非单次——旧文案 "account banned by upstream (11140 request illegal), re-login
+// required" 未提阈值，阈值化后会误导排障者以为单次即禁。
+const accountFaultReason = "account banned by upstream (11140 request illegal) " +
+	"after repeated faults, re-login required"
 
 // SessionDeadThreshold 暴露连续 12153 的禁用阈值（供 scheduler 日志/运维文档引用）。
 func SessionDeadThreshold() int { return sessionDeadThreshold }

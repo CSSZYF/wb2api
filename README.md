@@ -466,7 +466,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|---|---|
 | 余额不足 | HTTP 402 / body 含余额关键词 | 硬冷却到**次日 04:00**（本地时区） | 签到（09/21 点）余额恢复自动解冻 |
 | 频控 | HTTP 429 / 限流文案（不限状态码） | 软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）。**`code 6004`（模型级）带「将在 … 重置」时**冷却到上游重置墙钟并豁免切模型（见[常见问题](#429-code6004模型级限流的冷却语义)） | 到期自动恢复 / 成功清零退避 |
-| Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
+| Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数。chat 路径与 keepalive 路径**同一口径**（都走 `NoteSessionDead` 阈值版） | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
+| 账号级故障 | body 含 `request illegal`（code `11140`） | **连续 3 次**才永久禁用；未达阈值软冷却 `account fault (11140)`（到期自愈）。一次即禁会在根因未定时永久摘掉健康号 | 未达阈值：冷却到期；达阈值：人工登录或面板「解冻」 |
+| 账号级故障 | code `14017`（`trial not activated`） | 软冷却 `account fault (14017)`，**绝不禁用**（补完 register 可自愈） | 到期自动恢复 / 补完 register |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
 | 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
@@ -474,6 +476,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
 请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。请求体的网关侧截断已由 `server.max_body_mb`（默认 32MB）的 413 消灭，剩余的 `11101` 只可能是客户端发来的畸形 JSON。
+
+**11140 为什么阈值化**：`request illegal` 的根因**至今未定**——本仓历史上两次归因互斥（一次归为出站请求头 / UA 平台段，一小时后归为账号状态），现场也没有任何账号因 11140 被禁过、没有真实报文可分辨「内容审核拦截」与「账号级封禁」。代价不对称：误判「不罚号」只多一次轮换（有界），误判「禁用」则永久摘掉健康账号并需人工登录（无界）。故照 12153 的既有先例（一次即禁曾误杀 13 个健康号，后改为连续 3 次）改为连续 `accountFaultThreshold`（3）次才禁，未达阈值回落软冷却；计数 `account_fault_fails` 随 `state.json` 持久化，任意成功即清零。若将来拿到真实 11140 报文能区分审核与封禁，可再加第二层判定。
 
 **熔断器**：所有冷却入口与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
@@ -884,7 +888,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 | | 临时停用 `manual_disabled` | 永久禁用 `disabled` |
 |---|---|---|
-| 谁触发的 | **运维主动**（面板「停用」按钮） | **系统判定**（连续 3 次 12153、上游 11140 封号、refresh session dead） |
+| 谁触发的 | **运维主动**（面板「停用」按钮） | **系统判定**（连续 3 次 12153、连续 3 次 11140、refresh session dead） |
 | 语义 | 对话流量摘除——账号仍在池里，凭证与积分都是活的 | 账号视为坏号，退出选号 |
 | 签到 / token 保活 / 排程 | **照常执行**（`scheduler` 只跳过 `disabled`） | 跳过 |
 | 惩罚维度（冷却 / 熔断 / 降权） | **原样保留**，停用期间继续按各自规律演进 | `disableLocked` 清冷却域（熔断与降权保留） |
