@@ -1105,12 +1105,27 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
+// TestChatSessionDeadDisables 端到端：chat 路径的 12153 与 scheduler/keepalive 侧
+// **口径统一**（都走 NoteSessionDead 阈值版）——单次 12153 不禁用（一次 12153 多为
+// 临时抖动：网络/闪断/refresh 竞态，state.go 明载 13 个 disabled 号全是误判受害者），
+// 连续 3 次才禁用。
 func TestChatSessionDeadDisables(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 503 {
+			t.Errorf("第 %d 次: code=%d want 503", i, rec.Code)
+		}
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次 12153 不应禁用（阈值 %d）", i, pool.SessionDeadThreshold())
+		}
+	}
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -1119,7 +1134,7 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	}
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+		t.Errorf("连续 %d 次 12153 后 account should be disabled: %+v", pool.SessionDeadThreshold(), st)
 	}
 }
 

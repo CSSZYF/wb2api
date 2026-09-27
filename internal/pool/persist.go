@@ -151,24 +151,25 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			creditsExpiring = s.Credits
 		}
 		e := &entry{
-			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:          s.Credits,
-			creditsTotal:     s.CreditsTotal,
-			creditsExpiring:  creditsExpiring,
-			disabled:         s.Disabled,
-			reason:           s.Reason,
-			manualDisabled:   s.ManualDisabled,
-			manualReason:     s.ManualReason,
-			until:            s.Until,
-			coolKind:         s.CoolKind,
-			successCount:     s.SuccessCount,
-			errTotal:         errTotal,
-			lastErr:          s.LastErr,
-			lastSuccess:      s.LastSuccess,
-			tokenUsage:       s.TokenUsage,
-			softStreak:       s.SoftStreak,
-			sessionDeadFails: s.SessionDeadFails,
-			consecutiveFails: s.ConsecutiveFails,
+			a:                 &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:           s.Credits,
+			creditsTotal:      s.CreditsTotal,
+			creditsExpiring:   creditsExpiring,
+			disabled:          s.Disabled,
+			reason:            s.Reason,
+			manualDisabled:    s.ManualDisabled,
+			manualReason:      s.ManualReason,
+			until:             s.Until,
+			coolKind:          s.CoolKind,
+			successCount:      s.SuccessCount,
+			errTotal:          errTotal,
+			lastErr:           s.LastErr,
+			lastSuccess:       s.LastSuccess,
+			tokenUsage:        s.TokenUsage,
+			softStreak:        s.SoftStreak,
+			sessionDeadFails:  s.SessionDeadFails,
+			accountFaultFails: s.AccountFaultFails,
+			consecutiveFails:  s.ConsecutiveFails,
 		}
 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
 		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
@@ -342,12 +343,15 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			TokenUsage:       e.tokenUsage,
 			SoftStreak:       e.softStreak,
 			SessionDeadFails: e.sessionDeadFails,
-			ConsecutiveFails: e.consecutiveFails,
-			DegradeUntil:     degradeUntil,
-			BreakerUntil:     breakerUntil,
-			RetryCount:       retryCount,
-			CreditsExpiring:  e.creditsExpiring,
-			ModelCooldowns:   mcs,
+			// 连续 11140 计数与 session_dead_fails 同口径：恒写出（零值由 omitempty 省略），
+			// 清零点（NoteSuccess/Revive）也落盘，重启后不残留旧进度。
+			AccountFaultFails: e.accountFaultFails,
+			ConsecutiveFails:  e.consecutiveFails,
+			DegradeUntil:      degradeUntil,
+			BreakerUntil:      breakerUntil,
+			RetryCount:        retryCount,
+			CreditsExpiring:   e.creditsExpiring,
+			ModelCooldowns:    mcs,
 		}
 	}
 	return sf

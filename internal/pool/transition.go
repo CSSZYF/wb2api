@@ -9,7 +9,7 @@
 //
 // 迁移矩阵（事件 → 动作 → 字段）：
 //
-//	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
+//	disabled           ← disableLocked（Disable / NoteSessionDead 达阈 / NoteAccountFault 达阈）
 //	manualDisabled     ← setManualDisabledLocked（面板运维端点；只置位不清其他维度）
 //	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked（整域）清，
@@ -17,6 +17,7 @@
 //	breakerUntil       ← recordBreakerFailureLocked（NoteError 唯一喂入）；NoteSuccess 清
 //	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/Revive/reviveCoolingLocked（仅硬冷却）清
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
+//	accountFaultFails  ← NoteAccountFault；ClearAccountFault/NoteSuccess/ReviveDisabled/Revive 清
 //	consecutiveFails   ← NoteFailures（degrade.go，唯一喂入）；NoteSuccess/Revive 清
 //	degradeUntil       ← NoteFailures 达阈（固定时长，不做指数）；NoteSuccess/Revive 清
 //

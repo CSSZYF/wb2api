@@ -54,7 +54,52 @@ func (p *Pool) ClearSessionDead(uid string) {
 	}
 }
 
-// ReviveDisabled 人工/端点复活入口：清除 disabled + reason + 连续 12153 计数，
+// NoteAccountFault 记录一次 11140（ErrAccountFault 的 "request illegal" 形态）——
+// **不立即禁用**（与 NoteSessionDead 同构，照它的形态实现，不自创第二套）。
+//
+// 旧行为：一次 11140 即 Disable。但 11140 的根因未定（见 entry.accountFaultFails
+// 注释：本仓两处归因互斥且都无实测锚定，现场没有任何账号因 11140 被禁、没有真实报文），
+// 而代价不对称——误判「不罚号」= 多一次轮换（有界）；误判「Disable」= 永久摘掉健康账号
+// + 需人工登录（无界）。证据同等薄弱时选有界的一侧，且本仓已有同型前车之鉴
+// （一次 12153 即 Disable 误杀 13 个健康号 → 改为连续 3 次才禁）。
+//
+// 语义：计数 +1，达到 accountFaultThreshold → disableLocked（reason=accountFaultReason）
+// 并清计数；未达阈值返回 false，由调用方回落**有界软冷却**（到期自愈）。
+// 返回 true 表示本次已达阈值并完成禁用。
+//
+// 计数在「已 disabled」时仍会累计（同 NoteSessionDead）——可达性很低（选号/探活都跳过
+// disabled 号），只有「复活后计数未清」这类场景才会走到，届时达阈只是重复置位同一位。
+func (p *Pool) NoteAccountFault(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.accountFaultFails++
+	if e.accountFaultFails < accountFaultThreshold {
+		p.dirty.Store(true)
+		return false
+	}
+	e.accountFaultFails = 0
+	p.disableLocked(e, accountFaultReason)
+	return true
+}
+
+// ClearAccountFault 清连续 11140 计数——账号被证明未死的任何时刻调用（与
+// ClearSessionDead 同口径）：chat 成功（NoteSuccess）、手工复活（ReviveDisabled/Revive）。
+// 当前无独立的 refresh 成功清零点（11140 是 chat 出站响应，refresh 不产生该码）；
+// 保留本入口是为了让「清零」有一处显式可调用的落点（与 ClearSessionDead 对称）。
+func (p *Pool) ClearAccountFault(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && e.accountFaultFails != 0 {
+		e.accountFaultFails = 0
+		p.dirty.Store(true)
+	}
+}
+
+// ReviveDisabled 人工/端点复活入口：清除 disabled + reason + 连续 12153/11140 计数，
 // 账号回到池子（若无其他冷却/熔断则立即可选，健康检查自然接管）。
 // **不改** Disabled 在选号/状态端点的既有语义：disabled 号依然不参与选号，
 // 直到被本方法复活。不存在的 uid 为空操作。
@@ -73,6 +118,7 @@ func (p *Pool) ReviveDisabled(uid string) bool {
 	e.disabled = false
 	e.reason = ""
 	e.sessionDeadFails = 0
+	e.accountFaultFails = 0
 	p.dirty.Store(true)
 	return true
 }
@@ -141,6 +187,7 @@ func (p *Pool) Revive(uid string) bool {
 	e.softStreak = 0
 	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
+	e.accountFaultFails = 0
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
@@ -206,6 +253,9 @@ func (p *Pool) NoteError(uid string) {
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
 // 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
+// 同样清 accountFaultFails：成功是账号未死的**最强证据**（11140 若真是账号级封禁，
+// 该账号不可能再成功），连续 11140 的进度就此归零——这正是阈值化的核心安全阀：
+// 偶发/被误判的 11140 之间只要夹一次成功，就永远不会攒到阈值而被永久摘号。
 // 连败降权（issue #114）同样按「成功是恢复的最强证据」清零：consecutiveFails 归零、
 // degradeUntil 清空——成功即回池，不等降权到期（与 NoteSuccess 清 breakerUntil 同口径）。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
@@ -224,6 +274,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		e.accountFaultFails = 0
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)

@@ -1035,7 +1035,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					// 12153 口径统一（本批）：走阈值版 NoteSessionDead，与
+					// applyErrorPolicy 的 ErrSessionDead 分支、scheduler 的 keepalive
+					// 路径完全一致。旧实现此处单次 Disable 且用了**第三个** reason
+					// 文案（"refresh session dead"），与另两条路径既不同处置也不同文案
+					// ——同一个 code 在三条路径上三种行为，且单次即禁会永久摘掉健康号
+					// （见 state.go 顶部「13 个 disabled 号全是误判受害者」）。
+					// reason 统一为 pool 的 sessionDeadReason（12153 session dead）。
+					h.cfg.Pool.NoteSessionDead(acct.UID)
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -1451,7 +1458,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //     故指数升级保底存在）。基数经 jitterDur 抖动（复用 backoff.go 单一抖动来源，
 //     防多账号同相位冷却到期再聚团）。不喂熔断（WAF 拦截是频控不是账号故障）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
-//   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrSessionDead → NoteSessionDead（阈值版）：连续 sessionDeadThreshold 次才禁用，
+//     未达阈值仅计计数（单次 12153 多为临时抖动，与 scheduler/keepalive 侧口径统一）。
+//   - ErrAccountFault → 11140 阈值化（未达阈值软冷却、达阈禁用）+ 14017 恒软冷却。
+//     11140 不再单次即 Disable（根因未定 + 代价不对称 + 12153 误杀 13 号的前车之鉴），
+//     详见 pool/entry.go 的 accountFaultFails/accountFaultThreshold 注释。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError），passthrough 模式走降级重试。
 //   - ErrPromptTooLong → 11115「prompt is too long」：请求的问题不是账号的问题
 //     （同一 body 换任何号都超限）。零动作（不冷却/不熔断/不 NoteError、不喂连败，
@@ -1533,22 +1544,48 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(h.softCooldown()), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// chat 路径的 12153 与 scheduler/keepalive 侧**口径统一**：走阈值版
+		// NoteSessionDead（连续 sessionDeadThreshold 次才禁用），不再单次即 Disable。
+		// 旧实现此处直接 Disable，而 scheduler.go 的 keepalive 路径走阈值版——两条路径
+		// 对同一错误码的处置不一致，且 state.go 明载「一次 12153 即 Disable」导致
+		// 「13 个 disabled 号全部 refresh 成功，是历史误判的受害者」。单次 12153 多为
+		// 临时抖动（网络/闪断/refresh 竞态），不该永久摘号。
+		// 未达阈值时零额外惩罚（12153 不是限流信号，冷却它没有语义）：仅累计计数并换号。
+		h.cfg.Pool.NoteSessionDead(uid)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrAccountFault:
 		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
-		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
-		//     恢复（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
-		//     硬禁用（Disable），不再参与选号。面板以 disabled + disabled_reason 呈现。
+		//   - "request illegal"（code 11140）→ **阈值化**：未达阈值回落**有界软冷却**
+		//     （到期自愈，误判代价有界），连续 accountFaultThreshold 次才由
+		//     NoteAccountFault 内部 Disable（保留对「真封禁」的兜底）。
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
-		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
+		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）——本分支语义一字不动。
 		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
+		//
+		// 为什么 11140 从「一次即 Disable」改成阈值化（依据见 pool/entry.go 的
+		// accountFaultFails 与 accountFaultThreshold 注释，此处只留结论）：
+		//   - 根因未定：本仓两处归因互斥（出站 UA 平台段 vs 账号状态）且都无实测锚定；
+		//     19 个历史实例目录 + 4 个部署目录里没有任何账号因 11140 被禁、没有真实报文；
+		//   - 代价不对称：误判「不罚号」= 多一次轮换（有界）；误判「Disable」= 永久摘掉
+		//     健康账号 + 需人工登录（无界，disabled 无任何自动恢复路径——见
+		//     pool.TestAccountFaultDisabledRequiresManualRevive 钉死的现状）；
+		//   - 前车之鉴：一次 12153 即 Disable 曾误杀 13 个健康号，本仓已改成阈值版
+		//     （NoteSessionDead）；11140 旧行为是**完全相同且更激进**的模式。
+		//   - 伏笔：若将来拿到真实 11140 报文能把「内容审核拦截」与「账号级封禁」
+		//     区分开，可在此再加第二层判定（审核类零动作不计数），阈值路径只服务真封禁。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+			if h.cfg.Pool.NoteAccountFault(uid) {
+				log.Printf("chat uid=%s: 连续 %d 次 11140 request illegal — 禁用（需人工复活）",
+					uid, pool.AccountFaultThreshold())
+				return
+			}
+			// 未达阈值：有界软冷却（到期自愈）。reason 带 code 便于运维在 /status 区分
+			// 11140 与 14017 两种 account fault。
+			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (11140)")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
