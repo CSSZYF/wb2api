@@ -57,6 +57,11 @@ func stateSibling(stateFile, name string) string {
 	return filepath.Join(dir, name)
 }
 
+// boolPtr 返回 v 的指针。用途：把「布尔开关的**默认值**」与「显式 false」区分开——
+// server.Config 里少数开关（如 PTLMaxTokensRetry）用 *bool 表达「未配置 = 用默认 true」，
+// 裸 bool 的零值 false 会被误读成「显式关闭」。
+func boolPtr(v bool) *bool { return &v }
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
@@ -330,6 +335,10 @@ func main() {
 		MaxRotate:        cfg.Server.MaxRotate,              // 单请求最多换号次数（池内账号多时可调大）
 		// 入站读窗口：handler 侧按此值逐请求重设读截止（面板改完即时生效）。
 		ReadTimeout: time.Duration(cfg.Server.ReadTimeoutSeconds) * time.Second,
+		// 11115 下调 max_tokens 重试开关（features.ptl_max_tokens_retry，默认 true）：
+		// 传指针以区分「未配置（默认开）」与「显式 false」；面板保存后经
+		// SetPTLMaxTokensRetry 热生效。
+		PTLMaxTokensRetry: boolPtr(cfg.Features.PTLMaxTokensRetry),
 	})
 	chatHandler = h
 
@@ -623,6 +632,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if srv != nil {
 		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
 		srv.SetMaxRotate(newCfg.Server.MaxRotate) // 池内账号多时调大换号次数，保存后即时生效
+		// 11115 下调 max_tokens 重试开关热改（features.ptl_max_tokens_retry）：写原子
+		// 镜像，下一个请求即按新值判定，无需重启（与 sanitize_fingerprints 同口径）。
+		srv.SetPTLMaxTokensRetry(newCfg.Features.PTLMaxTokensRetry)
 		// 入站读窗口热改：handler 侧只写原子镜像，实际生效靠逐请求重设读截止
 		// （armBodyReadDeadline）。刻意不改 http.Server.ReadTimeout——它是裸字段、
 		// 无并发安全 setter，运行期赋值是数据竞争；且启动时那份静态值仅作兜底。

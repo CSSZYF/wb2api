@@ -67,7 +67,8 @@
   "features": {
     "sanitize_blacklist_fingerprints": true,
     "zerowidth_sanitize": false,
-    "reasoning_history": "full"
+    "reasoning_history": "full",
+    "ptl_max_tokens_retry": true
   },
   "prompt": {
     "mode": "passthrough",

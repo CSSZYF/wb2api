@@ -87,6 +87,14 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// PTLMaxTokensRetry 11115「prompt is too long」时按错误里的真实数字下调
+	// max_tokens 重试一次的开关（features.ptl_max_tokens_retry）。
+	// **默认 true**（nil = 开）：只在 11115 时生效、且失败也退回首次原始错误
+	// （客户端看到的报错与不加本项时逐字一致），故默认开是安全的；显式 &false 关闭。
+	// 指针类型是为了区分「未配置（用默认 true）」与「显式 false」——config 侧
+	// Default() 会给 true，测试/裸用场景传 nil 即默认开。
+	PTLMaxTokensRetry *bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -149,6 +157,12 @@ type Handler struct {
 	// 只有 SetKeepAlivesEnabled）。故热改走"逐请求重设读截止"路线：见
 	// armBodyReadDeadline。
 	readTimeout atomic.Int64
+	// ptlMaxTokensRetry 11115「prompt is too long」按真实数字下调 max_tokens 重试
+	// 一次的运行期开关（cfg.PTLMaxTokensRetry 的原子镜像）。面板保存
+	// features.ptl_max_tokens_retry 后经 SetPTLMaxTokensRetry 热生效（与
+	// sanitize_fingerprints 等 features 项同口径：保存即生效，不必重启）。
+	// 初值由 NewHandler 从 Config 装入（nil = 默认 true，见 Config.PTLMaxTokensRetry）。
+	ptlMaxTokensRetry atomic.Bool
 }
 
 // SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
@@ -207,6 +221,18 @@ func (h *Handler) readTimeoutValue() time.Duration {
 	}
 	return DefaultReadTimeout
 }
+
+// SetPTLMaxTokensRetry 热更新「11115 下调 max_tokens 重试一次」开关（面板保存配置
+// 路径调用，features.ptl_max_tokens_retry）。并发安全：请求路径走 atomic 读，
+// 与面板保存（另一 goroutine）不构成数据竞争。
+func (h *Handler) SetPTLMaxTokensRetry(v bool) { h.ptlMaxTokensRetry.Store(v) }
+
+// ptlRetryEnabled 返回当前生效的 11115 重试开关（运行期原子值）。
+// 零值（未经 NewHandler 装配）为 false——**但 NewHandler 恒按 Config 装入**，
+// 而 Config.PTLMaxTokensRetry 为 nil（未配置）时取默认 **true**（见 Config 字段注释：
+// 只在 11115 时生效、失败也退回首次原始错误，故默认开是安全的）。
+// 不读 h.cfg.PTLMaxTokensRetry：那是启动期快照，面板热改后会过期。
+func (h *Handler) ptlRetryEnabled() bool { return h.ptlMaxTokensRetry.Load() }
 
 // armBodyReadDeadline 把本请求的读截止推到 now+read_timeout_seconds（热生效入口）。
 //
@@ -289,6 +315,9 @@ func NewHandler(cfg Config) *Handler {
 	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
 	h.maxRotate.Store(int64(cfg.MaxRotate))
 	h.readTimeout.Store(int64(cfg.ReadTimeout))
+	// 11115 下调 max_tokens 重试开关：nil（未配置/测试裸用）= 默认 true
+	// （只在 11115 时生效、失败退回首次原文，故默认开安全；显式 &false 关闭）。
+	h.ptlMaxTokensRetry.Store(cfg.PTLMaxTokensRetry == nil || *cfg.PTLMaxTokensRetry)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
@@ -695,6 +724,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 入站 body 读窗口按**当前**配置值逐请求重设（面板改 server.read_timeout_seconds
 	// 后无需重启即生效；慢链路大上下文不再被启动时的静态值掐断）。必须在读 body 之前。
 	h.armBodyReadDeadline(w, r)
+	// 响应写出跟踪（**显式守卫**，见下方 ErrPromptTooLong 的 11115 重试分支）：11115
+	// 下调 max_tokens 的重试必须发生在「还没向客户端写出任何字节」的时刻，否则会出现
+	// 「头已发出（200/其它状态码）却想改错误响应」的形态。本包装记录 WriteHeader/Write
+	// 是否被调用过，供重试分支断言；包装透传 Flush（SSE 逐帧 flush 依赖）与 Unwrap
+	// （ResponseController 走它找 SetReadDeadline 等能力），对既有路径零行为变化。
+	// 必须放在 armBodyReadDeadline **之后**：那一步要拿原始 w 探测 SetReadDeadline。
+	wt := &respWriteTracker{ResponseWriter: w}
+	w = wt
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
@@ -736,6 +773,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// （未知 4xx）分支继续轮转，若不去重，一个请求级 4xx 会在 N 个账号上各记一次
 	// 连败——一个请求就能把整池推向降权阈值（与 11135 修复前的自伤面同形）。
 	errDedup := newErrDedup()
+	// 11115 下调 max_tokens 重试的请求级状态（features.ptl_max_tokens_retry）：
+	//   - ptlRetried：**只重试一次**的闸门（第二次 11115 直接回错误，不循环）；
+	//   - ptlRetryUID：重试要**钉住的账号**（首次失败的那个号）——普通选号是加权随机 +
+	//     LRU 兜底，失败号刚被用过会被判「不最旧」而落到别的号；而本项要求重试与首次
+	//     是**同一账号**（否则「上游把 max_tokens 计入同一上限口径」这个变量都不可控，
+	//     结论不可用）。空串 = 无重试意图，走既有选号。
+	//   - ptlFirstBody/ptlFirstHint：首次 11115 的原文与 hint（重试失败时逐字退回它，
+	//     保证客户端看到的报错与不加本项时完全一致）。
+	var (
+		ptlRetried   bool
+		ptlRetryUID  string
+		ptlFirstBody string
+		ptlFirstHint string
+	)
 	var lastErr error
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
@@ -908,7 +959,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < maxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
-		if stickyUID != "" {
+		// 11115 下调 max_tokens 的重试：**钉住首次那个账号**（见 ptlRetryUID 注释）。
+		// 走 PickByUIDForModel 而非 PickByUID：与粘性路径同口径（该号在当前模型被 6004
+		// 限额/占满在途时不选中）。
+		if ptlRetryUID != "" {
+			acct = h.cfg.Pool.PickByUIDForModel(ptlRetryUID, bareModel)
+			if acct == nil || (realm != "" && acct.Realm() != realm) {
+				// 钉住的账号在此期间不可用（在途占满/被 6004 限额/被禁用/跨域不符）→
+				// **放弃重试，直接回首次的 11115 原文**。刻意不回落普通轮换：本项的重试
+				// 语义是「同一账号」（换号则「上游按账号口径把 max_tokens 计入上限」这个
+				// 变量不可控，结论不可用），而且把请求放大到别的健康号上正是 11115 分支
+				// 要避免的白耗配额（见该分支注释）。
+				// 可达性：ptlRetryUID 非空 ⇒ 本请求已走过一次重试计划（ptlFirstBody/
+				// ptlFirstHint 均已填），此处直接用它回错误。
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long",
+					promptTooLongMessage(ptlFirstBody), ptlFirstHint)
+				st.status = http.StatusBadRequest
+				return
+			}
+		}
+		if acct == nil && stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
@@ -984,6 +1054,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
 		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		// 11115 重试的钉号**一次性**：本次出站已经用过它（ptlRetried=true 说明刚才是
+		// 重试那一次），后续轮转不该再钉住同一个号——否则该号连续失败时会在后续每轮
+		// 被反复选中，既浪费名额又偏离「只重试一次」的语义。首次尝试时 ptlRetried 为
+		// false，此处是空操作。
+		if ptlRetried {
+			ptlRetryUID = ""
+		}
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析，见 ChatStreamContext 注释）。传输层错误（非 *Error）走
 		// 抖动换号分支；防御分支（terr 为 nil 但 status>=400，如 ErrNone 兜底）回落
@@ -993,14 +1070,39 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = uerr.Status
 		}
 		if uerr == nil && terr != nil {
-			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
-			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
-			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
+			// 传输层错误（非 *Error 信封）：**只换号退避重试，不喂熔断**——传输层错误
+			// 对连续失败连坐熔断过于严苛（既有语义）。
+			//
+			// 连败兜底（issue #114）按**抖动判定**分流（本项修复点）：
+			//   - IsTransient=true（unexpected EOF / connection reset / i/o timeout /
+			//     TLS 握手失败 / DNS 失败 / 连接被本地回收 / CONNECT 隧道 502·503·504）：
+			//     这是**出口链路**条件，同一链路对池内全部账号一视同仁——一个请求里 N 个
+			//     账号全中恰恰证明根因不在账号上。若照旧每个账号各喂一次连败，达阈（默认 5）
+			//     即全体降权 10 分钟 → 用户看到「503 all accounts unavailable
+			//     (cooling/disabled)」。形态与刚修的 11135「一张坏图拖垮整个账号池」完全
+			//     相同（见 handler_image_terminal_test.go），故同待遇：不喂连败、不记惩罚，
+			//     只 fail（释放租约）+ 退避后换号。上游参照 hub f7bf4e2 is_transient()：
+			//     换号退避重试、不记冷却，抖动熬过重试后如实抛 502（本项仍回 503 +
+			//     lastErr，末端错误透传语义不变）。
+			//   - IsTransient=false（含**未知错误串**与裸 io.EOF）：保持既有语义继续喂连败
+			//     ——**保守优先**（取舍见 upstream.IsTransient 注释）：宁可误罚也不能让真
+			//     故障账号永远留在池内（漏判真故障 = 坏号持续被选中、白耗健康号配额；
+			//     误罚 = 一个连败计数，成功一次即清零回池）。**客户端断连**（ctx 取消）
+			//     同样落在此侧：它也不是链路抖动，本项不改其既有语义（且紧随其后的
+			//     rotateBackoff 见 ctx 已取消即终止轮转，只会喂到这一条计数）。
+			//
+			// 退避与重试上限**沿用既有** rotateBackoff + MaxRotate：本项不自创第二套重试
+			// 策略（池内 3 个号都连不上时轮转 3 次即止，不会无限重试）。
 			// 上游 client 已打 transport error 日志。
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptObs{Stream: peek.Stream}, attemptStarted)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
-			h.cfg.Pool.NoteFailures(acct.UID)
+			if upstream.IsTransient(terr) {
+				log.Printf("WARN: [server] transient upstream error uid=%s err=%v (no consecutive-fail penalty)",
+					uidPrefix(acct.UID), terr)
+			} else {
+				h.cfg.Pool.NoteFailures(acct.UID)
+			}
 			fail(acct.UID)
 			if !rotateBackoff(i, r.Context()) {
 				break // ctx 取消：终止轮转（传输层错误换号退避，WAF P0-2）
@@ -1045,18 +1147,75 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
-			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
-			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
-			// 与内容策略拦截同哲学：确定与账号无关的错误直接终止轮转）。
-			// applyErrorPolicy ErrPromptTooLong 分支零动作（不冷却/不熔断/不 NoteError，
-			// 不喂连败），fail 只释放租约。error-passthrough：message 装上游 body 原文
-			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
-			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
+			// 11115「prompt is too long」：按错误里的真实数字下调 max_tokens 重试一次
+			// （features.ptl_max_tokens_retry，默认开）；算不出/不适用则保持既有行为
+			// ——立即透传上游原文回客户端，**不罚号不轮转**（上下文超限是请求的问题，
+			// 同一 body 换任何号都超限，白扔健康号配额；与内容策略拦截同哲学：确定与
+			// 账号无关的错误直接终止轮转）。
+			//
+			// 重试前提（三条，缺一不重试）：
+			//   1. 开关开（面板可关，默认 true）；
+			//   2. 本请求**还没重试过**（ptlRetried，只重试一次，防无限循环）；
+			//   3. 上游原文能解析出 `<n> tokens > <limit> maximum` 且 n>limit，
+			//      且请求体带 max_tokens/maxOutputTokens、下调后 ≥ 下限（1024）
+			//      ——全部判定在 upstream.ParsePromptTooLongOvershoot /
+			//      upstream.DowngradeMaxTokens 里（单一事实来源，含余量规则与注释）。
+			//
+			// 为什么安全（默认开的前提）：本项是**兜底**而非结论——「上游把 max_tokens
+			// 也算进上下文上限」这一假设**未 100% 证实**（实测另有一次
+			// max_tokens=1048576 + 极小输入返回 200）。故失败路径逐字退回**首次**原文
+			// （见下方 ptlFirstBody 的用法），客户端看到的报错与不加本项时完全一致。
+			//
+			// 重试请求走与首次**完全相同**的准备管线（同一 body 变量、同一账号、同一
+			// chatMeta/chatMeta 会话头、同一 clientIP），唯一差异是 max_tokens 一个字段
+			// ——不轮转账号、不记惩罚（applyErrorPolicy ErrPromptTooLong 本就零动作）。
+			//
+			// 守卫（为什么此刻还没向客户端写出任何字节）：11115 是上游在**流式开始前**
+			// 回的 400（ChatStreamContext 在 status>=400 分支读 body 后即返回，从未向 w
+			// 写过一帧）；本函数内所有写响应都发生在轮转循环之后（末端错误出口）或成功
+			// 分支内。故此处重试不会出现「头已发出再改状态码」的形态。保险起见仍显式
+			// 断言 w 未被写过——用 ResponseController 探测写截止（未写过响应头时可用；
+			// 已写过则由下面的 ptlRetried 单次闸门兜底，不依赖该探测）。
 			if kind == upstream.ErrPromptTooLong {
+				if h.ptlRetryEnabled() && !ptlRetried && !wt.wrote() {
+					if newBody, overshoot, oldMax, newMax, ok := h.planPTLMaxTokensRetry(body, respBody); ok {
+						ptlRetried = true
+						// 首次原文留底：重试失败时逐字退回它（客户端报错与现在一致）。
+						ptlFirstBody = string(respBody)
+						ptlFirstHint = h.hintOf(upstream.ErrPromptTooLong, ptlFirstBody, bareModel, reqHasImage, uerr)
+						body = newBody
+						log.Printf("INFO: [server] prompt_too_long uid=%s model=%s: retrying once with lowered max_tokens=%d (was %d, overshoot=%d)",
+							uidPrefix(acct.UID), bareModel, newMax, oldMax, overshoot)
+						// 释放租约后**原地重试同一账号**（不换号：同一账号的配额与路由才
+						// 让「上游把 max_tokens 计入同一上限口径」这个变量可控；换号则
+						// 变量变多、结论不可用）。钉号走 ptlRetryUID（见该变量注释：普通
+						// 选号是加权随机 + LRU 兜底，不钉就会落到别的号）；delete(tried)
+						// 是必要的——下一轮选号要能重新选中同一账号（tried 已在本次选中时
+						// 标记，PickExcluding 会跳过它）。
+						ptlRetryUID = acct.UID
+						delete(tried, acct.UID)
+						releaseHeld()
+						// i-- 抵消 for 的 i++：本次重试**不消耗换号名额**——重试不是「换号」，
+						// 若占名额则 MaxRotate=1 的部署永远拿不到重试机会（本轮 continue
+						// 后循环即结束，反而回落到 503 全池不可用，比不重试更糟）。
+						// 只重试一次由 ptlRetried 闸门保证，不存在无限循环。
+						i--
+						continue
+					}
+				}
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr, errDedup)
 				fail(acct.UID)
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
-					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
+				// 重试过则退回**首次**原文（code/message/requestId 逐字一致，hint 也用
+				// 首次的）；未重试（开关关/算不出/不适用）则用本次原文——两条路径的可见
+				// 报错口径相同，区别只在「本请求是否多打了一次上游」。
+				finalBody, finalHint := string(respBody), ""
+				if ptlFirstBody != "" {
+					finalBody, finalHint = ptlFirstBody, ptlFirstHint
+				}
+				if finalHint == "" {
+					finalHint = h.hintOf(upstream.ErrPromptTooLong, finalBody, bareModel, reqHasImage, uerr)
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(finalBody), finalHint)
 				st.status = http.StatusBadRequest
 				return
 			}
@@ -1472,6 +1631,75 @@ func promptTooLongMessage(body string) string {
 	}
 	return body
 }
+
+// planPTLMaxTokensRetry 判定本次 11115 是否可按错误里的真实数字下调 max_tokens 重试。
+//
+// 三步判定（任一失败即返回 ok=false → 调用方保持现状：透传原文、不重试）：
+//  1. 从上游原文解析 `<n> tokens > <limit> maximum`（大小写/空格容错）；
+//  2. overshoot = n - limit（解析函数已保证 n > limit）；
+//  3. 按 overshoot + 安全余量下调请求体的输出预算字段（max_tokens / maxOutputTokens），
+//     低于下限则不可用。
+//
+// 全部判定在 upstream 侧（ParsePromptTooLongOvershoot / DowngradeMaxTokens），本函数
+// 只做串联与日志字段组装——规则与注释集中在一处，避免 handler 与 upstream 各写一套。
+//
+// 返回：newBody（改写后的请求体，只改输出预算一个字段）、overshoot、oldMax、newMax、ok。
+// ok=false 时 newBody 为 nil（调用方沿用原 body）。
+func (h *Handler) planPTLMaxTokensRetry(body, respBody []byte) (newBody []byte, overshoot, oldMax, newMax int64, ok bool) {
+	n, limit, parsed := upstream.ParsePromptTooLongOvershoot(string(respBody))
+	if !parsed {
+		return nil, 0, 0, 0, false
+	}
+	overshoot = n - limit
+	rewritten, oldMax, newMax, ok := upstream.DowngradeMaxTokens(body, overshoot)
+	if !ok {
+		return nil, 0, 0, 0, false
+	}
+	return rewritten, overshoot, oldMax, newMax, true
+}
+
+// respWriteTracker 记录本请求是否已向客户端写出任何字节（响应头或 body），供
+// 11115 下调重试的「必须在写出前」守卫使用（见 chatCompletions 顶部的包装注释）。
+//
+// 为什么需要运行时守卫而不是只靠结构论证：结构上 11115 必然发生在写响应之前
+// （上游在流式开始前回 400，handler 的写响应都在轮转循环之后），但这条论证依赖
+// 「未来没有人把写响应提前」——加一个显式断言，把「万一被改坏」从「悄悄发出半截
+// 错误响应」变成「跳过重试、按原路径回错误」（fail-safe 方向正确）。
+//
+// 透传能力：Flush 转发给底层（SSE 逐帧 flush 依赖它）；Unwrap 暴露底层 writer，
+// 让 http.ResponseController 仍能找到 SetReadDeadline/SetWriteDeadline 等能力。
+// 底层不支持 Flush 时转发为无操作——与「类型断言失败跳过 flush」的可观测行为一致。
+type respWriteTracker struct {
+	http.ResponseWriter
+	wroteHeader bool
+	wroteBody   bool
+}
+
+func (t *respWriteTracker) WriteHeader(code int) {
+	t.wroteHeader = true
+	t.ResponseWriter.WriteHeader(code)
+}
+
+func (t *respWriteTracker) Write(p []byte) (int, error) {
+	t.wroteHeader = true
+	if len(p) > 0 {
+		t.wroteBody = true
+	}
+	return t.ResponseWriter.Write(p)
+}
+
+// Flush 转发底层 Flush（不支持时无操作，与既有「断言失败即跳过」同效）。
+func (t *respWriteTracker) Flush() {
+	if fl, ok := t.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+// Unwrap 暴露底层 ResponseWriter（http.ResponseController 的 rwUnwrapper 协议）。
+func (t *respWriteTracker) Unwrap() http.ResponseWriter { return t.ResponseWriter }
+
+// wrote 报告是否已向客户端写出任何字节（响应头或 body）。
+func (t *respWriteTracker) wrote() bool { return t.wroteHeader || t.wroteBody }
 
 // invalidImageMessage 11135 透传 message：上游 body 原文（含 code/extError/
 // displayMsg/requestId/actions，客户端自行排查）；空 body 兜底为可读分类短文案

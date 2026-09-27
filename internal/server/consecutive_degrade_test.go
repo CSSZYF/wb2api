@@ -107,12 +107,19 @@ func TestApplyErrorPolicyWafAndNotFoundNotFed(t *testing.T) {
 // TestChatTransportErrorFeedsConsecutiveFailures 传输层失败（连不上上游）喂连败
 // （issue #114 端到端）：N 连败后该号出池（AvailableUIDs 不再含它），仍不熔断。
 // fake transport 返回 error（非 *upstream.Error）→ handler 网络抖动分支。
+//
+// fixture 用**判不出原因的**错误串（unknown transport failure）：issue #114 的连败兜底
+// 语义是「不知道原因的失败」——判定为**传输层抖动**的那些（unexpected EOF / connection
+// reset / i/o timeout / TLS 握手 / DNS 失败 / connection refused 等出口链路条件）自
+// 本项修复起不喂连败（同一链路对全池一视同仁，证据不指向任何账号，见
+// internal/upstream/transient.go 与 transient_transport_test.go）；未知错误串保持喂连败
+// （保守优先）。故本用例改用未知串以继续锁定 issue #114 的兜底路径。
 func TestChatTransportErrorFeedsConsecutiveFailures(t *testing.T) {
 	var calls int
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			calls++
-			return nil, errors.New("dial tcp: connection refused")
+			return nil, errors.New("unknown transport failure")
 		})},
 		ChatBaseCN:    "https://fake.example",
 		BillingBaseCN: "https://fake.example",
