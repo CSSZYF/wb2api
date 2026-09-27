@@ -335,6 +335,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .dlg .body { padding: 18px 20px; overflow: auto; }
 .dlg footer { padding: 13px 20px; border-top: 1px solid var(--line-soft); display: flex; gap: 10px; }
 .dlg footer .grow { flex: 1; }
+.dlg .tabs { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 9px; padding: 3px; margin-left: 10px; vertical-align: middle; }
+.dlg .tabs .tab { padding: 4px 14px; border-radius: 7px; border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer; }
+.dlg .tabs .tab.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+.tab-panel + .tab-panel { border-top: 1px solid var(--line-soft); margin: 0 -20px; padding: 14px 20px 0; }
 .url {
   background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
   padding: 11px 13px; font: 12px var(--mono); word-break: break-all; color: var(--accent);
@@ -740,6 +744,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hr"></div>
             <div class="grid2">
+              <div class="switch"><span class="lb">成长任务自动执行</span>
+                <input type="checkbox" name="growth_enabled"></div>
+              <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
+                <input name="growth_hours" placeholder="1">
+                <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
               <div class="switch"><span class="lb">后台冷却探活</span>
                 <input type="checkbox" name="cooldown_probe_enabled"></div>
               <label class="fld"><span class="lb">探活间隔（分钟）</span>
@@ -1003,25 +1015,38 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg">
     <header>
       <h3>添加账号</h3>
-      <div class="hint">浏览器完成腾讯账号登录，网关自动接续签到并载入账号池，无需重启。</div>
+      <div class="tabs" id="addTabs">
+        <button class="tab on" data-tab="login">浏览器登录</button>
+        <button class="tab" data-tab="import">导入 JSON</button>
+      </div>
     </header>
     <div class="body">
-      <div id="addPick">
-        <div class="realm-row">
-          <span class="hint" style="font-size:12px">版本：</span>
-          <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
-          <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
+      <!-- 浏览器登录 -->
+      <div id="addTabLogin" class="tab-panel">
+        <div id="addPick">
+          <div class="realm-row">
+            <span class="hint" style="font-size:12px">版本：</span>
+            <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
+            <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
+          </div>
+          <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
         </div>
-        <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
+        <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
+        <div id="addReady" hidden>
+          <div class="state">在浏览器打开以下链接并登录：</div>
+          <div class="url" id="addUrl"></div>
+          <div class="state" id="addPoll"><span class="dots">等待授权完成，自动检测中</span></div>
+        </div>
+        <div id="addDone" class="state ok" hidden></div>
+        <div id="addErr" class="state err" hidden></div>
       </div>
-      <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
-      <div id="addReady" hidden>
-        <div class="state">在浏览器打开以下链接并登录：</div>
-        <div class="url" id="addUrl"></div>
-        <div class="state" id="addPoll"><span class="dots">等待授权完成，自动检测中</span></div>
+      <!-- 导入 JSON（cockpit tools 导出批量导入） -->
+      <div id="addTabImport" class="tab-panel" hidden>
+        <div class="hint" style="margin-bottom:8px">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式（含 uid / access_token / refresh_token / domain）。</div>
+        <input type="file" id="importFile" accept=".json" style="margin-bottom:8px">
+        <div id="importDone" class="state ok" hidden></div>
+        <div id="importErr" class="state err" hidden></div>
       </div>
-      <div id="addDone" class="state ok" hidden></div>
-      <div id="addErr" class="state err" hidden></div>
     </div>
     <footer>
       <span class="grow"></span>

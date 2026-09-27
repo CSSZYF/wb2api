@@ -163,6 +163,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
+	// cockpit tools 导出 JSON 批量导入（吸收上游 9371f7d）：Add Account 的
+	// 「导入 JSON」标签页落点。写操作（落盘 + 进池）→ 同 withAuth。
+	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	// 临时停用/恢复（上游 a20d06f 吸收）：与上面的 disable/revive 是**两套语义**——
@@ -307,7 +310,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	infos = p.cfg.HiddenModels.FilterInfo(infos)
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id":                   mi.ID,
 			"name":                 mi.Name,
 			"context_length":       mi.ContextWindow,
@@ -319,7 +322,22 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			"supports_reasoning":   mi.SupportsReasoning,
 			"supports_images":      mi.SupportsImages,
 			"credits":              mi.Credits,
-		})
+		}
+		// 限时优惠（modelPromotions，吸收上游 2b0eedd）：credits 是**牌价**，
+		// promo_* 是当前生效折扣（限时免费 factor=0 / 夜间五折 0.5 等）——WorkBuddy
+		// 客户端显示的正是生效价。前端据此显示「生效价 + 标签 + 划线牌价（悬停看
+		// 时段）」。只在有值时下发（缺失 ≠ 免费，前端不得回填）。
+		if mi.PromoFactor != nil {
+			entry["promo_factor"] = *mi.PromoFactor
+			entry["promo_credits"] = mi.PromoCredits
+		}
+		if mi.PromoLabel != "" {
+			entry["promo_label"] = mi.PromoLabel
+		}
+		if mi.PromoNote != "" {
+			entry["promo_note"] = mi.PromoNote
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,

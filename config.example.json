@@ -30,11 +30,15 @@
     "blackcat_hours": [
       23
     ],
+    "growth_hours": [
+      1
+    ],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
     "blackcat_enabled": true,
+    "growth_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
     "auth_watch_enabled": true,

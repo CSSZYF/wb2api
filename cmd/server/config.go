@@ -85,6 +85,7 @@ type Config struct {
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -99,6 +100,7 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
+		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
@@ -339,6 +341,7 @@ func Default() *Config {
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
+	c.Schedule.GrowthHours = []int{1}
 	// 模型名协议缺省：去域前缀（裸名）+ 裸名默认落 global。键缺席时 Default() 的值
 	// 被原样保留，只有显式配置才覆盖。
 	c.Models.StripRealmPrefix = true
@@ -350,6 +353,7 @@ func Default() *Config {
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.BlackcatEnabled = true
+	c.Schedule.GrowthEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
 	// auths 目录热加载缺省开启、30 秒一轮（账号数是个位数，每轮只做目录列表 + stat）。
@@ -751,6 +755,11 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
 	}
+	// growth 的回落是**独立**的 if 块（上游 74c324a 把它误嵌在 blackcat 块内：
+	// blackcat_hours 非空时 growth_hours 空值不回落，排程被 nextFire 零值静默跳过）。
+	if len(c.Schedule.GrowthHours) == 0 {
+		c.Schedule.GrowthHours = []int{1}
+	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {
 		if c.Schedule.BalanceRefreshMinutes <= 0 {
@@ -840,7 +849,10 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours)
+	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

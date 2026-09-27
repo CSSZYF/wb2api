@@ -30,6 +30,8 @@ type Config struct {
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
 	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
+	GrowthHours    []int // 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，
+	// 01:00 自动扫描+执行；避开零点整防解锁竞态）
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
 	// <= now+window 的套餐余额标记为"快过期"（pool 据此优先消耗，见
@@ -48,6 +50,13 @@ type Config struct {
 	KeepaliveDisabled bool
 	// BlackcatDisabled 显式关闭夜猫子排程（schedule.blackcat_enabled=false）。
 	BlackcatDisabled bool
+	// GrowthDisabled 显式关闭成长任务自动排程（schedule.growth_enabled=false）。
+	GrowthDisabled bool
+
+	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
+	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
+	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
+	GrowthHook func()
 }
 
 // Scheduler 调度器。
@@ -140,6 +149,9 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
+	if len(cfg.GrowthHours) == 0 {
+		cfg.GrowthHours = []int{1}
+	}
 	s := &Scheduler{
 		cfg:                cfg,
 		adoptTried:         make(map[string]string),
@@ -184,10 +196,17 @@ func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
 	s.expiringSoonNanos.Store(int64(d))
 }
 
+// SetGrowthHook 挂载/替换成长任务队列回调（panel 构造晚于 scheduler，事后接线）。
+func (s *Scheduler) SetGrowthHook(fn func()) {
+	s.schedMu.Lock()
+	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
 // 空 hours 视为「未配置」保留原值（与 config.normalize 的回落语义一致）。
-func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
-	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled bool) {
+func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, growthHours []int,
+	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled, growthDisabled bool) {
 	s.schedMu.Lock()
 	if len(checkinHours) > 0 {
 		s.cfg.CheckinHours = checkinHours
@@ -204,11 +223,15 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	if len(blackcatHours) > 0 {
 		s.cfg.BlackcatHours = blackcatHours
 	}
+	if len(growthHours) > 0 {
+		s.cfg.GrowthHours = growthHours
+	}
 	s.cfg.CheckinDisabled = checkinDisabled
 	s.cfg.TravelDisabled = travelDisabled
 	s.cfg.ActivityDisabled = activityDisabled
 	s.cfg.KeepaliveDisabled = keepaliveDisabled
 	s.cfg.BlackcatDisabled = blackcatDisabled
+	s.cfg.GrowthDisabled = growthDisabled
 	s.schedMu.Unlock()
 	poke(s.rearmSchedule)
 	poke(s.rearmBalance)
@@ -246,6 +269,7 @@ const (
 	taskActivity
 	taskKeepalive
 	taskBlackcat
+	taskGrowth
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -257,6 +281,7 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	checkinHours, keepaliveHours, blackcatHours := s.cfg.CheckinHours, s.cfg.KeepaliveHours, s.cfg.BlackcatHours
 	travelHours, activityHours := s.cfg.TravelHours, s.cfg.ActivityHours
 	checkinOff, keepaliveOff, blackcatOff := s.cfg.CheckinDisabled, s.cfg.KeepaliveDisabled, s.cfg.BlackcatDisabled
+	growthHours, growthOff := s.cfg.GrowthHours, s.cfg.GrowthDisabled
 	travelOff, activityOff := s.cfg.TravelDisabled, s.cfg.ActivityDisabled
 	s.schedMu.Unlock()
 
@@ -279,6 +304,9 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !blackcatOff {
 		slots = append(slots, slot{nextFire(now, blackcatHours), taskBlackcat})
+	}
+	if !growthOff {
+		slots = append(slots, slot{nextFire(now, growthHours), taskGrowth})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -408,6 +436,14 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 		s.runKeepalive(ctx)
 	case taskBlackcat:
 		s.runBlackcat(ctx)
+	case taskGrowth:
+		// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
+		s.schedMu.Lock()
+		hook := s.cfg.GrowthHook
+		s.schedMu.Unlock()
+		if hook != nil {
+			hook()
+		}
 	}
 }
 
