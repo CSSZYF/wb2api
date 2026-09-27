@@ -51,6 +51,13 @@ func growthPending(t upstream.Task) bool {
 	if t.Claimed {
 		return false
 	}
+	// 上游锁定的任务不出待办（吸收上游 09fd96e）：Sequential 族每日零点解锁一环，
+	// 刚做完上一环时下一环以 locked 形态出现在列表里——扫进队列只会 accept 不落账
+	// 报失败（每日锁定窗口），零点解锁后自然回到待办。其余 locked（上游未开放）
+	// 同语义：不该被自动化尝试。
+	if t.Locked {
+		return false
+	}
 	if t.Target > 0 && t.Current >= t.Target {
 		return false // 达标未领：也入队（队列执行后会自动领）
 	}
@@ -105,8 +112,13 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 				it.SchoolErr = err.Error()
 			} else {
 				it.InPeriod = inPeriod
+				// 活动期门控（吸收上游 729247b 的「活动结束」语义，但**只补门控不删
+				// 代码**——活动可能复办）：in_period=false 时上游仍会返回历史 pending
+				// 条目，扫进待办会让面板永远显示「有 N 项待办」而点执行什么也做不成
+				// （scheduler 的 schoolAccount 一进门就因 !inPeriod 返回）。
+				// 在期时照旧全量扫描（零回归）。
 				for _, t := range stasks {
-					if schoolPending(t) {
+					if inPeriod && schoolPending(t) {
 						it.School = append(it.School, schoolTaskView{
 							Code: t.TaskCode, Status: t.Status, Prog: t.Progress, Target: t.TargetCount,
 						})
@@ -169,28 +181,38 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	if !body.Growth && !body.School {
 		body.Growth, body.School = true, true
 	}
-	if body.Concurrency < 1 {
-		body.Concurrency = 1
+	started, total, seq, msg := p.startGrowthQueue(body.Concurrency, body.Growth, body.School)
+	switch {
+	case seq == -1:
+		writeErr(w, http.StatusConflict, msg)
+	case !started:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": false, "message": msg})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "total": total, "seq": seq})
 	}
-	if body.Concurrency > 4 {
-		body.Concurrency = 4
+}
+
+// startGrowthQueue 扫描全部账号待办并启动队列（HTTP「执行全部待办」与调度器
+// growth 时点共用核心）。返回 (started, total, seq, msg)：seq==-1 表示队列
+// 已在执行（冲突）；started=false 时 msg 为无可执行待办的说明。并发夹取
+// [1,4]；growth/school 开关同 HTTP 入参语义。
+func (p *Panel) startGrowthQueue(concurrency int, growth, school bool) (started bool, total int, seq int, msg string) {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > 4 {
+		concurrency = 4
 	}
 	q := p.queue()
 	q.mu.Lock()
 	if q.running {
 		q.mu.Unlock()
-		writeErr(w, http.StatusConflict, "队列正在执行中（可在任务中心查看进度）")
-		return
+		return false, 0, -1, "队列正在执行中（可在任务中心查看进度）"
 	}
 	q.mu.Unlock()
 
 	// 扫描待办（复用扫描逻辑的拉取部分）。
 	states := p.cfg.Pool.List()
-	type acct struct {
-		a      *auth.Auth
-		grow   []upstream.Task
-		school bool
-	}
 	var accts []queueAccount
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -210,7 +232,7 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 			if a.IsGlobal() {
 				return
 			}
-			if body.Growth {
+			if growth {
 				if tasks, err := p.listAllTasks(a); err == nil {
 					for _, t := range tasks {
 						if growthPending(t) {
@@ -223,7 +245,10 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if wantSchool && p.cfg.Scheduler != nil {
-				if stasks, _, err := p.cfg.Upstream.SchoolTasks(a); err == nil {
+				// 活动期门控：in_period=false（活动结束）时上游仍会返回历史 pending
+				// 条目——入队就是一条永远完不成的 school_daily（scheduler 一进门
+				// 即返回），用户以为队列卡住。门控只掐自动化，不掐状态展示。
+				if stasks, inPeriod, err := p.cfg.Upstream.SchoolTasks(a); err == nil && inPeriod {
 					for _, t := range stasks {
 						if schoolPending(t) { // 认证等不可做任务已在口径外
 							one.school = true
@@ -237,7 +262,7 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 				accts = append(accts, one)
 				mu.Unlock()
 			}
-		}(a, body.School)
+		}(a, school)
 	}
 	wg.Wait()
 
@@ -253,22 +278,32 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(items) == 0 {
 		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": false, "message": "全部账号没有待办任务"})
-		return
+		return false, 0, 0, "全部账号没有待办任务"
 	}
 
 	q.mu.Lock()
 	q.running = true
 	q.startedAt = time.Now()
 	q.items = items
-	q.conc = body.Concurrency
+	q.conc = concurrency
 	q.seq++
-	seq := q.seq
+	seq = q.seq
 	q.mu.Unlock()
 
-	go p.runQueueItems(accts, items, body.Concurrency)
-	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v 开学季 %v）", len(items), body.Concurrency, body.Growth, body.School)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "total": len(items), "seq": seq})
+	go p.runQueueItems(accts, items, concurrency)
+	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v 开学季 %v）", len(items), concurrency, growth, school)
+	return true, len(items), seq, ""
+}
+
+// RunGrowthQueueOnce 调度器 growth 时点回调（sch.SetGrowthHook 挂载）：与
+// 「执行全部待办」按钮完全同管线（成长+开学季，串行并发 1）。Sequential 族
+// 每日零点解锁一环，此前只能手动扫描推进；此回调让链条每天自动走一环。
+// 异步执行（startGrowthQueue 启动 goroutine 即返），已在跑/无待办安全跳过。
+func (p *Panel) RunGrowthQueueOnce() {
+	started, total, _, _ := p.startGrowthQueue(1, true, true)
+	if started {
+		log.Printf("panel: 定时成长任务队列已启动（%d 项）", total)
+	}
 }
 
 // runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），

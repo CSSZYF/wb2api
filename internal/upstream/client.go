@@ -1373,6 +1373,15 @@ type ModelInfo struct {
 	SupportsReasoning  bool     // supportsReasoning：模型支持思考
 	SupportsImages     bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
 	Credits            string   // credits：积分倍率（如 "x0.79"）
+
+	// 优惠（modelPromotions，/v3/config data.modelPromotions，见 modelpromo.go）：
+	// Credits 是**牌价**（转正后基准倍率），Promo* 是当前生效的限时优惠——面板据此
+	// 显示「生效价 + 标签 + 划线牌价」。PromoFactor 为 nil 表示无 machine-readable
+	// 折扣（如「错峰使用」只有时段文案无 factor），仅挂标签/提示。
+	PromoFactor  *float64 // 折扣系数（0=限时免费，0.5=五折）；nil=无
+	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
+	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
+	PromoNote    string   // hover 说明原文（含时段/日期描述）
 }
 
 // nonChatModel 判定是否非对话模型（应从模型列表过滤掉）。
@@ -1627,6 +1636,7 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 	}
 	// CN 侧固定 IDE UA 单路（吸收上游 9dce68a：CN 目录主源是企业端点，v3 只作能力
 	// 覆盖，换 UA 无收益；global 侧的双 UA 并集在 probeGlobalV3Capabilities）。
+	// overlay 同时携带能力与限时优惠（credits 是牌价，promo_* 是当前生效折扣，见 modelpromo.go）。
 	if overlay, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA); err == nil && len(overlay) > 0 {
 		out = mergeModelCapabilities(out, overlay)
 	}
@@ -1739,6 +1749,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 					} `json:"banners"`
 				} `json:"ModelTrialBanner"`
 			} `json:"productFeaturesConfig"`
+			// 限时优惠（见 modelpromo.go）：credits 是牌价，这里是当前生效折扣。
+			// 与上面的试用横幅是 data 下的两个平级字段，互不覆盖。
+			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -1801,6 +1814,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	if len(out) == 0 {
 		return nil, fmt.Errorf("v3/config returned empty models")
 	}
+	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
+	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
+	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
+	applyModelPromotions(out, env.Data.ModelPromotions)
 	return out, nil
 }
 
@@ -1841,6 +1858,20 @@ func mergeModelCapabilities(base []ModelInfo, overlay map[string]ModelInfo) []Mo
 		}
 		if ov.Credits != "" {
 			mi.Credits = ov.Credits
+		}
+		// 限时优惠同样只填有值字段：overlay 未挂优惠（该模型无 modelPromotions 命中）
+		// 时不得清空基底已有的 promo（promo 只由 /v3/config 提供，企业端点没有）。
+		if ov.PromoFactor != nil {
+			mi.PromoFactor = ov.PromoFactor
+		}
+		if ov.PromoCredits != "" {
+			mi.PromoCredits = ov.PromoCredits
+		}
+		if ov.PromoLabel != "" {
+			mi.PromoLabel = ov.PromoLabel
+		}
+		if ov.PromoNote != "" {
+			mi.PromoNote = ov.PromoNote
 		}
 		if ov.Name != "" {
 			mi.Name = ov.Name

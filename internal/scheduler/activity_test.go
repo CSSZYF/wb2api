@@ -363,7 +363,7 @@ func TestCheckinDisabledTravelStillRuns(t *testing.T) {
 	}
 }
 
-// TestAllFourDisabledNoSpin 四类任务全禁用：Run 不空转。
+// TestAllFourDisabledNoSpin 六类任务全禁用：Run 不空转。
 func TestAllFourDisabledNoSpin(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
@@ -371,6 +371,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
 		BlackcatDisabled:  true,
+		GrowthDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},
@@ -378,7 +379,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {
-		t.Errorf("at=%v kinds=%v want zero/nil（五类全禁用）", at, kinds)
+		t.Errorf("at=%v kinds=%v want zero/nil（六类全禁用）", at, kinds)
 	}
 }
 
