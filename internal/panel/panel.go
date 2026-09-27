@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -176,6 +177,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
+	// 账号顺序（顺序填充式选号的权威次序，pool.pick_mode=sequential 时生效）：
+	// 面板拖拽排序的落点。写池 + 落盘 state.json 顶层 account_order。
+	p.mux.HandleFunc("POST /panel/api/accounts/order", p.withAuth(p.accountOrder))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
@@ -508,6 +512,70 @@ func (p *Panel) writeAccountState(w http.ResponseWriter, uid string, changed boo
 		"manual_disabled": st.ManualDisabled,
 		"manual_reason":   st.ManualReason,
 	})
+}
+
+// accountOrder 设置账号顺序（顺序填充式选号 pool.pick_mode=sequential 的权威次序，
+// 面板拖拽排序的落点）。请求体 {"uids":["uid1","uid2",...]}，响应 {"ok":true,...}。
+//
+// 语义（与 pool.SetOrder 一致，见 pool/order.go）：
+//   - 空数组/缺 uids 键 = **清除自定义顺序** → 回落「按 UID 排序」（改动前行为）；
+//   - 未知 uid（不在池内）：**过滤掉并在响应里 warning 说明**，而不是整单拒绝。
+//     取舍理由：拖拽排序是一次性 UI 动作，客户端拿到的列表可能因为账号在另一处被
+//     删除/添加而略微过期；整单 400 会让用户「拖了没反应」且无从修复（前端无法
+//     自动重试出正确列表）。过滤后写入的是"当前池内有效次序"，同时把被忽略的 uid
+//     明确回给调用方——数据没有静默丢失，用户看得到。已删除 uid 的副作用也是良性的
+//     （pool 读取时本就会跳过它们，见 effectiveOrderLocked）。
+//   - 未列出的池内账号（新号）由 pool 侧追加到末尾（按 UID 升序）。
+//
+// 顺序立即落盘（pool.SetOrder 内 saveLocked），重启后仍在。
+func (p *Panel) accountOrder(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Pool == nil {
+		writeErr(w, http.StatusNotImplemented, "pool not available")
+		return
+	}
+	var body struct {
+		UIDs []string `json:"uids"`
+	}
+	if r.Body != nil {
+		// 限制读取量：uid 列表是短文本（账号数有界），4KB 足够且防畸形大请求。
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&body); err != nil {
+			// 空体/非法 JSON：区分「清除顺序」（空体 = 无 uids 字段）与「格式错误」。
+			// 空体是最常见的"清空顺序"调用形态，不应报错；非空但解析失败才是错误。
+			if !errors.Is(err, io.EOF) {
+				writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+				return
+			}
+		}
+	}
+	// 过滤未知 uid（回显 warning），去重保序。
+	valid := make([]string, 0, len(body.UIDs))
+	var unknown []string
+	seen := make(map[string]bool, len(body.UIDs))
+	for _, uid := range body.UIDs {
+		uid = strings.TrimSpace(uid)
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		if _, ok := p.cfg.Pool.Status(uid); !ok {
+			unknown = append(unknown, uid)
+			continue
+		}
+		valid = append(valid, uid)
+	}
+	p.cfg.Pool.SetOrder(valid)
+	log.Printf("panel: accounts/order 已更新（%d 个有效 uid，忽略 %d 个未知 uid）", len(valid), len(unknown))
+	resp := map[string]any{
+		"ok": true,
+		// order 回显**有效顺序**（含被追加到末尾的新号），前端据此立即重排列表，
+		// 不必等下一次 overview（与 writeAccountState 的回显口径一致）。
+		"order": p.cfg.Pool.Order(),
+	}
+	if len(unknown) > 0 {
+		resp["warning"] = "已忽略不在池内的 uid（账号可能已被删除）"
+		resp["unknown_uids"] = unknown
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // panelReasonFromBody 读可选 JSON 体里的 reason 字段（截断到 200 字符）。

@@ -93,7 +93,8 @@
     "degrade_cooldown_max": "2h",
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
-    "expiring_soon": "168h"
+    "expiring_soon": "168h",
+    "pick_mode": "weighted"
   },
   "session_sticky": {
     "enabled": true,

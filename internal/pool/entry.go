@@ -523,6 +523,13 @@ type stateModelCooldown struct {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
+	// AccountOrder 用户指定的选号顺序（顺序填充式选号的权威次序；面板拖拽排序落点）。
+	// 放**顶层**而不是每个 account 对象里：顺序是池级属性（一个列表表达全序），
+	// 塞进 account 会让每个账号各带一个"我在第几位"，改序要写 N 条、且无法表达
+	// "某账号不在自定义顺序里（新号追加末尾）"。
+	// 兼容：旧 state.json 无本键 → 零值 nil → 回落「按 UID 排序」，与改动前逐字节
+	// 相同（见 order.go 的 effectiveOrderLocked）。空数组同样回落（清除自定义顺序）。
+	AccountOrder []string `json:"account_order,omitempty"`
 }
 
 // flushInterval 后台落盘周期。

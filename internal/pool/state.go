@@ -573,15 +573,13 @@ func (p *Pool) ModelRateLimitExhausted(model, realm string) (time.Duration, bool
 	return earliest.Sub(now), true
 }
 
-// List 返回所有账号状态（按 UID 排序，稳定输出）。
+// List 返回所有账号状态，按**选号顺序**输出（Pool.Order() 的口径，见 order.go）：
+// 有自定义顺序（account_order）时按该顺序，无顺序时按 UID 升序（改动前的行为，
+// 零回归）。面板按此顺序渲染账号列表，拖拽排序才有意义（顺序权威与选号一致）。
 func (p *Pool) List() []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	uids := make([]string, 0, len(p.byUID))
-	for uid := range p.byUID {
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
+	uids := p.effectiveOrderLocked()
 	out := make([]Status, 0, len(uids))
 	for _, uid := range uids {
 		out = append(out, p.statusOf(uid, p.byUID[uid]))

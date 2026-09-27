@@ -36,6 +36,18 @@ type Pool struct {
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// order 用户指定的选号顺序（面板拖拽排序；uid 列表，可为空）。
+	// 权威语义与收敛规则见 order.go（SetOrder/effectiveOrderLocked）：
+	//   - 空 = 无自定义顺序 → 回落「按 UID 排序」（旧 state.json / 清除顺序，零回归）；
+	//   - 非空 = 顺序填充式选号的遍历次序（内部顺序权威，不依赖 byUID 的 map 序）；
+	//   - 顺序里的已删除 uid 读取时跳过，池内未列出的新账号追加到末尾（按 UID 升序）。
+	// 持久化在 state.json **顶层**键 account_order（不塞进每个 account 对象，
+	// 见 persist.go/stateFile）。
+	order []string
+	// pickMode 选号模式（SetPickMode 注入）：pickWeighted（0，缺省）= 改动前的
+	// 三因子加权随机；pickSequential = 顺序填充式（按 order 取第一个合格账号）。
+	// 零值即缺省，故旧部署/未注入时行为与改动前逐字节相同。
+	pickMode PickMode
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域

@@ -126,6 +126,10 @@ func (p *Pool) load() {
 	if json.Unmarshal(raw, &sf) != nil {
 		return
 	}
+	// 选号顺序（顶层 account_order）：旧 state.json 无此键 → nil → 回落 UID 排序。
+	// 顺序里的已删除 uid 不在此处剔除（读时收敛，见 order.go）：账号可能因 auths
+	// 目录半截写入暂时出池，顺序保留可让它在下一轮回到原位。
+	p.order = append([]string(nil), sf.AccountOrder...)
 	p.applyAccountsLocked(sf.Accounts)
 }
 
@@ -215,8 +219,12 @@ func (p *Pool) adoptSnapshot(s snapshot) {
 }
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
+// 选号顺序（顶层 account_order）与账号状态同源同快照，一并采用——快照是「本地
+// state.json 的等价镜像」，只采用一半（账号状态）会让顺序在快照恢复后回落到 UID 排序，
+// 面板拖拽的次序静默丢失。
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
+	p.order = append([]string(nil), s.AccountOrder...)
 	p.applyAccountsLocked(s.Accounts)
 }
 func (p *Pool) saveLocked() {
@@ -283,6 +291,12 @@ func cooledReasonLocked(e *entry, now time.Time) (coolKind CoolKind, reason stri
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}}
+	// 选号顺序（顶层键）：恒按当前内存值写出（空则 omitempty 省略，与旧文件等价）。
+	// 顺序是运维意图的忠实记录，落盘不做事后收敛（收敛在读侧 effectiveOrderLocked，
+	// 见 order.go）——已删除 uid 留在文件里，账号回来后仍在原位。
+	if len(p.order) > 0 {
+		sf.AccountOrder = append([]string(nil), p.order...)
+	}
 	for uid, e := range p.byUID {
 		// 模型级冷却落盘（复用既有落盘循环，不新增遍历）。只写 Until 在未来的条目，
 		// 与恢复时过期过滤同口径——落盘即清理，避免 state.json 残留已过期条目。
