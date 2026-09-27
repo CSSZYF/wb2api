@@ -218,6 +218,30 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc tbody tr.susp .mark i { background: var(--warn); }
 /* 模型表无色条（健康指示只属于账号表）。 */
 .acc.md .mark { display: none; }
+/* ── 拖拽排序（手柄列 + 落点提示线 + 拖拽中半透明）────────────────────
+   手柄列窄且不可选中：user-select:none 防拖拽起手时先选中一个字符（选中会把
+   mousemove 变成选区操作，拖拽视觉上"粘住"）；cursor:grab 给出可拖的暗示。 */
+.acc .drag-col { width: 1px; padding: 9px 4px; }
+.acc td.drag-handle {
+  width: 1px; padding: 11px 4px 11px 7px; cursor: grab;
+  color: var(--ink-3); font-size: 14px; line-height: 1; letter-spacing: -1px;
+  user-select: none; -webkit-user-select: none;
+}
+.acc td.drag-handle:hover { color: var(--accent); }
+.acc tbody tr.dragging { opacity: .45; }
+.acc tbody tr.dragging td.drag-handle { cursor: grabbing; }
+/* 落点提示线用 2px 内阴影画在行边界上（不用 border：border 会改变行高，
+   拖拽中整个表抖动、落点跟着漂）。drop-before=插到该行之前，drop-after=追加末尾。 */
+.acc tbody tr.drop-before td { box-shadow: inset 0 2px 0 0 var(--accent); }
+.acc tbody tr.drop-after td { box-shadow: inset 0 -2px 0 0 var(--accent); }
+/* 在途占满：warn 色（与冷却/限流标签同色系）——顺序模式下这是"新请求将溢出到
+   下一个号"的唯一可见信号，必须一眼看到。 */
+.acc td.inflight .of { color: var(--ink-3); font-size: 11px; }
+.acc td.inflight-full { color: var(--warn); font-weight: 600; }
+.acc td.inflight-full .of { color: var(--warn); }
+/* 顺序模式横幅：只在 pick_mode=sequential 时显示（app.js 控 hidden），
+   否则「从上到下溢出」不成立，显示会误导。 */
+#accSeqNote { color: var(--accent); }
 /* 操作列用 width:1px + nowrap 的经典技巧：列宽恰为内容宽，其余列按内容自适应 */
 .acc .c-acts { width: 1px; white-space: nowrap; }
 /* 档位标签列：允许换行在标签之间（不拆字），并给足最小宽度 */
@@ -508,6 +532,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>账号池</h3>
           <span class="grow"></span>
+          <span class="note" id="accSeqNote" hidden></span>
           <span class="note" id="accNote"></span>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>
@@ -519,8 +544,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
+            <th class="drag-col" title="按住 ⠿ 上下拖动可调整选号顺序（顺序模式下生效）"></th>
             <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th title="在途 / 单号并发上限；占满时新请求会溢出到下一个账号（顺序模式）">在途 / 上限</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -774,6 +800,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">连续失败熔断阈值</span>
                 <input name="breaker_threshold" type="number" min="1" placeholder="3">
                 <span class="hint">5xx 连续失败 N 次熔断（指数退避）</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">选号模式</span>
+                <select name="pick_mode">
+                  <option value="weighted">weighted — 加权随机（缺省）</option>
+                  <option value="sequential">sequential — 顺序填充</option>
+                </select>
+                <span class="hint">顺序填充：按账号池的顺序（在「账号池」表里拖动 ⠿ 调整，顺序立即落盘）从上到下取第一个可用号；该号在途占满即临时溢出到下一个，并发降回来它重新成为首选。用于减少「每次挑不同账号」引发的频繁 429；保存后立即生效（非法值按加权随机处理）</span></label>
             </div>
             <div class="grid3">
               <label class="fld"><span class="lb">连败降权阈值</span>
