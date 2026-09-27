@@ -155,8 +155,8 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 //     切模型绕过）。
 //   - resetAt 零值且**不在冷却中**（首次/恢复后的新限流）→ 有界退避：按 softStreak
 //     指数退避并封顶 softRateMax（默认 2h，并经 softDurationLocked 统一封顶）。
-//     softStreak 只在真正进入一次新冷却时计数，由 NoteSuccess/reviveCoolingLocked
-//     清零（既有恢复语义）。
+//     softStreak 只在真正进入一次新冷却时计数，由 NoteSuccess 清零（唯一恢复证据；
+//     余额恢复解冻自 602ed1b 起不再清零——退避计数与「余额有钱」无关）。
 //   - resetAt 零值且**已在软冷却中**（兜底探测再次撞 429）→ 不推进 streak、不延长
 //     until：用户重试/并发兜底探测不得把冷却越堆越厚——这正是旧实现「越重试越冷、
 //     全池被推到 2h 封顶」的元凶（每次探测都 softStreak++ 指数翻倍）。

@@ -4,6 +4,8 @@
 //     "none" 保留 tools 声明，见 normalizeToolChoice 的上游 4db4e91 依据）
 //  3. max_completion_tokens 别名翻译为 max_tokens（上游只认后者，别名被静默忽略后
 //     回落默认输出上限，见 translateMaxCompletionTokens）
+//  4. image_url 归一化（上游只认 OpenAI 对象形态 {"url":...}，字符串形态会
+//     400 code=11101，见 normalizeImageURL）
 package upstream
 
 import (
@@ -83,6 +85,7 @@ func PrepareBodyOptRealmHistory(src []byte, realm string, sanitize, zeroWidth bo
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	normalizeImageURL(obj)
 	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
@@ -296,6 +299,46 @@ func normalizeRoles(obj map[string]any) {
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
 			log.Printf("role normalized developer->system idx=%d", i)
+		}
+	}
+}
+
+// normalizeImageURL 兼容 OpenAI chat 多模态内容的两种 image_url 写法
+// （吸收上游 d47219b）。
+//
+// OpenAI Chat Completions 规范用对象形态 {"url":"...","detail":"..."}，但部分客户端
+// （以及 Responses → Chat 转换器）会发字符串形态 "data:..." / "https://..."。
+// WorkBuddy 上游只接受对象形态，字符串会返回 400 code=11101
+// "cannot unmarshal string into ... ImageContent"——同一个 body 换任何账号都失败，
+// 且客户端拿到的报错完全不指向"写法不对"。
+//
+// 这里只做形状转换：字符串转 {"url": 原值}；已有对象（含 url/detail/mime_type 等键）
+// 原样保留；空字符串、缺失值、对象内非法 url 一律不补默认值——让上游返回真实错误
+// （编造 url 会把"客户端漏字段"变成"网关发了个不存在的图片"，错误方向完全错）。
+func normalizeImageURL(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, rawMsg := range msgs {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok || part["type"] != "image_url" {
+				continue
+			}
+			imageURL, ok := part["image_url"].(string)
+			if !ok || imageURL == "" {
+				continue
+			}
+			part["image_url"] = map[string]any{"url": imageURL}
 		}
 	}
 }

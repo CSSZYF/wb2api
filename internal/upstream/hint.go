@@ -41,12 +41,15 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		}
 		return "request parameters were rejected by the model provider; check message format and model capabilities"
 	}
-	// 11135 invalid_image_data 家族（图片数据无效，Discussion #77 实测形态）。
+	// 11135 invalid_image_data 家族（图片数据无效，Discussion #77 实测形态）
+	// + 出站 image_url 归一后仍撞上的格式类错误（"invalid image_url content"，
+	// 吸收上游 d47219b）：同一句文案覆盖「格式」与「数据」两种成因——两者对客户端
+	// 的动作一致（换一张真图 / 修 image_url 写法），且都不该换号重试。
 	// 条件里带上 Kind：Classify 现已把 11135 归 ErrInvalidImage（请求级终态），
 	// 形态分支与 Kind 分支共用**同一句文案**（不引入第二套措辞）；kind 命中而 body
 	// 未命中 marker（如 uerr.Msg 被截断到 200 字符）时仍能给出该 hint。
 	if isInvalidImageData(msg) || kind == ErrInvalidImage {
-		return "image data rejected by upstream; use a real/valid image, may need a new conversation"
+		return "image request was rejected by upstream; check image_url format and image data, may need a new conversation"
 	}
 	switch kind {
 	case ErrPromptTooLong:
@@ -142,11 +145,18 @@ func isModelParamInvalid(body string) bool {
 }
 
 // isInvalidImageData 上游 11135 body 判定（code 11135 / invalid_image_data /
-// "replace the image" msg 家族）。
+// "invalid image_url content" 格式类文案 / "replace the image" msg 家族）。
+//
+// 吸收上游 d47219b：code 判定走 codeMarker 统一口径（容忍 `"code": 11135` 空白形态，
+// 字面量 marker 只能覆盖紧凑写法），文案 marker 只留 code 覆盖不到的形态。
+// "invalid image_url content" 是**出站 image_url 归一之后**仍可能撞上的真格式错误
+// （见 payload.go normalizeImageURL）：字符串写法已被网关转成对象，剩下的就是内容
+// 本身不合法（截断的 base64 / 非图片字节 / 不支持的格式），同 body 换号结果不变。
 func isInvalidImageData(body string) bool {
 	lower := strings.ToLower(body)
 	return codeMarker(lower, "11135") ||
 		strings.Contains(lower, "invalid_image_data") ||
+		strings.Contains(lower, "invalid image_url content") ||
 		strings.Contains(lower, "replace the image")
 }
 

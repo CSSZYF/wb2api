@@ -89,12 +89,13 @@ func TestGatewayHintImageForms(t *testing.T) {
 			"request parameters were rejected by the model provider; check message format and model capabilities",
 		},
 		{
-			// 11135 invalid_image_data → 图片数据无效指向（不需要带图上下文——
-			// 上游明说 image 就是图片问题）。
+			// 11135 invalid_image_data / image_url 格式类 → 图片问题指向（不需要带图
+			// 上下文——上游明说 image 就是图片问题）。措辞吸收上游 d47219b 后同时
+			// 指向「image_url 写法」与「图片数据」两条排查路径。
 			"11135",
 			body11135,
 			HintContext{},
-			"image data rejected by upstream; use a real/valid image, may need a new conversation",
+			"image request was rejected by upstream; check image_url format and image data, may need a new conversation",
 		},
 		{
 			// 11133 body 但 Kind 是 ErrClient（分类词表不含 11133）→ hint 层自带

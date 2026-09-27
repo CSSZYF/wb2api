@@ -704,41 +704,43 @@ func TestBalanceRefreshDefaults(t *testing.T) {
 	}
 }
 
-// TestMaxBodyDefault 默认 max_body_mb=32（v1.9.17 从 8 提到 32）。
+// TestMaxBodyDefault 默认 max_body_mb=0 = **不预拦截**（吸收上游 73fe1f8）。
 //
-// 为什么是 32：本项是**网关侧内存护栏**（非上游限制），旧值 8MB 在多图会话下常态
-// 误伤（历史图片每轮 base64 重发，膨胀约 37%）；也不宜更大——无入站并发闸门时
-// 实测单请求峰值内存约为 body 的 5 倍。改这个数须同步 README 与 413 文案口径。
+// 历史沿革：8（初始）→ 32（v1.9.17，多图会话 8MB 常态误伤）→ 0（本次，对齐上游
+// 「大请求交上游自然响应」）。本项从"默认护栏"变成"默认不设护栏、显式 >0 才开"，
+// 因为上游的错误响应信息量更大（能看到上游到底是什么策略），网关提前 413 反而
+// 挡住上游真实行为。
 func TestMaxBodyDefault(t *testing.T) {
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if c.Server.MaxBodyMB != 32 {
-		t.Errorf("max_body_mb=%d want 32", c.Server.MaxBodyMB)
+	if c.Server.MaxBodyMB != 0 {
+		t.Errorf("max_body_mb=%d want 0（默认不预拦截）", c.Server.MaxBodyMB)
 	}
-	// 与 handler 侧兜底同源（Default() 取自 server.DefaultMaxBodyBytes）：两处各写一个
-	// 数字时，"配置默认 32、handler 兜底 8"这类漂移不会有任何测试报错，只会在裸构造
-	// handler 的路径上表现为"配置写着 32，实际按 8 拦截"——与 TestReadTimeoutDefault
-	// 盯 read_timeout 漂移同一形态。
+	// 与 handler 侧同源（Default() 取自 server.DefaultMaxBodyBytes）：两处各写一个
+	// 数字时，"配置默认 0、handler 兜底 32MB"这类漂移不会有任何测试报错，只会在
+	// 裸构造 handler 的路径上表现为"配置说不拦，实际按 32MB 拦截"——与
+	// TestReadTimeoutDefault 盯 read_timeout 漂移同一形态。
 	if want := int(server.DefaultMaxBodyBytes >> 20); c.Server.MaxBodyMB != want {
 		t.Errorf("config 默认 %d 与 handler.DefaultMaxBodyBytes(%dMB) 漂移",
 			c.Server.MaxBodyMB, want)
 	}
-	if server.DefaultMaxBodyBytes != 32<<20 {
-		t.Errorf("DefaultMaxBodyBytes=%d want 32MB", server.DefaultMaxBodyBytes)
+	if server.DefaultMaxBodyBytes != 0 {
+		t.Errorf("DefaultMaxBodyBytes=%d want 0（不预拦截）", server.DefaultMaxBodyBytes)
 	}
 }
 
-// TestMaxBodyExplicit 显式设置 max_body_mb 覆盖默认（含显式 8——证明"默认提到 32"
-// 不是把配置写死成 32：老用户配的 8 仍原样生效，不受默认值变更影响）。
+// TestMaxBodyExplicit 显式设置 max_body_mb 覆盖默认（含显式 0——显式写 0 也是
+// "不预拦截"，与默认同义；含显式 8/32——老用户配的护栏值仍原样生效，不受默认变更影响）。
 func TestMaxBodyExplicit(t *testing.T) {
 	for _, tc := range []struct {
 		json string
 		want int
 	}{
-		{`{"server":{"max_body_mb":8}}`, 8},   // 反向断言：显式 8 仍生效（可覆盖）
-		{`{"server":{"max_body_mb":16}}`, 16}, // 旧用例
+		{`{"server":{"max_body_mb":0}}`, 0}, // 显式 0 = 不预拦截（与默认同义）
+		{`{"server":{"max_body_mb":8}}`, 8}, // 反向断言：显式 8 仍生效（可覆盖）
+		{`{"server":{"max_body_mb":16}}`, 16},
 		{`{"server":{"max_body_mb":32}}`, 32},
 		{`{"server":{"max_body_mb":128}}`, 128},
 	} {
@@ -755,11 +757,11 @@ func TestMaxBodyExplicit(t *testing.T) {
 	}
 }
 
-// TestMaxBodyInvalid 非法值（0/负数）normalize 报错：0 想表达"不限"会被静默当成默认，
-// 与其误导不如 fail fast 提示显式配大上限。
-// v1.9.17 只动默认值（8→32），**刻意不动**这里的 fail-fast 语义。
+// TestMaxBodyInvalid 非法值（负数）normalize 报错；0 **不再**非法（语义变为"不预拦截"）。
+// 负的字节上限没有合理语义，静默当成极小上限会把所有请求打成 413（最坏的反向风险），
+// 回落默认又会让"我配了个负数"无声无息变成"没护栏"——故 fail fast。
 func TestMaxBodyInvalid(t *testing.T) {
-	for _, v := range []string{"0", "-1"} {
+	for _, v := range []string{"-1", "-100"} {
 		dir := t.TempDir()
 		fp := filepath.Join(dir, "c.json")
 		os.WriteFile(fp, []byte(`{"server":{"max_body_mb":`+v+`}}`), 0o600)

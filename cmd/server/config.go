@@ -26,16 +26,22 @@ type Config struct {
 	StateFile string `json:"state_file"` // ./data/state.json
 
 	Server struct {
-		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 32）。
-		// 请求体超过该值直接返回 413 request_body_too_large，不再静默截断后喂给上游
-		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
+		// MaxBodyMB 聊天请求体大小上限（单位 MB，**默认 0 = 不预拦截**，吸收上游 73fe1f8）。
 		//
-		// 这是**网关侧内存护栏**，不是上游限制：上游本身没有可观测的 body 上限，
-		// 这个值只用来挡住"单请求把进程内存吃爆"。默认 32 而非更小，是因为多图
-		// 会话每轮重发历史图片（base64 再膨胀约 37%），8MB 常态误伤；也不用更大，
-		// 因为无入站并发闸门时实测单请求峰值内存约为 body 的 5 倍。
-		// 0/负数视为非法 → normalize fail fast 报错（刻意不回落默认：0 会被误读成
-		// "不限"，静默回落反而让用户以为配置生效了）。
+		// 语义：
+		//   - 0（默认）→ 网关**不做**任何请求体预拦截，完整读入后交上游自然响应。
+		//     上游的错误响应信息量更大（能看到上游到底是什么策略），网关提前 413
+		//     反而挡住上游真实行为；多图/长上下文会话（历史图片每轮 base64 重发）
+		//     不再撞网关上限。
+		//   - >0 → 保留一道**网关侧内存护栏**（不是上游限制）：超限直接 413
+		//     request_body_too_large，不把半截请求喂上游（issue #41：截断的 JSON 让
+		//     上游 unmarshal 报 unexpected EOF，网关却罚号）。无入站并发闸门时实测
+		//     单请求峰值内存约为 body 的 5 倍——大内存机器上想开护栏时按此估算。
+		//
+		// 为什么保留该键而不是像上游那样直接删（本仓刻意的取舍）：删键会让既有
+		// config.json 里的显式设置静默失效（未知键被忽略），正是 issue #17 反复
+		// 强调的"改了配置却不生效还不提示"失效模式；保留可显式开启的护栏也更安全。
+		// 负数视为非法 → normalize fail fast（负的字节上限没有合理语义）。
 		MaxBodyMB int `json:"max_body_mb"`
 
 		// MaxRotate 单请求最多换号次数（默认 3）。
@@ -322,10 +328,10 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
-	// 请求体上限默认 32MB：**网关侧内存护栏，非上游限制**（见字段注释）。32 的取舍：
-	// 旧值 8MB 在多图会话下常态误伤（历史图片每轮 base64 重发，膨胀约 37%）；也不宜
-	// 更大——无入站并发闸门时实测单请求峰值内存约为 body 的 5 倍。
-	// 值取自 server.DefaultMaxBodyBytes（handler 侧兜底同一常量），避免"配置默认一个数、
+	// 请求体上限默认 0 = **不预拦截**（吸收上游 73fe1f8，见字段注释）：大请求完整读入
+	// 后交上游自然响应，网关不再以 413 提前挡住上游真实行为。显式 >0 时仍是一道
+	// 网关侧内存护栏。
+	// 值取自 server.DefaultMaxBodyBytes（handler 侧同一常量），避免"配置默认一个数、
 	// handler 兜底另一个数"的静默漂移（与下面 ReadTimeoutSeconds 同一处理风格）。
 	c.Server.MaxBodyMB = int(server.DefaultMaxBodyBytes >> 20)
 	c.Server.MaxRotate = 3 // 单请求最多换号次数默认 3（与 handler 侧兜底口径一致）
@@ -627,11 +633,12 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
-	// max_body_mb 非法（0/负数）直接报错：0 若被静默当成默认 32MB，用户以为"不限"，
-	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
-	// 语义与默认值无关（默认 8 还是 32 都 fail fast），v1.9.17 只动默认值，未动此处。
-	if c.Server.MaxBodyMB <= 0 {
-		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
+	// max_body_mb 语义（吸收上游 73fe1f8）：0 = **不预拦截**（默认），>0 = 网关侧
+	// 内存护栏（超限 413）。负数非法 fail fast——负的字节上限没有合理语义，静默当成
+	// 极小上限会把所有请求打成 413（最坏的反向风险），回落默认又会让"我配了个负数"
+	// 无声无息地变成"没护栏"。
+	if c.Server.MaxBodyMB < 0 {
+		return fmt.Errorf("server.max_body_mb: %d 非法（0 = 不预拦截，或正整数 MB 作为网关内存护栏）", c.Server.MaxBodyMB)
 	}
 	// max_rotate 非正回落默认 3（处理风格参照 pool.max_in_flight_global）：0/负数
 	// 在这里没有「不限」之类的合理语义（「不限换号」可用超大值表达），报错只会让

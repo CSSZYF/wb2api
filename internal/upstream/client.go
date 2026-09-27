@@ -382,6 +382,44 @@ func IsModelBlocked(status int, body string) bool {
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
 }
 
+// hasBusinessCode 报告 JSON 错误信封里是否存在**精确等于** want 的业务码
+// （吸收上游 d47219b）。上游信封形态在顶层 / error / data / extError 之间来回变，
+// 故遍历解码后的结构找名为 "code" 的字段。
+//
+// 与 codeMarker（hint.go）的分工：那个是**子串**口径、用于补充说明（宁宽勿漏）；
+// 本函数是**结构化精确**口径、用于分类决策——判错的代价是把限流号硬冷却到次日
+// 04:00（12h），故不接受 "requestId":"req-14018" 这类子串噪声。
+// 数字与字符串形态都认（`"code":14018` / `"code":"14018"`），JSON 空白天然容差
+// （走 json.Unmarshal，不做字面量匹配）。
+func hasBusinessCode(body, want string) bool {
+	var root any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return false
+	}
+	var walk func(any) bool
+	walk = func(value any) bool {
+		switch node := value.(type) {
+		case map[string]any:
+			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
+				return true
+			}
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(root)
+}
+
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
 // `"code":` 或 `"msg":` 字段）。WAF 403 判定（IsWafBlocked）用「无业务信封」
 // 区分 WAF 拦截页（HTML/空体/纯文本）与上游业务层 403（带 code/msg 信封，
@@ -531,34 +569,36 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 //     soft_rate（"限流"语义不符：限流可退避等自愈，账号级故障等不来）。
 //     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
 //     不在此层命中，后续走 softRateMarkers 层，不受影响。
-//  4. status==429 —— 限流状态码兜底（本层先于 hardMarkers，fork-scan-absorb T-3）：
+//  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（吸收上游 d47219b，
+//     issue #175）。只认结构化业务码，不靠跨计费/限流两界的文案猜测。
+//  5. status==429 —— 限流状态码兜底（本层先于 hardMarkers，fork-scan-absorb T-3）：
 //     429 body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
 //     若 hardMarkers 先判会把限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约
 //     12h。状态码是比关键词更权威的信号：上游既然给了 429，就按限流语义处理
-//     （宁可短冷却自愈，不可长冷却弃号）；真正的余额耗尽由 402（第 1 层）捕获，
-//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 5 层）。
-//  5. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//     （宁可短冷却自愈，不可长冷却弃号）；真正的余额耗尽由 402（第 1 层）或
+//     14018（第 4 层）捕获，非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 6 层）。
+//  6. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
 //     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit；429 场景已由
-//     第 4 层前置接管（issue #28 记录的非 429 反向误判风险保持原样，待上游
+//     第 5 层前置接管（issue #28 记录的非 429 反向误判风险保持原样，待上游
 //     原始响应确认后再定）。
-//  6. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
-//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 4 层
+//  7. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 5 层
 //     短路，结果同为 soft_rate。
-//  7. 11115（IsPromptTooLong）—— 「prompt is too long」请求级语义：判在 404/5xx 与
+//  8. 11115（IsPromptTooLong）—— 「prompt is too long」请求级语义：判在 404/5xx 与
 //     通用 4xx 兜底之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限
 //     与账号无关）。只认 400/404/413（429/5xx 已在上方各自状态码层短路）。
-//  8. 11135（isInvalidImageData）—— 「invalid_image_data」请求级**终态**：判在
-//     404/5xx 与通用 4xx 兜底之前（与第 7 层同位置、同理由：图片数据无效是请求的
+//  9. 11135（isInvalidImageData）—— 「invalid_image_data」请求级**终态**：判在
+//     404/5xx 与通用 4xx 兜底之前（与第 8 层同位置、同理由：图片数据无效是请求的
 //     属性，与账号无关；落 ErrClient 兜底会喂连败计数并逐号轮转 → 一张坏图把整个
 //     账号池拖降权）。只认 400/404/413，词表复用 hint.go 的 isInvalidImageData。
-//  9. 404 / 5xx —— 与限流无关的常规分类。
-//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：WAF 拦截形态
+//  10. 404 / 5xx —— 与限流无关的常规分类。
+//  11. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：WAF 拦截形态
 //     （WAF 403 修复 P0-1）。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient →
-//     applyErrorPolicy 只换号不罚 → 连环 403。带业务信封的 403 已被上方 1-6 层
+//     applyErrorPolicy 只换号不罚 → 连环 403。带业务信封的 403 已被上方 1-7 层
 //     捕获（11140 request illegal → ErrAccountFault 禁用语义不变），走不到本层。
 //     插在 404/5xx 之后是「只加不重排」：404/5xx 层只认各自状态码，403 不与之
 //     相交，插入点不改变任何既有分类结果。
-//  11. 内容策略/参数错误/其他 4xx —— 通用兜底（内容策略拦截须先于通用 ErrClient，
+//  12. 内容策略/参数错误/其他 4xx —— 通用兜底（内容策略拦截须先于通用 ErrClient，
 //     前者是误报信号、不罚账号，由网关降级重试处理）。11133 model_param_invalid
 //     在参数层归 ErrBadParams（不罚号但仍轮转，理由见该层注释）。
 func Classify(status int, body string) ErrKind {
@@ -586,6 +626,18 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault
 		}
+	}
+	// status==429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（吸收上游
+	// d47219b，issue #175）：上游把积分耗尽也用 429 + 业务码表达。若不先判，会落
+	// 下方通用 429 兜底成软限流——软冷却自愈不了真耗尽，全池冷却时的兜底选号会
+	// 反复选中它白打请求。
+	//
+	// 只认结构化 code（hasBusinessCode），不猜文案：429 body 高频携带
+	// "quota exceeded"/"额度不足" 这类跨计费/限流两界的措辞，按文案判会把限流号
+	// 硬冷却到次日 04:00（白扔 12h）；无该码的 "credits exhausted" 文案仍保持
+	// 普通 429 的软限流语义（fork-scan-absorb T-3 的既有裁定，见下方注释）。
+	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
+		return ErrHardCredit
 	}
 	// status==429 先于 hardMarkers（fork-scan-absorb T-3，本次修复点）：限流响应 body
 	// 高频携带 "quota exceeded"/"额度不足" 等跨两界措辞，hardMarkers 先判会误归
@@ -942,29 +994,27 @@ func (c *Client) globalOn(a *auth.Auth) bool {
 	return c.GlobalEnabled && a != nil && a.Realm() == "global"
 }
 
-// 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
-const (
-	chatCompletionsPath   = "/v2/chat/completions"
-	globalChatConsolePath = "/console/chat/completions"
-)
+// chatCompletionsPath CN 与 global 共用的 chat 出站路径（/v2 单路径，吸收上游 03ce06d
+// 的 #119 项）。
+const chatCompletionsPath = "/v2/chat/completions"
 
-// chatPaths 按 realm 返回 chat 端点路径候选序列：
-// global → [v2, console]（v2 优先，404/405 时 fallback）；cn → [v2]（现状逐字，零回归）。
+// chatPaths 返回按 realm 的 chat 路径候选序列（两域都是 /v2 单元素）。
 //
-// 2026-09-17 实测修正：/console 通道对请求内容更敏感——同一 body 直连 /console
-// 返回 403 WAF Block Page、/v2 返回 200（触发为历史文本的累计安全评分，与体积无关，
-// 4KB 触发段在 /console 稳定 403、在 /v2 稳定 200）。私人构建（fb07cc9）与 intl
-// 项目均直接走 /v2。原 [console, v2] 顺序来自 PLAN R9，实测会误伤长历史对话
-// （ZCode 会话历史含安全术语时 console 首路径必 403 → 单账号池 503）。
-// 改为 v2 优先后，console 仅作 v2 404/405 的兼容兜底（上游新旧路径分叉场景）。
+// global 为何收敛成单路径（吸收上游 03ce06d 的 #119 项 + 本仓 2026-09-17 实测）：
+// /console 挂腾讯云 WAF body 内容规则（命令执行特征确定性 403），/v2 同 base 不挂该
+// 规则、实测等价端点。同一 body 直连 /console 返回 403 WAF Block Page、/v2 返回 200
+// （触发为历史文本的累计安全评分，与体积无关）。原 [console, v2] 顺序来自 PLAN R9，
+// 实测会误伤长历史对话（ZCode 会话历史含安全术语时 console 首路径必 403 → 单账号池 503）。
+//
+// 兜底为什么也去掉（本仓新增理由）：保留 console 作 404/405 兜底会把**路径级 404**
+// 升级成**账号级惩罚**——/v2 若 404，同请求改打 /console，后者对命令执行特征文案
+// 确定性 403 WAF → Classify 归 ErrWafBlock → 健康账号被软冷却 + 抖动退避。兜底不仅
+// 大概率救不回来（console 本身 WAF 敏感），还会为一个「上游路径变了」的事实惩罚无辜
+// 账号。已知取舍：若上游未来关闭 /v2，global chat 整体不可用——届时应重新启用
+// /console 路径，本注释即"坏了再说"的锚点。
 func (c *Client) chatPaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{chatCompletionsPath, globalChatConsolePath}
-	}
 	return []string{chatCompletionsPath}
 }
-
-func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
 
 // billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
 // 统一走 billingJSON 发请求。
@@ -1234,10 +1284,12 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // handler 传 r.Context() → 客户端断开时上游请求随之取消（不再白白消耗账号积分
 // 与上游连接继续生成无人消费的流）。成功流的 cancel 仍由 monitorBody 的 Close
 // 接管（reqCtx 取消与显式 Close 任一触发即断）。
-// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
-// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11128）。
+// global chat 自 #119 实测后固定走 /v2（chat 层无 fallback 链；billing 层的 404
+// fallback 独立存在，语义不受影响）。ensureConsoleSystem 在 prepareBody 后统一套用
+// 全局脚本：首条消息非 system 时前置兜底 system（防上游 code 11128；#119 后 global
+// 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测反证，删了无回滚路径）。
 //
-// 错误路径（≥400 且非 fallback 状态码）除 (status, respBody) 外还返回**已分类的**
+// 错误路径（≥400）除 (status, respBody) 外还返回**已分类的**
 // *Error（Kind 信封 + Retry-After 头解析，WAF 403 修复 P0-1/P1-2）：客户端错误
 // 分类在此一次完成，handler 不再对 body 二次 Classify（消除「上游分类一次、
 // 网关再分类一次」的双路径漂移面），Retry-After 也随信封流动。respBody 仍原样
@@ -1247,7 +1299,6 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// global 首次路径 404/405 时换 fallback 路径重试。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
@@ -1255,7 +1306,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
-	for attempt, path := range c.chatPaths(a) {
+	for _, path := range c.chatPaths(a) {
 		endpoint := c.chatBase(a) + path
 		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
 		if err != nil {
@@ -1289,10 +1340,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 				a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
-			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
-			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
-				continue
-			}
+			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
 			if kind == ErrNone {
@@ -1351,11 +1399,25 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 }
 
 // codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA。
-// CLI 三段式 WorkBuddy UA 会拿到精简目录（flash 输出 128K、无 supportedEfforts）；
-// 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 才返回完整能力
-// （flash：393216 + low/high/max）。
-// 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
+// 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0`。
+// 版本号需随上游 IDE 发版跟进：UA 版本过旧时该端点可能同样返回精简目录。
+//
+// 注意（上游 9dce68a 实测修正，勿再按旧注释推断）：旧注释称「CLI UA 拿到精简目录、
+// IDE UA 才返回完整能力」——实测**模型数量恰好相反**（IDE 14 条 / CLI 22 条，CLI 路
+// 多出 deepseek 系列等），但 IDE 响应体积更大（26003B vs 21111B），故「完整能力」
+// 应理解为**单条字段更全**，而非模型更多。两路各有独有模型，缺一不可——见
+// codeBuddyCLIUA 与 probeGlobalV3Capabilities。
 const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
+
+// codeBuddyCLIUA CLI 三段式 UA（吸收上游 9dce68a）。**实测（2026-09-22）该端点对
+// 不同 UA 下发的模型集合不同**：
+//   - IDE UA  → 14 条（含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**）
+//   - CLI UA  → 22 条（**含 deepseek-v4.1-flash / deepseek-v4.1-flash-sg /
+//     gpt-6-astra / kimi-k2.8-preview**，但无 o4-mini / enhance-1.0 / auto-chat）
+//
+// 该常量仅用于 global 侧第二路探测（probeGlobalV3Capabilities）；CN 侧仍走
+// codeBuddyIDEUA 单路（CN 目录主源是企业端点，v3 只作能力覆盖，换 UA 无收益）。
+const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 // modelsPaths 按 realm 返回模型目录端点候选序列（按序尝试，首个成功即采用）。
 //
@@ -1563,7 +1625,9 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 			diag.Dropped = append(diag.Dropped, id)
 		}
 	}
-	if overlay, err := c.fetchV3ConfigModelMap(a); err == nil && len(overlay) > 0 {
+	// CN 侧固定 IDE UA 单路（吸收上游 9dce68a：CN 目录主源是企业端点，v3 只作能力
+	// 覆盖，换 UA 无收益；global 侧的双 UA 并集在 probeGlobalV3Capabilities）。
+	if overlay, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA); err == nil && len(overlay) > 0 {
 		out = mergeModelCapabilities(out, overlay)
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
@@ -1610,9 +1674,13 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	return "copilot.tencent.com"
 }
 
-// fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
-// 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
-func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, error) {
+// fetchV3ConfigModelMap 拉官方配置目录，按模型 id 建能力表（吸收上游 b498416 +
+// 9dce68a）。该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403；
+// 且**不同 UA 下发不同模型集合**（见 codeBuddyCLIUA 注释）——global 探测据此并发
+// 两路取并集（probeGlobalV3Capabilities），CN 侧仍传 codeBuddyIDEUA 单路。
+//
+// ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。
+func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
 		return nil, err
@@ -1625,7 +1693,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 	}
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("User-Agent", codeBuddyIDEUA)
+	if ua == "" {
+		ua = codeBuddyIDEUA // 空串兜底（既有调用点语义不变）
+	}
+	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -1655,6 +1726,19 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 					SupportedEfforts   []string `json:"supportedEfforts"`
 				} `json:"reasoning"`
 			} `json:"models"`
+			// 试用模型横幅（吸收上游 b498416）：上游把「N 天免费试用」的模型**只**放在
+			// 这里，不在 data.models 中——纯目录解析会漏掉，客户端选不到（该模型实际
+			// 可调用）。实测 global 侧 hy4-preview-f 即如此：
+			//   {"firstUseTimeKey":"hy4.first_user_time","modelId":"hy4-preview-f",
+			//    "targetModelId":"hy4-preview","trialDays":14}
+			ProductFeaturesConfig struct {
+				ModelTrialBanner struct {
+					Banners []struct {
+						ModelID       string `json:"modelId"`
+						TargetModelID string `json:"targetModelId"`
+					} `json:"banners"`
+				} `json:"ModelTrialBanner"`
+			} `json:"productFeaturesConfig"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -1685,6 +1769,34 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 			SupportsImages:     m.SupportsImages,
 			Credits:            m.Credits,
 		}
+	}
+	// 补入试用横幅模型（ModelTrialBanner，吸收上游 b498416）：上游把「N 天免费试用」
+	// 的模型只放在这里，data.models 里没有，故纯目录解析会漏（实测 global 侧
+	// hy4-preview-f 即如此，但该模型**实际可调用**）。
+	//
+	// 元数据口径：能力字段（context/maxTokens/efforts/reasoning 等）从 targetModelId
+	// 的既有条目继承——试用版与其转正目标是同族模型，能力应当一致；
+	// 但 **Credits 与 Tags 显式清空**——它们描述的是"转正后"的计费与营销信息
+	// （如 hy4-preview 的 x0.29 与 badge），用在免费试用版上会误导下游展示。
+	//
+	// firstUseTimeKey / trialDays 属**账号级**试用状态，不透出给下游。
+	for _, b := range env.Data.ProductFeaturesConfig.ModelTrialBanner.Banners {
+		id := strings.TrimSpace(b.ModelID)
+		if id == "" {
+			continue
+		}
+		if _, exists := out[id]; exists {
+			continue
+		}
+		mi := ModelInfo{ID: id}
+		if tgt := strings.TrimSpace(b.TargetModelID); tgt != "" {
+			if base, ok := out[tgt]; ok {
+				mi = base
+				mi.ID = id
+			}
+		}
+		mi.Credits = ""
+		out[id] = mi
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("v3/config returned empty models")

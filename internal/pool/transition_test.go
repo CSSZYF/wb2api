@@ -162,9 +162,12 @@ func TestTransitionReviveClearsCoolingAndBreaker(t *testing.T) {
 	}
 }
 
-// TestTransitionReenableOnlyHardCooling issue #199 语义收窄的迁移边界：
-// 余额刷新/签到（ReenableIfCredits）对**硬冷却**清冷却域、对**软冷却**只更新 credits；
-// 两者都不动熔断域（熔断只由到期/NoteSuccess 恢复）。
+// TestTransitionReenableOnlyHardCooling issue #199 + 602ed1b 的迁移边界：
+// 余额刷新/签到（ReenableIfCredits）对**硬冷却**只解冻 CoolHard 三字段
+// （until/coolKind/reason）、对**软冷却**只更新 credits；两者都不动熔断域
+// （熔断只由到期/NoteSuccess 恢复）。硬冷却解冻也**不再**顺带清 softStreak 与
+// modelCooldowns（吸收上游 602ed1b：余额恢复不是限流解除的证据，见
+// revive_hardonly_test.go）。
 func TestTransitionReenableOnlyHardCooling(t *testing.T) {
 	// 硬冷却：解冻（余额恢复正是硬冷却的恢复条件）。
 	pHard := New("")
@@ -174,10 +177,13 @@ func TestTransitionReenableOnlyHardCooling(t *testing.T) {
 	pHard.NoteError("u1")
 	pHard.ReenableIfCredits("u1", 700, 0)
 	until, kind, reason, streak, mc := coolingDomain(t, pHard, "u1")
-	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
-		t.Errorf("硬冷却应被余额恢复解冻：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
-			until, kind, reason, streak, mc)
+	if !until.IsZero() || kind != 0 || reason != "" {
+		t.Errorf("硬冷却应被余额恢复解冻：until=%v kind=%v reason=%q", until, kind, reason)
 	}
+	// 本场景 streak/mc 恒 0（未触发过软限流）；非零形态的保留语义由
+	// TestReviveHardOnlyKeepsSoftStreak / KeepsModelCooldowns 锁定。
+	_ = streak
+	_ = mc
 	if st, _ := pHard.Status("u1"); st.Credits != 700 {
 		t.Errorf("credits=%d want 700", st.Credits)
 	}

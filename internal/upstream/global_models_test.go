@@ -3,6 +3,8 @@ package upstream
 import (
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,14 +16,41 @@ func globalAuth() *auth.Auth {
 	return &auth.Auth{UID: "g1", AccessToken: "tok", Domain: "www.workbuddy.ai"}
 }
 
+// callCounter 并发安全的出站计数。global 目录探测自 9dce68a 起**并发两路**
+// /v3/config（IDE UA + CLI UA 取并集），测试 fake transport 里的裸 `*int++`
+// 在 -race 下构成数据竞争（与上游 73fe1f8 顺手修的 handler_test 裸 calls++ 同形态）。
+type callCounter struct{ n atomic.Int64 }
+
+// Load 返回当前计数（并发安全，替代裸 `calls.Load()`）。
+func (c *callCounter) Load() int { return int(c.n.Load()) }
+
+// pathRecorder 并发安全的请求路径记录（同因：两路并发探测下裸 append 不安全）。
+type pathRecorder struct {
+	mu    sync.Mutex
+	paths []string
+}
+
+func (r *pathRecorder) add(p string) {
+	r.mu.Lock()
+	r.paths = append(r.paths, p)
+	r.mu.Unlock()
+}
+
+// all 返回路径快照（拷贝，调用方可安全遍历）。
+func (r *pathRecorder) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.paths...)
+}
+
 // globalTestClient 起一个 fake transport 的 Client，global base 指向假上游。
 // behavior 按 path 返回 (status, body)。
-func globalTestClient(t *testing.T, behavior func(path string) (int, string)) (*Client, *int) {
+func globalTestClient(t *testing.T, behavior func(path string) (int, string)) (*Client, *callCounter) {
 	t.Helper()
-	calls := new(int)
+	calls := new(callCounter)
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			*calls++
+			calls.n.Add(1)
 			status, body := behavior(r.URL.Path)
 			return jsonResp(status, body), nil
 		})},
@@ -162,14 +191,14 @@ func TestFetchGlobalModelInfosFallsBackToStaticOnFailure(t *testing.T) {
 			t.Errorf("失败回落不应有元数据：%+v", mi)
 		}
 	}
-	first := *calls
+	first := calls.Load()
 	if first == 0 {
 		t.Fatal("首次探测应打上游")
 	}
 	// 负缓存：第二次零上游调用。
 	_ = c.FetchGlobalModelInfos(globalAuth())
-	if *calls != first {
-		t.Errorf("负缓存期内不应再打上游：calls %d → %d", first, *calls)
+	if calls.Load() != first {
+		t.Errorf("负缓存期内不应再打上游：calls %d → %d", first, calls.Load())
 	}
 }
 
@@ -232,22 +261,23 @@ func TestFetchGlobalModelInfosRespectsGlobalGate(t *testing.T) {
 	if len(infos) != len(GlobalModelNames) {
 		t.Fatalf("逃生门兜底条目数=%d want %d", len(infos), len(GlobalModelNames))
 	}
-	if *calls != 0 {
-		t.Errorf("逃生门关闭时上游调用=%d want 0", *calls)
+	if calls.Load() != 0 {
+		t.Errorf("逃生门关闭时上游调用=%d want 0", calls.Load())
 	}
 }
 
 // TestFetchGlobalModelInfosV2PreferredV2 优先：/v2 命中即止（不碰 /console）。
 func TestFetchGlobalModelInfosV2Preferred(t *testing.T) {
-	var paths []string
+	var rec pathRecorder
 	c, _ := globalTestClient(t, func(path string) (int, string) {
-		paths = append(paths, path)
+		rec.add(path)
 		if path == "/v2/enterprises/personal/models" {
 			return 200, `{"code":0,"data":{"models":[{"id":"gpt-5.4","maxInputTokens":262144}]}}`
 		}
 		return 500, "<html>500</html>"
 	})
 	_ = c.FetchGlobalModelInfos(globalAuth())
+	paths := rec.all()
 	if len(paths) == 0 || paths[0] != "/v2/enterprises/personal/models" {
 		t.Errorf("首个探测路径=%v want /v2 家族优先", paths)
 	}
@@ -265,18 +295,18 @@ func TestFetchGlobalModelInfosTTLCache(t *testing.T) {
 	})
 	a := globalAuth()
 	_ = c.FetchGlobalModelInfos(a)
-	first := *calls
+	first := calls.Load()
 	_ = c.FetchGlobalModelInfos(a)
-	if *calls != first {
-		t.Errorf("TTL 内不应重复探测：calls %d → %d", first, *calls)
+	if calls.Load() != first {
+		t.Errorf("TTL 内不应重复探测：calls %d → %d", first, calls.Load())
 	}
 	// 把成功时间戳拨到 2h 前 → 重新探测。
 	c.globalModels.Lock()
 	c.globalModels.fetched = time.Now().Add(-2 * time.Hour)
 	c.globalModels.Unlock()
 	_ = c.FetchGlobalModelInfos(a)
-	if *calls <= first {
-		t.Errorf("TTL 过期后应重新探测：calls %d → %d", first, *calls)
+	if calls.Load() <= first {
+		t.Errorf("TTL 过期后应重新探测：calls %d → %d", first, calls.Load())
 	}
 }
 
@@ -333,8 +363,8 @@ func TestGlobalModelCreditsSnapshot(t *testing.T) {
 	if got := c.GlobalModelInfosSnapshot(); got != nil {
 		t.Fatalf("冷快照 = %+v, want nil", got)
 	}
-	if *calls != 0 {
-		t.Fatalf("冷快照发起 %d 次上游请求，want 0（绝不探测）", *calls)
+	if calls.Load() != 0 {
+		t.Fatalf("冷快照发起 %d 次上游请求，want 0（绝不探测）", calls.Load())
 	}
 
 	// (b) 预热：Fetch 返回值**无倍率**（D2），快照**有倍率**（展示口径）。
@@ -372,7 +402,7 @@ func TestGlobalModelCreditsSnapshot(t *testing.T) {
 	if mi, ok := snapByID["deepseek-v4.1-flash"]; ok && mi.Credits != "" {
 		t.Errorf("静态独有条目 Credits=%q want 空（上游没给，不编造）", mi.Credits)
 	}
-	warm := *calls
+	warm := calls.Load()
 
 	// (c) 只读：反复读快照零新增请求。
 	for i := 0; i < 5; i++ {
@@ -380,8 +410,8 @@ func TestGlobalModelCreditsSnapshot(t *testing.T) {
 			t.Fatalf("快照读取 #%d = %+v, want 缓存条目（含倍率）", i, got)
 		}
 	}
-	if *calls != warm {
-		t.Errorf("快照读取新增 %d 次上游请求，want 0（只读）", *calls-warm)
+	if calls.Load() != warm {
+		t.Errorf("快照读取新增 %d 次上游请求，want 0（只读）", calls.Load()-warm)
 	}
 }
 
@@ -398,7 +428,7 @@ func TestGlobalModelInfosSnapshotTTL(t *testing.T) {
 	if got := snapshotCreditOf(c.GlobalModelInfosSnapshot(), "hy3"); got != "x0.05" {
 		t.Fatalf("预热后快照 hy3 Credits=%q, want x0.05", got)
 	}
-	warm := *calls
+	warm := calls.Load()
 
 	// 把落缓存时间拨到 TTL 之外。
 	c.globalModels.Lock()
@@ -408,8 +438,8 @@ func TestGlobalModelInfosSnapshotTTL(t *testing.T) {
 	if got := c.GlobalModelInfosSnapshot(); got != nil {
 		t.Errorf("TTL 过期快照 = %+v, want nil", got)
 	}
-	if *calls != warm {
-		t.Errorf("过期快照读取新增 %d 次上游请求，want 0（不因读取而刷新）", *calls-warm)
+	if calls.Load() != warm {
+		t.Errorf("过期快照读取新增 %d 次上游请求，want 0（不因读取而刷新）", calls.Load()-warm)
 	}
 }
 

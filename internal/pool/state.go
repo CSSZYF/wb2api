@@ -259,8 +259,9 @@ func (p *Pool) NoteError(uid string) {
 // 连败降权（issue #114）同样按「成功是恢复的最强证据」清零：consecutiveFails 归零、
 // degradeUntil 清空——成功即回池，不等降权到期（与 NoteSuccess 清 breakerUntil 同口径）。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
-// 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
-// 冷却（Cooldown/reviveCoolingLocked）清除；另有两条**同模型**的提前解冻路径：
+// 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/人工 Revive/
+// 账号级冷却（Cooldown）清除（reviveCoolingLocked 自 602ed1b 起不再清台账——余额
+// 恢复不构成限流解除证据）；另有两条**同模型**的提前解冻路径：
 // 11102 条目由 handler 成功路径的 BlockModelClear 清，任意条目由面板「测试」成功
 // 触发的 ClearModelCooldown 清（都是"该模型刚被证明可用"，不属本函数职责）。
 func (p *Pool) NoteSuccess(uid string) {

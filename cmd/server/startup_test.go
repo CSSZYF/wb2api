@@ -137,6 +137,14 @@ func TestStartupListenSuccessLogsAfterBind(t *testing.T) {
 	if !strings.Contains(got, "入站请求体读取窗口") {
 		t.Errorf("成功路径应打入站读窗口日志:\n%s", got)
 	}
+	// 请求体上限描述必须按当前配置渲染（吸收上游 73fe1f8 后默认 0 = 不预拦截）：
+	// 旧日志恒打「请求体上限 32MB」，默认改为不预拦截后那句话会误导排障。
+	if !strings.Contains(got, bodyLimitDesc(32)) {
+		t.Errorf("启动日志应含请求体上限描述 %q:\n%s", bodyLimitDesc(32), got)
+	}
+	if strings.Contains(got, "请求体上限 0MB") {
+		t.Errorf("0 不应渲染成「0MB」（应为「不预拦截」）:\n%s", got)
+	}
 	// listener 确实在监听：起一个真实 http.Server 并完成一次请求。
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
