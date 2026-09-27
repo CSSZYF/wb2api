@@ -77,9 +77,11 @@ func TestFetchGlobalModelInfosParsesMetadata(t *testing.T) {
 	if len(m.Efforts) != 2 || m.Efforts[0] != "low" {
 		t.Errorf("gpt-5.4 Efforts=%v want [low high]", m.Efforts)
 	}
-	// credits 必须被丢弃：探测端点返回了 x1.00 也不进 global 路径。
+	// credits 不进**路由/列表口径**（PLAN §3.D2）：FetchGlobalModelInfos 的返回值里
+	// 必须为空——它服务 /v1/models 与选号。探测端点返回的 x1.00 只落缓存旁表，
+	// 由 GlobalModelInfosSnapshot（展示出口）填回，见 TestGlobalModelCreditsSnapshot。
 	if m.Credits != "" {
-		t.Errorf("gpt-5.4 Credits=%q want 空（倍率不进 global 路径）", m.Credits)
+		t.Errorf("gpt-5.4 Credits=%q want 空（倍率不进 Fetch/路由口径）", m.Credits)
 	}
 	// 老键 reasoning.effort 兼容。
 	if got := byID["old-key-model"].DefaultEffort; got != "medium" {
@@ -304,4 +306,171 @@ func idsOf(infos []ModelInfo) []string {
 		out = append(out, mi.ID)
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// GlobalModelInfosSnapshot 只读快照 + 倍率旁表（对齐 sliver 1dfe750）
+// ---------------------------------------------------------------------------
+
+// TestGlobalModelCreditsSnapshot 只读快照的三个契约（issue #176）：
+//   - (a) 冷客户端（从未探测）→ nil，且**零上游请求**（绝不主动探测）；
+//   - (b) 一次 FetchGlobalModelInfos 预热 → 快照返回同一批条目**且带倍率原文**，
+//     而 Fetch 的返回值里倍率恒为空（D2：倍率不进路由/列表口径）；
+//   - (c) 预热后反复读快照 → 上游请求计数不变（只读）。
+func TestGlobalModelCreditsSnapshot(t *testing.T) {
+	c, calls := globalTestClient(t, func(path string) (int, string) {
+		if path != "/v2/enterprises/personal/models" {
+			return 500, "<html>500</html>"
+		}
+		return 200, `{"code":0,"data":{"models":[
+			{"id":"hy3","name":"Hy3","maxInputTokens":192000,"credits":"x0.05"},
+			{"id":"no-credits","name":"No Credits","maxInputTokens":128000},
+			{"id":"disabled-model","credits":"x9.99","disabled":true}
+		]}}`
+	})
+
+	// (a) 冷：快照 nil，零上游请求。
+	if got := c.GlobalModelInfosSnapshot(); got != nil {
+		t.Fatalf("冷快照 = %+v, want nil", got)
+	}
+	if *calls != 0 {
+		t.Fatalf("冷快照发起 %d 次上游请求，want 0（绝不探测）", *calls)
+	}
+
+	// (b) 预热：Fetch 返回值**无倍率**（D2），快照**有倍率**（展示口径）。
+	infos := c.FetchGlobalModelInfos(globalAuth())
+	fetchByID := make(map[string]ModelInfo, len(infos))
+	for _, mi := range infos {
+		fetchByID[mi.ID] = mi
+	}
+	if got := fetchByID["hy3"].Credits; got != "" {
+		t.Errorf("FetchGlobalModelInfos 的 hy3 Credits=%q want 空（倍率不进路由/列表口径）", got)
+	}
+
+	snap := c.GlobalModelInfosSnapshot()
+	snapByID := make(map[string]ModelInfo, len(snap))
+	for _, mi := range snap {
+		snapByID[mi.ID] = mi
+	}
+	if got := snapByID["hy3"].Credits; got != "x0.05" {
+		t.Errorf("快照的 hy3 Credits=%q want x0.05（展示口径透出倍率原文）", got)
+	}
+	// 元数据必须与 Fetch 一致（快照只是倍率增强，不改其他字段）。
+	if snapByID["hy3"].ContextWindow != fetchByID["hy3"].ContextWindow ||
+		snapByID["hy3"].MaxTokens != fetchByID["hy3"].MaxTokens {
+		t.Errorf("快照元数据与 Fetch 不一致：snap=%+v fetch=%+v", snapByID["hy3"], fetchByID["hy3"])
+	}
+	// 未下发倍率的条目：快照里也是空串（**缺失 ≠ 免费**，调用方据此整体省略）。
+	if got := snapByID["no-credits"].Credits; got != "" {
+		t.Errorf("未下发倍率的条目 Credits=%q want 空串（缺失≠免费，不得编造 x0.00）", got)
+	}
+	// disabled 条目两侧都不出现。
+	if _, ok := snapByID["disabled-model"]; ok {
+		t.Error("disabled 条目不应进快照")
+	}
+	// 静态独有条目（上游未返回）无倍率——不得从别处借一个值过来。
+	if mi, ok := snapByID["deepseek-v4.1-flash"]; ok && mi.Credits != "" {
+		t.Errorf("静态独有条目 Credits=%q want 空（上游没给，不编造）", mi.Credits)
+	}
+	warm := *calls
+
+	// (c) 只读：反复读快照零新增请求。
+	for i := 0; i < 5; i++ {
+		if got := c.GlobalModelInfosSnapshot(); len(got) == 0 || got[0].Credits == "" {
+			t.Fatalf("快照读取 #%d = %+v, want 缓存条目（含倍率）", i, got)
+		}
+	}
+	if *calls != warm {
+		t.Errorf("快照读取新增 %d 次上游请求，want 0（只读）", *calls-warm)
+	}
+}
+
+// TestGlobalModelInfosSnapshotTTL TTL 过期视同冷：快照返回 nil，且**不因读取而刷新**
+// （与 FetchGlobalModelInfos 的 miss-即-探测相反）。
+func TestGlobalModelInfosSnapshotTTL(t *testing.T) {
+	c, calls := globalTestClient(t, func(path string) (int, string) {
+		if path != "/v2/enterprises/personal/models" {
+			return 500, "<html>500</html>"
+		}
+		return 200, `{"code":0,"data":{"models":[{"id":"hy3","credits":"x0.05"}]}}`
+	})
+	c.FetchGlobalModelInfos(globalAuth())
+	if got := snapshotCreditOf(c.GlobalModelInfosSnapshot(), "hy3"); got != "x0.05" {
+		t.Fatalf("预热后快照 hy3 Credits=%q, want x0.05", got)
+	}
+	warm := *calls
+
+	// 把落缓存时间拨到 TTL 之外。
+	c.globalModels.Lock()
+	c.globalModels.fetched = time.Now().Add(-2 * globalModelsTTL)
+	c.globalModels.Unlock()
+
+	if got := c.GlobalModelInfosSnapshot(); got != nil {
+		t.Errorf("TTL 过期快照 = %+v, want nil", got)
+	}
+	if *calls != warm {
+		t.Errorf("过期快照读取新增 %d 次上游请求，want 0（不因读取而刷新）", *calls-warm)
+	}
+}
+
+// TestGlobalModelCreditsSnapshotClearedOnProbeFailure 探测失败时倍率旁表必须一并清空：
+// 留下上一轮倍率会让 /v1/stats 展示与当前目录脱节的过期数字。
+func TestGlobalModelCreditsSnapshotClearedOnProbeFailure(t *testing.T) {
+	fail := false
+	c, _ := globalTestClient(t, func(path string) (int, string) {
+		if fail {
+			return 500, "<html>500</html>"
+		}
+		if path != "/v2/enterprises/personal/models" {
+			return 500, "<html>500</html>"
+		}
+		return 200, `{"code":0,"data":{"models":[{"id":"hy3","credits":"x0.05"}]}}`
+	})
+	c.FetchGlobalModelInfos(globalAuth())
+	if got := snapshotCreditOf(c.GlobalModelInfosSnapshot(), "hy3"); got != "x0.05" {
+		t.Fatalf("预热后快照 hy3 Credits=%q, want x0.05", got)
+	}
+
+	// 让缓存过期 + 探测失败（负缓存路径），快照必须为 nil（旁表已清）。
+	fail = true
+	c.globalModels.Lock()
+	c.globalModels.fetched = time.Now().Add(-2 * globalModelsTTL)
+	c.globalModels.Unlock()
+	c.FetchGlobalModelInfos(globalAuth())
+
+	if got := c.GlobalModelInfosSnapshot(); got != nil {
+		t.Errorf("探测失败后快照 = %+v, want nil（倍率旁表须随 models 一起清空）", got)
+	}
+}
+
+// TestGlobalModelInfosSnapshotDoesNotMutateCache 快照填回的倍率不得污染缓存本体：
+// 缓存里的 models 恒无倍率，否则第二次 Fetch 就会把倍率带进路由/列表口径。
+func TestGlobalModelInfosSnapshotDoesNotMutateCache(t *testing.T) {
+	c, _ := globalTestClient(t, func(path string) (int, string) {
+		if path != "/v2/enterprises/personal/models" {
+			return 500, "<html>500</html>"
+		}
+		return 200, `{"code":0,"data":{"models":[{"id":"hy3","credits":"x0.05"}]}}`
+	})
+	c.FetchGlobalModelInfos(globalAuth())
+	_ = c.GlobalModelInfosSnapshot() // 读一次快照（若实现是原地填字段，这里就污染了缓存）
+
+	// 再读缓存本体（Fetch 命中缓存路径）与快照，倍率必须仍然只在快照侧。
+	again := c.FetchGlobalModelInfos(globalAuth())
+	if got := snapshotCreditOf(again, "hy3"); got != "" {
+		t.Errorf("Fetch 第二次 hy3 Credits=%q want 空（快照不得污染缓存本体）", got)
+	}
+	if got := snapshotCreditOf(c.GlobalModelInfosSnapshot(), "hy3"); got != "x0.05" {
+		t.Errorf("快照 hy3 Credits=%q want x0.05", got)
+	}
+}
+
+// snapshotCreditOf 取条目列表里指定 id 的倍率原文（诊断用）。
+func snapshotCreditOf(infos []ModelInfo, id string) string {
+	for _, mi := range infos {
+		if mi.ID == id {
+			return mi.Credits
+		}
+	}
+	return ""
 }

@@ -20,6 +20,14 @@
 //   - **字段名逐字对齐上游 schema**（见 internal/usage/stats.go 的 StatsModel），
 //     消费方按上游约定解析即可，无需为本仓特判。
 //
+//   - **倍率只读合入，缺失即省略**（对齐 sliver 5009a1f + 1dfe750）：出口处把上游
+//     积分倍率原文合进各模型行（enrichStatsCredits），数据源是**模型目录的只读快照**
+//     （CN 侧 cachedModelsSnapshot / global 侧 GlobalModelInfosSnapshot），本端点
+//     依旧零上游调用。目录未下发 / 缓存冷 / 查不到条目 → credits 字段整体省略
+//     （omitempty），**缺失 ≠ 免费**：未知倍率不得显示成 "x0.00" 或 0。
+//     注意与 credit / credit_per_req 的区别：那两个是**真实扣费观测**（上游 usage），
+//     本字段是目录**牌价**，语义不同、不可互相换算。
+//
 //   - 鉴权与其余 /v1/* 同口径（Bearer，api_key 为空则放行）。
 //
 // 与上游的口径差异（实现时逐条确认，写在这里便于对账）：
@@ -34,6 +42,9 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // statsDefaultHours 缺省窗口：0 = 不限（全量累计，与上游 /v1/stats 同口径）。
@@ -63,5 +74,58 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	// 不必为「未启用」单独写解析分支，也不会把 404 误读成「旧版网关不支持该端点」。
 	snap := h.cfg.Usage.Stats(hours)
 	snap.Now = time.Now()
+	h.enrichStatsCredits(&snap)
 	writeJSON(w, http.StatusOK, snap)
+}
+
+// enrichStatsCredits 把上游积分倍率原文合入 /v1/stats 的各模型行（展示侧增强）。
+//
+// 数据源与 /v1/models 同源：CN 侧 cachedModelsSnapshot / global 侧
+// upstream.GlobalModelInfosSnapshot，两者都是**只读快照**——缓存冷 / 过期 → nil，
+// 本函数**绝不发起上游请求**（/v1/stats 被面板高频轮询，任何上游调用都会变成对
+// 上游的额外压力；与 cachedModelsSnapshot 的只读纪律同款）。
+//
+// 键归一：桶里的模型键是**请求体 model 原文**（可能带 "cn:"/"global:" 前缀），
+// 目录 id 是裸名——故经 h.router.Resolve 一次拿到 (realm, 裸名)，保证与路由口径
+// 完全一致（同一模型名不会出现"路由走 global、倍率查 CN"的错配）。裸名含非法前缀
+// （"weird:hy3"）时 Resolve 原样返回，查目录必然落空 → 省略，不做额外猜测。
+//
+// 纪律：**缺失 ≠ 免费**。目录没下发该模型 / 该条目倍率为空 / 缓存冷 → 字段保持空串，
+// 由 StatsModel 的 omitempty 让 JSON **整体省略 credits 键**。绝不回填 "x0.00" 或
+// 空串占位——把未知倍率显示成 0 会被读成"该模型免费"，据此做容量/成本决策就全错了。
+//
+// total 行不参与：跨倍率聚合无意义（不同模型的倍率不能相加或平均）。
+func (h *Handler) enrichStatsCredits(snap *usage.StatsSnapshot) {
+	if snap == nil {
+		return
+	}
+	cn := creditsByModel(cachedModelsSnapshot())
+	var global map[string]string
+	if h.cfg.Upstream != nil {
+		global = creditsByModel(h.cfg.Upstream.GlobalModelInfosSnapshot())
+	}
+	for i := range snap.Models {
+		realm, bare := h.router.Resolve(snap.Models[i].Model)
+		if bare == "" || bare == "-" {
+			continue // 空键 / 统计占位键不是模型名，不进目录查询
+		}
+		if realm == "global" {
+			snap.Models[i].Credits = global[bare]
+			continue
+		}
+		snap.Models[i].Credits = cn[bare]
+	}
+}
+
+// creditsByModel 把目录条目按裸 id 建"倍率原文"索引；倍率为空的条目不入表
+// （查不到即省略，而不是落一个空串进 map 让下游以为"查到了但没值"）。
+func creditsByModel(infos []upstream.ModelInfo) map[string]string {
+	out := make(map[string]string, len(infos))
+	for _, mi := range infos {
+		if mi.ID == "" || mi.Credits == "" {
+			continue
+		}
+		out[mi.ID] = mi.Credits
+	}
+	return out
 }
