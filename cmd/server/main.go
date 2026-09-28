@@ -25,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -299,9 +300,26 @@ func main() {
 	// 避免"面板看得见、客户端调不到"的两处投影漂移。
 	hiddenModels := upstream.ResolveHiddenModels(cfg.Models.HiddenModels)
 	pinnedModels := upstream.ResolvePinnedModels(cfg.Models.PinnedModels)
+	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
+	requestLog := reqlog.New(reqlog.Config{
+		Dir:           stateSibling(cfg.StateFile, "request-logs"),
+		Enabled:       cfg.Logging.RequestArchiveEnabled,
+		RetentionDays: cfg.Logging.RequestRetentionDays,
+		MaxBytes:      int64(cfg.Logging.RequestArchiveMaxMB) << 20,
+	})
+	defer requestLog.Close()
+	rs := requestLog.Snapshot().Archive
+	if rs.Enabled {
+		log.Printf("[reqlog] 请求指标已启用；JSONL 归档 %s（保留 %d 天，上限 %d MiB）",
+			rs.Dir, cfg.Logging.RequestRetentionDays, cfg.Logging.RequestArchiveMaxMB)
+	} else {
+		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
+	}
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
+		RequestLog:  requestLog,
 		Upstream:    up,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
@@ -341,6 +359,7 @@ func main() {
 		Panel:        pn,
 		Live:         live,
 		Usage:        rec,
+		RequestLog:   requestLog,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global 模型名。
@@ -743,6 +762,7 @@ func restartRequiredFields(c *Config) []string {
 	// gc_interval 保留：GC ticker 在 StartGC 时按当时值建立，热改需重建 goroutine
 	// （StopGC+StartGC 与在途 tick 有竞态），刻意不做，仍按重启项提示。
 	out = append(out, "session_sticky.gc_interval")
+	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	return out
 }
 

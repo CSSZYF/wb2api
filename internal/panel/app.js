@@ -956,7 +956,13 @@ async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   try {
-    const d = await api('logs');
+    const [d, metrics, requestRows] = await Promise.all([
+      api('logs'),
+      api('request_metrics').catch(() => ({})),
+      api('request_logs?limit=100').catch(() => ({ entries: [] })),
+    ]);
+    const recent = (requestRows.entries && requestRows.entries.length) ? requestRows.entries : (metrics.recent || []);
+    renderRequestMetrics(metrics, recent);
     const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
       ? entries.map(e => {
@@ -973,6 +979,48 @@ async function loadLogs() {
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
   } catch (e) { /* 概览已提示 */ }
+}
+
+function renderRequestMetrics(m, entries) {
+  m = m || {};
+  const a = m.archive || {};
+  $('reqStats').innerHTML =
+    usStat(fmtTok(m.completed), '已完成') +
+    usStat(m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%', '完成成功率') +
+    usStat(m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%', 'HTTP 成功率') +
+    usStat(fmtMs(m.avg_duration_ms), '平均耗时') +
+    usStat(String(m.in_flight || 0), '进行中') +
+    usStat(fmtTok(a.files), '归档文件');
+  $('reqNote').textContent = a.enabled
+    ? 'JSONL 归档 ' + fmtBytes(a.bytes) + (a.dropped_writes ? ' · 丢弃 ' + a.dropped_writes + ' 条' : '') +
+      (a.last_error ? ' · 错误：' + a.last_error : '')
+    : '仅内存指标，JSONL 归档已关闭';
+
+  const outcomeLabel = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' };
+  $('reqBody').innerHTML = (entries || []).map(e => {
+    const when = e.time ? new Date(e.time).toLocaleString('zh-CN', { hour12: false }) : '—';
+    const token = Number(e.total_tokens || 0) || (Number(e.prompt_tokens || 0) + Number(e.completion_tokens || 0));
+    const credit = e.credit_known ? fmtCredit(e.credit) : '—';
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td class="num">' + esc(when) + '</td>' +
+      '<td class="num">' + esc(e.request_id || '—') + '</td>' +
+      '<td>' + esc(e.account || '—') + '</td>' +
+      '<td>' + esc(e.model || '—') + '</td>' +
+      '<td class="num">' + esc(e.status || '—') + '</td>' +
+      '<td>' + esc(outcomeLabel[e.outcome] || e.outcome || '—') + '</td>' +
+      '<td class="num">' + fmtMs(e.duration_ms) + '</td>' +
+      '<td class="num">' + fmtTok(token) + '</td>' +
+      '<td class="num">' + credit + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="10" class="empty">暂无请求记录</td></tr>';
+}
+
+function fmtBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
 $('btnLogPin').onclick = () => {
   logPin = !logPin;

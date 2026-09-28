@@ -76,6 +76,15 @@ type Config struct {
 		ReadTimeoutSeconds int `json:"read_timeout_seconds"`
 	} `json:"server"`
 
+	Logging struct {
+		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
+		RequestArchiveEnabled bool `json:"request_archive_enabled"`
+		// RequestRetentionDays 归档保留天数，缺省 7；<=0 回落默认。
+		RequestRetentionDays int `json:"request_retention_days"`
+		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
+		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+	} `json:"logging"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
@@ -378,6 +387,9 @@ func Default() *Config {
 	// 值取自 server.DefaultReadTimeout（handler 侧兜底同一常量），避免"配置默认一个数、
 	// handler 兜底另一个数"的静默漂移。
 	c.Server.ReadTimeoutSeconds = int(server.DefaultReadTimeout / time.Second)
+	c.Logging.RequestArchiveEnabled = true
+	c.Logging.RequestRetentionDays = 7
+	c.Logging.RequestArchiveMaxMB = 100
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -708,6 +720,12 @@ func (c *Config) normalize() error {
 	// 回落值取 server.DefaultReadTimeout，与 handler 侧兜底同源。
 	if c.Server.ReadTimeoutSeconds <= 0 {
 		c.Server.ReadTimeoutSeconds = int(server.DefaultReadTimeout / time.Second)
+	}
+	if c.Logging.RequestRetentionDays <= 0 {
+		c.Logging.RequestRetentionDays = 7
+	}
+	if c.Logging.RequestArchiveMaxMB <= 0 {
+		c.Logging.RequestArchiveMaxMB = 100
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

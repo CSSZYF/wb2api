@@ -24,6 +24,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -102,6 +103,8 @@ type Config struct {
 	// 指针类型是为了区分「未配置（用默认 true）」与「显式 false」——config 侧
 	// Default() 会给 true，测试/裸用场景传 nil 即默认开。
 	PTLMaxTokensRetry *bool
+	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
+	RequestLog *reqlog.Recorder
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -343,6 +346,22 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
+		obs := &responseObserver{ResponseWriter: w}
+		w.Header().Set("X-Request-Id", trace.id)
+		h.cfg.RequestLog.Begin()
+		defer func() {
+			status := obs.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			h.cfg.RequestLog.Record(trace.event(status))
+		}()
+		h.mux.ServeHTTP(obs, r)
+		return
+	}
 	h.mux.ServeHTTP(w, r)
 }
 
@@ -855,6 +874,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	if tr := requestTraceFrom(r); tr != nil {
+		tr.stat = st
+	}
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -943,6 +965,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 天然覆盖全路径（含失败尝试——重试放大只能靠这一列看出来），不需要在每个
 	// return 前重复记账（那反而会漏分支或双计）。
 	recordAttempt := func(uid string, delta pool.TokenUsageDelta, obs attemptObs, started time.Time) {
+		st.attempts++
+		if delta.HasPromptTokens {
+			st.promptTokens = delta.PromptTokens
+		}
+		if delta.HasCompletionTokens {
+			st.completionTokens = delta.CompletionTokens
+		}
+		if delta.HasTotalTokens {
+			st.totalTokens = delta.TotalTokens
+		} else if delta.HasPromptTokens || delta.HasCompletionTokens {
+			st.totalTokens = st.promptTokens + st.completionTokens
+		}
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -967,6 +1001,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 字段），把"缺失"当 0 会让保底漏放、当"有消耗"会让免费请求凭空扣余额。
 		// 缺失时不动余额——下一轮余额刷新会以权威值覆盖，方向安全。
 		if obs.HasCredit {
+			st.credit += obs.Credit
+			st.hasCredit = true
 			h.cfg.Pool.NoteConsumedCredits(uid, obs.Credit)
 		}
 
@@ -1292,6 +1328,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg,
 					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
 			// 11115「prompt is too long」：按错误里的真实数字下调 max_tokens 重试一次
@@ -1364,6 +1401,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(finalBody), finalHint)
 				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
 			// 11135「invalid_image_data」：请求级**终态**——图片数据是否可识别是请求的
@@ -1410,6 +1448,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg,
 					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
@@ -1491,6 +1530,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				st.status = http.StatusBadGateway
+				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream uid=%s model=%s: empty upstream stream (200+0 frames)", uidPrefix(acct.UID), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
@@ -1500,6 +1540,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind := upstream.FrameKind(errFrame)
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil, errDedup)
 				st.status = http.StatusServiceUnavailable
+				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream uid=%s model=%s: upstream error frame kind=%s payload=%s",
 					uidPrefix(acct.UID), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case upstream.IsStreamAbortedError(sErr):
@@ -1508,12 +1549,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// 账号侧照常记成功（上游帧无恙，这一跳是被下游掐掉的，与 sErr != nil
 					// 同语义——改前成功三件套在开流前就执行，此处保持该口径不回归）。
 					log.Printf("INFO: [server] stream uid=%s model=%s: stream aborted by client disconnect (no 502)", uidPrefix(acct.UID), bareModel)
+					st.outcome = reqlog.OutcomeInterrupted
 					markSuccess()
 					break
 				}
 				st.status = http.StatusBadGateway
+				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream uid=%s model=%s: %v (200+partial frames)", uidPrefix(acct.UID), bareModel, sErr)
 			case sErr != nil:
+				st.outcome = reqlog.OutcomeInterrupted
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为中断（人已走，未完成）。
 				markSuccess()
@@ -1553,11 +1597,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
+			st.outcome = reqlog.OutcomeHTTPError
 			return
 		}
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), obsFromResponse(resp), attemptStarted)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
+		st.outcome = reqlog.OutcomeSuccess
 		st.toks = completionTokens(resp)
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 		markSuccess()
@@ -1676,6 +1722,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
+	st.outcome = reqlog.OutcomeHTTPError
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
