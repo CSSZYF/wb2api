@@ -1489,6 +1489,35 @@ func (c *Client) FetchModelsDiag(a *auth.Auth) ([]ModelInfo, ModelFetchDiag, err
 	return nil, lastDiag, lastErr
 }
 
+// v3OverlayFor 取本次目录拉取要用的 /v3/config 覆盖表（能力 + 限时优惠 promo_*）。
+// 按 realm 分路（理由见调用点注释）：
+//   - global → probeGlobalV3Capabilities（双 UA 并发取并集，两路各有独有模型）；
+//   - cn     → fetchV3ConfigModelMap(codeBuddyIDEUA) 单路（CN 目录主源是企业端点）。
+//
+// ok=false 表示两路都没拿到可用覆盖（global 双路全失败 / cn 单路失败或空表）：
+// 调用方保持目录原样（fail-soft，v3 挂了不得把目录整体打空——能力字段由
+// context_catalog 知识表兜底），并记一条 WARN（promo_* 的唯一来源，静默丢会让人
+// 无从判断"上游没给"还是"网关丢了"）。
+//
+// 为什么与 FetchGlobalModelInfos 的探测共用 probeGlobalV3Capabilities 而不各写一份：
+// 同一个"哪几路 UA、怎么合并"的知识写两遍必然漂移（一处改了另一处忘了，症状是
+// "目录探测有 deepseek、面板列表没有"这类极难发现的错配）。
+func (c *Client) v3OverlayFor(a *auth.Auth) (map[string]ModelInfo, bool) {
+	if c.globalOn(a) {
+		cap, ok := c.probeGlobalV3Capabilities(a)
+		if !ok {
+			log.Printf("WARN: [upstream] models: v3/config overlay failed (realm=global, 双 UA 全失败) —— 模型能力补全与限时优惠 promo_* 本轮不可用")
+		}
+		return cap, ok
+	}
+	overlay, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	if err != nil {
+		log.Printf("WARN: [upstream] models: v3/config overlay failed (realm=cn) —— 模型能力补全与限时优惠 promo_* 本轮不可用: %v", err)
+		return nil, false
+	}
+	return overlay, len(overlay) > 0
+}
+
 // fetchModelsOnce 单个候选端点拉取 + 解析（含 /v3/config 能力覆盖与 effort 缓存刷新）。
 func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelFetchDiag, error) {
 	diag := ModelFetchDiag{Path: path}
@@ -1634,10 +1663,25 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 			diag.Dropped = append(diag.Dropped, id)
 		}
 	}
-	// CN 侧固定 IDE UA 单路（吸收上游 9dce68a：CN 目录主源是企业端点，v3 只作能力
-	// 覆盖，换 UA 无收益；global 侧的双 UA 并集在 probeGlobalV3Capabilities）。
-	// overlay 同时携带能力与限时优惠（credits 是牌价，promo_* 是当前生效折扣，见 modelpromo.go）。
-	if overlay, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA); err == nil && len(overlay) > 0 {
+	// v3/config 覆盖（能力补全 + 限时优惠 promo_*）。**按 realm 分路**：
+	//
+	//   - global：**双 UA 并集**（probeGlobalV3Capabilities，与目录探测
+	//     FetchGlobalModelInfos 同一入口）。理由：实测该端点对 UA 下发的模型集合不同
+	//     ——IDE 路**不含 deepseek 系列**（见 codeBuddyCLIUA 注释），而
+	//     deepseek-v4.1-flash 正是用户点名要保的免费模型之一。单走 IDE 路时
+	//     applyModelPromotions 的「目录外模型不挂」判据会把指向它的优惠整条丢掉，
+	//     面板倍率列显示不出生效价——用户看到的症状就是"折扣一个都没显示"。
+	//     并集是唯一能覆盖两路独有模型的取法（单换 UA 只会引入另一侧的缺失）。
+	//   - cn：固定 IDE UA 单路（吸收上游 9dce68a：CN 目录主源是企业端点，v3 只作
+	//     能力覆盖，换 UA 无收益）。刻意不为 global 的修复把 CN 的调用数翻倍
+	//     （TestFetchModelsCNStaysIDEOnly 锁住这条）。
+	//
+	// 失败时**显式记一条 WARN**（而非静默跳过）：v3/config 是 promo_* 的**唯一**来源
+	// （企业端点不下发 modelPromotions），它一挂，面板倍率列的「生效价 + 标签」就全空
+	// ——而静默跳过时日志里没有任何线索，只能猜是上游没给还是网关丢了（这正是"没显示"
+	// 类问题最贵的排查成本）。频率安全：本函数只在目录缓存 miss 时调用（/v1/models
+	// 10min 缓存、面板按需），不是请求级热路径。
+	if overlay, ok := c.v3OverlayFor(a); ok {
 		out = mergeModelCapabilities(out, overlay)
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。

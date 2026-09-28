@@ -653,7 +653,10 @@ func (h *Handler) realmAvailable(realm string) bool {
 // 的倍率只读快照（GlobalModelInfosSnapshot），统计端点被面板高频轮询——缩短 TTL
 // 会让高频轮询反复触发上游探测，与「统计端点零上游压力」的设计相悖。
 func (h *Handler) fetchGlobalModelInfos() []upstream.ModelInfo {
-	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+	// 元数据路径（PickExcludingForRealmMeta）：本调用不消费积分，故豁免保留积分闸门
+	// ——否则池内账号全部触底时 global 目录退回静态名单（窗口/能力全空），恰好发生在
+	// 用户最需要看清"还剩什么免费模型"的时刻。理由与取舍见 internal/pool/reserve.go 文件头。
+	acct := h.cfg.Pool.PickExcludingForRealmMeta(nil, "global")
 	if acct == nil {
 		// 无 global 账号：输出静态名单（仅 ID，元数据留空），零上游调用。
 		out := make([]upstream.ModelInfo, 0, len(globalModels))
@@ -693,7 +696,10 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
+	// 元数据路径（PickExcludingForRealmMeta）：豁免保留积分闸门，理由同
+	// fetchGlobalModelInfos 的注释（本调用不消费积分，被闸门拦住只会让用户在最需要看
+	// 模型列表时看不到列表）。
+	acct := h.cfg.Pool.PickExcludingForRealmMeta(nil, "cn")
 	if acct == nil {
 		return nil
 	}
@@ -1453,7 +1459,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if !realmExplicit {
 			scope = "" // 裸名归属：回落允许跨域 → 判定范围是全池
 		}
+		// 保留积分耗尽（pool.reserve_credits）：池内候选**全部**只因余额 ≤ 保留线而出局
+		// （账号其实都健康、没在冷却）时，通用文案「cooling/disabled」是误导——用户会去
+		// 翻冷却/禁用状态，而真正的动作是"给号充值/调小 reserve_credits/改用免费模型"。
+		// 这里只**补一句可操作的限定说明**（code 仍是 no_healthy_account：它不是新错误类，
+		// 客户端侧的重试语义与"池子空了"一致——换号/重试都不会自己变好）。
+		//
+		// 只在 lastErr == nil 时改文案：有上游原文时必须逐字透传（透传纪律优先，原文自带
+		// 语义，拼本地前缀会污染排障证据）。选号阶段就无候选（一次上游都没打）正是
+		// lastErr == nil 的情形，也是本判定的目标场景。
+		//
+		// 与 429 分支的排他：模型级冷却优先（那是更具体的终态信号，且两者不会同时成立
+		// ——被保留积分拦住的号没有模型级冷却条目）。故本分支放在 429 判定**之后**。
+		modelRateLimited := false
 		if wait, ok := h.cfg.Pool.ModelRateLimitExhausted(bareModel, scope); ok {
+			modelRateLimited = true
 			status = http.StatusTooManyRequests
 			code = "model_rate_limited"
 			hint = upstream.ModelRateLimitedHint()
@@ -1472,6 +1492,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 服务端故障，补一句限定说明「是模型被限流、不是池子坏了」。有上游
 				// 原文时 message 一个字节都不动（透传纪律优先，原文自带语义）。
 				msg = "all accounts unavailable for this model (rate limited upstream, retry after the reset window)"
+			}
+		}
+		// 保留积分耗尽（pool.reserve_credits）的可操作文案：见上方 modelRateLimited 处的
+		// 说明。只在「没走 429 分支 + 无上游原文可透传 + 全池候选都只因保留积分出局」
+		// 三个条件同时成立时替换——任一不成立就保持既有 503 文案（零回归）。
+		if !modelRateLimited && lastErr == nil {
+			if blocked, line, ok := h.cfg.Pool.ReserveCreditsExhausted(bareModel, scope); ok {
+				msg = fmt.Sprintf(
+					"all accounts unavailable: every account for this model has credits at or below the reserve line (pool.reserve_credits=%d, %d account(s) blocked) — top up the accounts, lower pool.reserve_credits, or use a free model",
+					line, blocked)
 			}
 		}
 	}

@@ -48,16 +48,22 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
 // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
 // 排序口径同 AvailableUIDs（sortByOrderLocked → Pool.Order()），域过滤/健康过滤保序。
+// 保留积分闸门同 AvailableUIDsForModel（余额触底的号对贵模型不列入）——粘性分配的
+// 候选集与选号口径必须一致，否则会话会被绑到池侧随后拒绝的号上。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
+	gate := p.reserveGateFor(model, false)
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if !gate.allows(e, model) {
 			continue
 		}
 		if p.inFlightFull(e) {

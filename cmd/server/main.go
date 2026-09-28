@@ -114,6 +114,11 @@ func main() {
 	// 顺序（state.json 顶层 account_order）填充式选号，某号在途满则临时溢出给下一个。
 	// 面板改配置后经 saveConfig 热生效（无需重启）。
 	p.SetPickMode(PickMode(cfg.Pool.PickMode))
+	// 保留积分线（pool.reserve_credits，缺省 50）：余额 ≤ 该线的账号只对免费/低价模型可用，
+	// 贵模型跳过它换别的号（用户需求：别让贵模型把积分吃到连免费的 4.1 都用不了）。
+	// 免费判定是模型感知的（倍率口径 + 兜底白名单，见 internal/pool/reserve.go 文件头）；
+	// 判定回调在下方 up 构造后经 SetFreeModelLookup 注入（回调要闭包捕获 client）。
+	p.SetReserveCredits(int64(cfg.Pool.ReserveCredits))
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -137,6 +142,11 @@ func main() {
 	}
 
 	up := upstream.New()
+	// 保留积分的「免费/低价模型」判定回调（pool.reserve_credits 的模型感知部分）：
+	// 数据源是 CN（cachedModelsSnapshot）与 global（GlobalModelInfosSnapshot）两个
+	// **只读目录快照**——回调在选号热路径上被调用，绝不发起上游请求（与 /v1/stats
+	// 的倍率透出同一纪律）。契约与取舍见 internal/server/freemodels.go。
+	p.SetFreeModelLookup(server.FreeModelLookup(up))
 	// 连接层四项（h2 开关 / TLS 握手 / 拨号 / 空闲池）按配置重建共享 Transport：
 	// Transport 是 HTTP 与 ChatHTTP 的共享实例（连接池不重复），ConfigureTransport
 	// 同步替换两者。配置缺键 = TransportOpts 零值 = **h2 启用** + 30/30/90，与用户
@@ -556,7 +566,7 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetDegrade/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights/SetPickMode
+//   - pool.* → pool.SetBreaker/SetDegrade/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights/SetPickMode/SetReserveCredits
 //     （pool.pick_mode 另需 session.Router.SetSequential：粘性侧的新会话分配是**另一条**
 //     分配路径，见函数内注释）
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetAuthWatchInterval/SetCooldownProbeInterval
@@ -644,6 +654,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if sess != nil {
 		sess.SetSequential(PickMode(newCfg.Pool.PickMode) == pool.PickSequential)
 	}
+	// 保留积分线热改（pool.reserve_credits）：原子写，**下一次选号**即按新值判定
+	// （已发出的请求不追溯改选号口径，与 pick_mode 同款）。设为 0 = 立即关闭该闸门，
+	// 行为回到改动前。判定回调（免费模型集合）不在此处重装：它读的是目录**只读快照**，
+	// 每次调用现算，配置改动与目录刷新都会自然反映（见 server.FreeModelLookup）。
+	p.SetReserveCredits(int64(newCfg.Pool.ReserveCredits))
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,

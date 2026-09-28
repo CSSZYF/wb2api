@@ -286,6 +286,28 @@ type Config struct {
 		// 非法值（空/未知）回落 weighted 并记 warn——与 features.reasoning_history
 		// 同风格：本键的缺省方向必须与改动前逐字节一致（静默失败的方向是"保持旧行为"）。
 		PickMode string `json:"pick_mode"`
+
+		// ReserveCredits 保留积分线（**默认 50**）：账号余额 ≤ 本值时，它只对**免费/低价
+		// 模型**可用，贵模型请求跳过该号（换别的号）——用户需求原话「设置一个保留至少
+		// 积分，不然免费的 4.1 都用不了……贵模型把积分用到剩余 50 了就不能再用这个号，
+		// 只有免费模型才可以使用」。
+		//
+		// 免费/低价的判定是**模型感知**的（见 internal/pool/reserve.go 文件头）：
+		//   ① 倍率口径（主判据）：模型目录里的**生效倍率** ≤ 0（牌价 x0.00，或
+		//      modelPromotions 的 factor=0 限时免费）——数据源是 CN/global 两个目录
+		//      快照（server.FreeModelLookup），注入 pool.SetFreeModelLookup；
+		//   ② 兜底白名单：hy4-preview / hy3 / deepseek-v4.1-flash（用户点名要保的三个）。
+		// 两层取并集，理由见 pool/reserve.go。
+		//
+		// 0 = **关闭**（回到改动前行为：余额触底不产生任何过滤）。负值非法 → normalize
+		// fail fast——负的保留线没有合理语义，静默钳 0 会让"我配了个负数"变成"关掉了
+		// 这个功能"，正是 issue #17 反复强调的失效模式（与 server.max_body_mb 同风格）。
+		//
+		// 余额**未知**（credits_total 为 0，即从未刷新过余额）时闸门 fail-open：
+		// 不拿"未知"当"余额 0"，否则全新部署在首次余额刷新前会把付费模型全打成 503。
+		//
+		// 面板保存后经 pool.SetReserveCredits 热生效（下一次选号即按新值）。
+		ReserveCredits int `json:"reserve_credits"`
 	} `json:"pool"`
 
 	// Models 网关对外模型名协议（/v1/models 的 id 形态 + 裸名归属域）。
@@ -431,6 +453,10 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// 选号模式缺省 weighted：与加本键前逐字节一致（顺序模式是用户显式选择的行为变更）。
 	c.Pool.PickMode = PoolPickModeWeighted
+	// 保留积分线缺省 50（用户点名"默认搞个 50"）：余额用到只剩 50 时该号对贵模型出池，
+	// 只留免费模型可用。键缺席时 Default() 的值被保留（Load 先取 Default 再 unmarshal）；
+	// 显式 0 才关闭。
+	c.Pool.ReserveCredits = DefaultReserveCredits
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -654,6 +680,12 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PICK_MODE"); v != "" {
 		c.Pool.PickMode = v
 	}
+	// 保留积分线（pool.reserve_credits）：env 与 JSON 同口径（负数由 normalize fail fast）。
+	if v := os.Getenv("WB2A_RESERVE_CREDITS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Pool.ReserveCredits = n
+		}
+	}
 }
 
 func (c *Config) normalize() error {
@@ -842,6 +874,12 @@ func (c *Config) normalize() error {
 		log.Printf("pool.pick_mode: %q 不是合法模式（weighted/sequential），已按 weighted 处理", c.Pool.PickMode)
 		c.Pool.PickMode = PoolPickModeWeighted
 	}
+	// pool.reserve_credits：负数非法 → fail fast（风格同 server.max_body_mb）。负的保留线
+	// 没有合理语义，而静默钳 0 等于把用户写错的配置变成"关掉了这个功能"且不提示——
+	// 正是 issue #17 那类"改了配置却不生效还不说"的失效模式。0 合法（= 显式关闭）。
+	if c.Pool.ReserveCredits < 0 {
+		return fmt.Errorf("pool.reserve_credits: %d 非法（0 = 关闭该功能，或正整数作为保留积分线）", c.Pool.ReserveCredits)
+	}
 	return c.normalizePrompt()
 }
 
@@ -852,6 +890,14 @@ const (
 	// PoolPickModeSequential 顺序填充式选号。
 	PoolPickModeSequential = "sequential"
 )
+
+// DefaultReserveCredits pool.reserve_credits 的缺省值（用户指定"默认搞个 50"）。
+//
+// 提为常量而不是在两处各写 50：默认值同时出现在 Default()（键缺席）与面板表单的
+// placeholder（index.html 的显示值），两处漂移会让"面板显示 50、实际按别的数跑"。
+// 面板 HTML 无法引用 Go 常量（go:embed 静态资源），故那边由 frontend_test 断言
+// placeholder 与本常量一致。
+const DefaultReserveCredits = 50
 
 // NormalizePickMode 归一化 pool.pick_mode：大小写/首尾空白不敏感，返回归一化值与
 // 是否合法。空串视为**非法**（由调用方回落 weighted 并 warn）——空串与"键缺席"

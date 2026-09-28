@@ -94,7 +94,8 @@
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
     "expiring_soon": "168h",
-    "pick_mode": "weighted"
+    "pick_mode": "weighted",
+    "reserve_credits": 50
   },
   "session_sticky": {
     "enabled": true,

@@ -894,6 +894,7 @@ const CFG_MAP = {
   read_timeout_seconds: ['server', 'read_timeout_seconds'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   pick_mode: ['pool', 'pick_mode'],
+  reserve_credits: ['pool', 'reserve_credits'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'],
   degrade_cooldown: ['pool', 'degrade_cooldown'], degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],

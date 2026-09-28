@@ -53,6 +53,18 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// reserveCredits 保留积分线（SetReserveCredits 注入，config pool.reserve_credits）：
+	// credits ≤ 本值 的账号对**贵模型**出池，只放行免费/低价模型（语义与判定见
+	// reserve.go）。0 = 关闭（零值即关闭，故未注入的库使用者/测试行为与改动前一致）。
+	reserveCredits int64
+	// freeModelLookup 「该模型是否免费/低价」的判定回调（SetFreeModelLookup 注入，
+	// 数据源是模型目录的只读快照）。nil = 只认内置兜底白名单。契约见 SetFreeModelLookup。
+	// 池层刻意不 import upstream：判定逻辑在 upstream.FreeModelSet，这里只要一个
+	// 纯函数回调——与 SetMaxInFlight 那批依赖注入同形，避免 pool→upstream 的反向依赖。
+	freeModelLookup func(model string) bool
+	// reserveLog 保留积分跳过日志的节流器（见 reserve.go 的类型注释：自持锁，
+	// 因为它在写锁与读锁两种锁态下都会被调用）。
+	reserveLog reserveLogThrottle
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
