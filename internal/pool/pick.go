@@ -52,9 +52,10 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 // 另一域 healthy 候选；本域只剩冷却号而另一域有健康号时也回落健号（探测冷却号是
 // 最后手段）；仅当两域都无 healthy 候选才走全冷却兜底，且兜底同样先本域、后另一域。
 //
-// 回落轮只放宽 realm 谓词，其余谓词（tried / healthy / healthyForModel / inFlightFull）
-// 逐一保持：更宽松的域不改变请求级轮换与租约语义，只是候选域从「本域」扩到「全池」。
-// 每轮回落仍受调用方 tried 约束，故请求整体尝试次数上限不变（MaxRotate 次）。
+// 回落轮只放宽 realm 谓词，其余谓词（tried / healthy / healthyForModel / inFlightFull
+// / 保留积分闸门）逐一保持：更宽松的域不改变请求级轮换与租约语义，只是候选域从
+// 「本域」扩到「全池」。每轮回落仍受调用方 tried 约束，故请求整体尝试次数上限不变
+// （MaxRotate 次）。
 //
 // 动机（issue #199c）：混合池（1 global + 1 cn、realm_precedence=global）下，裸模型名
 // 归属 global；若 global 号对该模型全部限流/不可用，旧实现轮转的每一轮都只在 global
@@ -64,6 +65,21 @@ func (p *Pool) PickExcludingForRealmFallback(tried map[string]bool, reqModel, re
 	return p.pick(tried, reqModel, realm, true)
 }
 
+// PickExcludingForRealmMeta 元数据路径选号（拉模型目录 / 面板查询这类 GET）：
+// 等同 PickExcludingForRealm(nil, "", realm)，但**豁免保留积分闸门**。
+//
+// 为什么需要独立入口：这些调用方传 reqModel=""（只要"任一个本域账号"去取元数据），
+// 而空模型名在保留积分口径下是**保守拦截**的（见 reserve.go 文件头）。若不豁免，
+// 池内账号全部触底时「模型与档位」会 503、/v1/models 退回静态名单、/v1/stats 的倍率
+// 快照失效——恰好发生在用户最需要看清"还剩什么免费模型"的时刻。这类请求不消费积分，
+// 闸门拦它没有收益只有代价。
+//
+// 注意：**只有元数据路径**用它。任何会真正发起 chat / 签到 / 任务出站的调用方都不该
+// 走这里——那正是闸门要拦的消费路径。
+func (p *Pool) PickExcludingForRealmMeta(tried map[string]bool, realm string) *auth.Auth {
+	return p.pickWith(tried, "", realm, false, true)
+}
+
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）；realmFallback=true 时
@@ -71,28 +87,41 @@ func (p *Pool) PickExcludingForRealmFallback(tried map[string]bool, reqModel, re
 // "pool: realm fallback" 日志供运维确认跨域发生）。
 //
 // 四段顺序（前一段有果即返回，不跨段跳级；跨域只放宽 realm 谓词，其余谓词逐一保持）：
-//  1. 本域 healthy 候选（含 healthyForModel）；
+//  1. 本域 healthy 候选（含 healthyForModel + 保留积分闸门）；
 //  2. [回落] 另一域 healthy 候选——必须排在全冷却兜底**之前**：本域只剩冷却号而
 //     另一域有健康号时，「优先本域」的合理边界止于 healthy，探测冷却号是最后手段；
 //  3. 本域全冷却兜底（既有语义：全池冷却时探测最早到期号而非 503）；
 //  4. [回落] 另一域全冷却兜底——本域连冷却号都没有时的最后手段（仍优于 503）。
+//
+// 保留积分闸门（pool.reserve_credits）贯穿 1–4 段（metaOnly=false 时）：它回答的是
+// "这个号对这个模型此刻能不能用"，与 healthyForModel 同一层语义，故每一段都不得绕开
+// ——尤其第 3/4 段的全冷却兜底：兜底是"探测冷却号是否已恢复"的最后手段，不是"花掉
+// 用户设的积分底线"的旁路（余额触底的号在贵模型上被兜底选中，用户设的底线就形同虚设）。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string, realmFallback bool) *auth.Auth {
+	return p.pickWith(tried, reqModel, realm, realmFallback, false)
+}
+
+// pickWith 是 pick 的实现体；metaOnly=true 时跳过保留积分闸门（见
+// PickExcludingForRealmMeta 的注释：只有元数据路径该传 true）。
+func (p *Pool) pickWith(tried map[string]bool, reqModel, realm string, realmFallback, metaOnly bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	if a := p.pickHealthyLocked(tried, now, reqModel, realm); a != nil {
+	// 闸门在入口按 reqModel 现算一次，四段共用（理由见 reserveGate 的类型注释）。
+	gate := p.reserveGateFor(reqModel, metaOnly)
+	if a := p.pickHealthyLocked(tried, now, reqModel, realm, gate); a != nil {
 		return a
 	}
 	if realm != "" && realmFallback {
-		if a := p.pickHealthyLocked(tried, now, reqModel, ""); a != nil {
+		if a := p.pickHealthyLocked(tried, now, reqModel, "", gate); a != nil {
 			return p.logRealmFallbackLocked(realm, a, reqModel)
 		}
 	}
-	if a := p.pickEarliestExpiryLocked(tried, now, realm); a != nil {
+	if a := p.pickEarliestExpiryLocked(tried, now, reqModel, realm, gate); a != nil {
 		return a
 	}
 	if realm != "" && realmFallback {
-		if a := p.pickEarliestExpiryLocked(tried, now, ""); a != nil {
+		if a := p.pickEarliestExpiryLocked(tried, now, reqModel, "", gate); a != nil {
 			return p.logRealmFallbackLocked(realm, a, reqModel)
 		}
 	}
@@ -148,11 +177,12 @@ func (p *Pool) PickMode() PickMode {
 // 交由 pick 决定是否跨域回落或走全冷却兜底。调用方必须已持 p.mu 写锁：跨域回落要在
 // 同一临界区内做多次候选扫描，中间不得释放锁——否则两次扫描之间池状态变化会让
 // 「回落」判定与候选集不一致。
-func (p *Pool) pickHealthyLocked(tried map[string]bool, now time.Time, reqModel, realm string) *auth.Auth {
+// gate 为保留积分闸门（由 pick 按 reqModel 现算一次后传入，理由见 reserveGate 注释）。
+func (p *Pool) pickHealthyLocked(tried map[string]bool, now time.Time, reqModel, realm string, gate reserveGate) *auth.Auth {
 	if p.pickMode == PickSequential {
-		return p.pickSequentialLocked(tried, now, reqModel, realm)
+		return p.pickSequentialLocked(tried, now, reqModel, realm, gate)
 	}
-	return p.pickWeightedHealthyLocked(tried, now, reqModel, realm)
+	return p.pickWeightedHealthyLocked(tried, now, reqModel, realm, gate)
 }
 
 // seqSkip 顺序模式下被跳过的账号及其原因（仅供溢出日志组装，不参与选号判定）。
@@ -161,8 +191,19 @@ type seqSkip struct {
 	reason string
 }
 
+// seqSkipReserve 顺序模式下"因保留积分跳过"的原因标签。
+//
+// 为什么要单列一类（而不是并进 unhealthy）：它与 tried/inflight 一样是**持久条件**——
+// 账号一旦触底，此后每一次贵模型选号都会跳过它。若按 overflow 处理，
+// logSequentialSkipsLocked 会把每一行都变成 `uid=poor reason=reserve`，把"顺序填充的
+// 溢出链路"这个真正需要人看的信号淹掉。故它**不算** overflow：只有它（与 realm）时不打
+// 汇总行，那条事实由 reserveLogThrottle 的节流日志承担（每个 uid 每分钟一条），
+// 既可见又不刷屏；与真正的溢出（tried/unhealthy/inflight_full）同时出现时，汇总行照打
+// 并把 reserve 项一并列出（用户能看到完整的跳过链路）。
+const seqSkipReserve = "reserve"
+
 // pickSequentialLocked 顺序填充式选号：按 Pool.Order() 从上到下遍历，返回第一个
-// 同时满足 tried 未标记 / healthy(ForModel) / 未占满在途 的账号。
+// 同时满足 tried 未标记 / healthy(ForModel) / 保留积分闸门 / 未占满在途 的账号。
 //
 // 三条需求的实现方式（都不需要额外状态机）：
 //   - 需求 2「并发满 = 临时溢出」：inFlightFull 过滤天然实现——顺序靠前的号满了就
@@ -185,10 +226,14 @@ type seqSkip struct {
 // LRU 兜底（可能选中窗口外的其他号）——这两条在顺序模式下都是反向语义。
 // 故本分支不做该过滤，且不读也不写 lastUsed 之外的任何窗口判定。
 //
+// 保留积分闸门（gate）与 healthyForModel 同层：余额触底的号对贵模型视同不可用，
+// 顺序遍历自然跳过它、落到下一个号；免费模型则照常命中顺序第一的号。
+//
 // 溢出日志（需求 6）：只有当**顺序靠前的合格形态账号被跳过**时才打一条，
-// 避免每次选号都刷屏。触发情形两类：在途占满（inflight_full）、冷却/禁用等不健康
-// （unhealthy）。跳过原因取每个被跳过账号的首个判据（顺序：tried → healthy → inflight）。
-func (p *Pool) pickSequentialLocked(tried map[string]bool, now time.Time, reqModel, realm string) *auth.Auth {
+// 避免每次选号都刷屏。触发情形三类：在途占满（inflight_full）、冷却/禁用等不健康
+// （unhealthy）、保留积分触底（reserve）。跳过原因取每个被跳过账号的首个判据
+// （顺序：tried → realm → healthy → reserve → inflight）。
+func (p *Pool) pickSequentialLocked(tried map[string]bool, now time.Time, reqModel, realm string, gate reserveGate) *auth.Auth {
 	order := p.effectiveOrderLocked()
 	var chosen *entry
 	// skipped 收集被跳过的账号及其原因（仅在真的选中了后面的号时才打日志：
@@ -217,6 +262,11 @@ func (p *Pool) pickSequentialLocked(tried map[string]bool, now time.Time, reqMod
 			skipped = append(skipped, seqSkip{uid, "unhealthy"})
 			continue
 		}
+		if !gate.allows(e, reqModel) {
+			// 保留积分：余额 ≤ 保留线且该模型非免费 → 视同对该模型不可用，跳过。
+			skipped = append(skipped, seqSkip{uid, seqSkipReserve})
+			continue
+		}
 		if p.inFlightFull(e) {
 			// 需求 2：并发满 → 临时溢出给下一个号（不冷却、不惩罚，并发降回来即首选）。
 			skipped = append(skipped, seqSkip{uid, "inflight_full"})
@@ -241,22 +291,24 @@ func (p *Pool) pickSequentialLocked(tried map[string]bool, now time.Time, reqMod
 // 且每个被跳账号的原因用 `uid=... reason=...` 逐项列出。
 // 在途占满额外带 `(在途/上限)` 便于用户核对并发档位（maxInFlight 按 realm 分档）。
 //
-// **纯 realm 跳过不打日志**：混合池下顺序里排在前面的是另一域的号时，按域过滤的
-// 每次请求都会跳过它们（reason=realm）——那是分池路由的正常形态，不是溢出，照打会
-// 把每次请求都刷成一行。判据取「至少一个非 realm 的跳过原因」（tried / unhealthy /
-// inflight_full 三类才是溢出/切换信号），有它时整条 skip 列表（含 realm 项）一并
-// 列出，用户能看到完整的跳过链路。
+// **纯 realm / 纯 reserve 跳过不打汇总日志**：混合池下顺序里排在前面的是另一域的号时，
+// 按域过滤的每次请求都会跳过它们（reason=realm）——那是分池路由的正常形态，不是溢出，
+// 照打会把每次请求都刷成一行；reserve 同理（账号触底后每次贵模型请求都会跳过它），
+// 那条事实由 reserveLogThrottle 的**节流**日志承担（每个 uid 每分钟至多一条）。
+// 判据取「至少一个非 realm、非 reserve 的跳过原因」（tried / unhealthy / inflight_full
+// 三类才是溢出/切换信号），有它时整条 skip 列表（含 realm/reserve 项）一并列出，
+// 用户能看到完整的跳过链路。
 // 调用方必须已持 p.mu 写锁（读 inFlight/上限字段与选号同一时刻快照）。
 func (p *Pool) logSequentialSkipsLocked(skipped []seqSkip, chosen *entry) {
 	overflow := false
 	for _, s := range skipped {
-		if s.reason != "realm" {
+		if s.reason != "realm" && s.reason != seqSkipReserve {
 			overflow = true
 			break
 		}
 	}
 	if !overflow {
-		return // 顺序第一直接命中，或仅因 realm 过滤跳过：正常路径零噪音
+		return // 顺序第一直接命中，或仅因 realm/保留积分过滤跳过：正常路径零噪音
 	}
 	var b strings.Builder
 	b.WriteString("pool: sequential skip")
@@ -281,9 +333,9 @@ func (p *Pool) logSequentialSkipsLocked(skipped []seqSkip, chosen *entry) {
 
 // pickWeightedHealthyLocked 三因子加权随机的 healthy 段选号（**改动前原实现，
 // 逐字保留**）：Top5 短名单 + 加权抽签 + minPickGap 防并发撞号 + LRU 兜底。
-// 由 pickHealthyLocked 在 PickWeighted 模式（缺省）下调用——本函数体与
-// pick_mode 引入前逐字节相同，保证默认部署零回归。
-func (p *Pool) pickWeightedHealthyLocked(tried map[string]bool, now time.Time, reqModel, realm string) *auth.Auth {
+// 由 pickHealthyLocked 在 PickWeighted 模式（缺省）下调用——除保留积分闸门（gate）
+// 这一条新增过滤外，本函数体与 pick_mode 引入前逐字节相同，保证默认部署零回归。
+func (p *Pool) pickWeightedHealthyLocked(tried map[string]bool, now time.Time, reqModel, realm string, gate reserveGate) *auth.Auth {
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
@@ -297,6 +349,9 @@ func (p *Pool) pickWeightedHealthyLocked(tried map[string]bool, now time.Time, r
 		e.pruneExpiredModelCooldowns(now) // 惰性清理过期模型级冷却（防 map 膨胀）
 		if !healthyOf(e) {
 			continue
+		}
+		if !gate.allows(e, reqModel) {
+			continue // 保留积分：余额 ≤ 保留线且该模型非免费 → 视同对该模型不可用
 		}
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
@@ -398,7 +453,11 @@ func (p *Pool) pickWeightedHealthyLocked(tried map[string]bool, now time.Time, r
 // CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
+//
+// 保留积分闸门（gate）在本段同样生效：兜底是"探测冷却号是否已恢复"的最后手段，不是
+// "花掉用户设的积分底线"的旁路——余额已触底的号在贵模型上被兜底选中，底线就形同虚设
+// （用户明确要求"贵模型把积分用到剩余 50 了就不能再用这个号了"）。免费模型不受影响。
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, reqModel, realm string, gate reserveGate) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -412,6 +471,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		}
+		if !gate.allows(e, reqModel) {
+			continue // 保留积分：兜底不得绕开（见函数注释）
 		}
 		if p.inFlightFull(e) {
 			continue

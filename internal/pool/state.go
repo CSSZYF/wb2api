@@ -385,13 +385,22 @@ func (p *Pool) AvailableUIDs() []string {
 // 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）。
 // 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
 // 排序口径与 AvailableUIDs 同源（sortByOrderLocked → Pool.Order()），过滤保序。
+//
+// 保留积分闸门同样并入（gate 由 model 现算）：余额触底的号对贵模型不列入，对免费模型
+// 照常列入——这是**必须**的，否则粘性分配会把会话绑到"对当前模型不可用"的号上，
+// 而池侧 Pick 又会拒绝它（粘性成为保留积分的旁路，见 PickByUIDForModel 的注释）。
+// model 为空时闸门按"保守拦截"处理（空模型名当贵模型）——与选号口径一致。
 func (p *Pool) AvailableUIDsForModel(model string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
+	gate := p.reserveGateFor(model, false)
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if !gate.allows(e, model) {
 			continue
 		}
 		if p.inFlightFull(e) {
@@ -407,6 +416,9 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 // 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
+//
+// 保留积分闸门同口径校验（理由同 AvailableUIDsForModel）：绑定号余额触底且当前请求是
+// 贵模型时返回 nil → handler 解绑并回落轮换；免费模型照常命中（粘性继续有效）。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -416,6 +428,9 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	}
 	now := time.Now()
 	if !e.healthyForModel(now, model) {
+		return nil
+	}
+	if !p.reserveGateFor(model, false).allows(e, model) {
 		return nil
 	}
 	if p.inFlightFull(e) {

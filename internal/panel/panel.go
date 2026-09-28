@@ -293,7 +293,10 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			realm = "cn" // 纯 CN 部署：默认查国内版
 		}
 	}
-	acct := p.cfg.Pool.PickExcludingForRealm(nil, "", realm)
+	// 元数据路径（PickExcludingForRealmMeta）：本查询不消费积分，豁免保留积分闸门
+	// ——否则池内账号全部触底时面板「模型与档位」会 503，恰好是用户最需要看清
+	// "还剩什么免费模型"的时刻。理由见 internal/pool/reserve.go 文件头。
+	acct := p.cfg.Pool.PickExcludingForRealmMeta(nil, realm)
 	if acct == nil {
 		writeErr(w, http.StatusServiceUnavailable,
 			"没有可用的 "+realm+" 账号：请先在面板添加账号再查询")

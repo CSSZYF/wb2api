@@ -396,8 +396,12 @@ func mergeV3CapabilityMaps(primary, secondary map[string]ModelInfo) map[string]M
 //     不补则客户端选不到。追加前过 nonChatModel 过滤（v3 目录含嵌入/图片类条目），
 //     并按 id 排序保证输出稳定（map 迭代序随机）。
 //
+// 3. **限时优惠搬运**（Promo*，见下）：与能力字段相反，promo 是**覆盖**而非 fill-only。
+//
 // Credits 不进本路径（PLAN §3.D2）：调用方在建倍率旁表时从**探测结果**取，
 // 本函数追加的条目 Credits 恒空（试用模型更是刻意清空，见 fetchV3ConfigModelMap）。
+// Promo* 与 Credits 是**两个口径**（生效价 vs 牌价），搬 promo 不得顺手把 v3 的
+// credits 带进来——那会把"计费口径的牌价"污染成"展示口径的优惠价"（旁表只认探测端点）。
 func applyGlobalV3Catalog(base []ModelInfo, cap map[string]ModelInfo) []ModelInfo {
 	if len(cap) == 0 {
 		return base
@@ -438,6 +442,31 @@ func applyGlobalV3Catalog(base []ModelInfo, cap map[string]ModelInfo) []ModelInf
 		if base[i].Name == "" {
 			base[i].Name = ov.Name
 		}
+		// 限时优惠（modelPromotions）**覆盖**而非 fill-only——promo 是**时变**的：
+		// 限时折扣会过期、档位会切换（实测 glm-5.2 白天 badge-only 与夜间五折靠
+		// priority + daily 双轨切换），而 v3/config 每轮都是**重新**从
+		// env.Data.ModelPromotions 现算（applyModelPromotions 只挂当前生效的条目，
+		// 未命中就完全不设字段）。故本函数的契约定为「cap 的 promo 即本轮当前事实」：
+		// cap 挂了就照搬（含**清零**——上一轮 0x、本轮已恢复原价的模型必须回到无 promo
+		// 态），cap 没挂就清空。
+		//
+		// 与 fill-only 的实际差别（诚实说明）：当前调用链上两者等价——base 每轮都由
+		// probeGlobalModels 重新构造（parseGlobalModelInfos 从不设 Promo*），进本函数时
+		// base 的 promo 恒为零值，故"只填零值"同样能通过 TestGlobalCatalogCarriesPromo。
+		// 选覆盖是为了**契约正确**：promo 的语义是"此刻的折扣"而不是"能力"，把它写成
+		// fill-only 会让"折扣已结束"这一事实无法表达（一旦有人日后把缓存条目当 base
+		// 传进来，或上游改成增量下发，旧 promo 就会永久粘住且永不自我纠正）。
+		// 能力字段（窗口/档位）是慢变事实，照旧 fill-only。
+		//
+		// 清零安全的前提：promo 的**唯一**来源是 /v3/config，而本函数只在 v3OK 时被调用
+		// （见 FetchGlobalModelInfos）——能走到这里，cap 就是本轮权威 promo 快照，
+		// 不存在"v3 这轮没给、上轮的 promo 仍有效"的情形。CN 侧 mergeModelCapabilities
+		// 保持 fill-only 是另一回事：那边是"overlay 可能没拿到"（单路 UA 缺失），
+		// 这边是"拿到了、且该模型此刻无生效优惠"。
+		base[i].PromoFactor = ov.PromoFactor
+		base[i].PromoCredits = ov.PromoCredits
+		base[i].PromoLabel = ov.PromoLabel
+		base[i].PromoNote = ov.PromoNote
 	}
 
 	extra := make([]string, 0, len(cap))
