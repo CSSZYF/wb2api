@@ -216,8 +216,8 @@ func TestModelListGlobalOnlyNoPrefix(t *testing.T) {
 	}
 	for _, m := range list {
 		if id, _ := m["id"].(string); id == "deepseek-v4.1-flash" {
-			if m["credits"] != "x0.03" {
-				t.Errorf("写死条目应透出 credits=x0.03，got %v", m["credits"])
+			if m["credits"] != "x0.00" {
+				t.Errorf("写死条目应透出 credits=x0.00（实测 v3-CLI 原值），got %v", m["credits"])
 			}
 			if m["context_length"] != int64(1000000) {
 				t.Errorf("写死条目应透出 context_length=1000000，got %v", m["context_length"])

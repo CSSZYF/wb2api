@@ -28,13 +28,25 @@ type PinnedModel struct {
 // DefaultPinnedModels 出厂写死条目。
 //
 // deepseek-v4.1-flash：国际版 /v2 目录不返回它（实测账号的 cli agents 名单里没有），
-// 但模型可调用，故写死。数值来自官方客户端实测：固定档 high、窗口 1000K、输出 128K、
-// 倍率 x0.03。上游若开始返回它，此处自动让位（MergePinned 不覆盖已有条目）。
+// 但模型可调用，故写死。窗口 1000K、输出 128K、固定档 high 来自官方客户端实测。
+//
+// Credits 更正为 x0.00（2026-10-02，字节级核对三个端点的原始 dump）：
+//   - /v3/config（CLI UA，唯一下发该 id 的端点）给的是 **x0.00**；
+//   - 企业端点 /v2/enterprises/personal/models 与 v3-IDE **都没有这个 id**
+//     （bytes.count(b"deepseek")==0 / 不在 models[] 里）；
+//   - 旧的写死值 x0.03 实际是**新加坡版** deepseek-v4.1-flash-sg 的价（同一次 dump
+//     里 -sg 是 x0.03），当初跟进时把两个变体的价抄混了。用户点名"国际服现在 4.1
+//     有优惠"与此一致。
+//
+// 影响面：本条目只在**上游两条路都没给出该 id**时兜底（MergePinned 不覆盖上游数据），
+// 所以线上探测正常时改与不改都看不到差别；但兜底场景（v3 探测失败 / 无 global 账号）
+// 下它决定面板显示 x0.03（误报"要收费"）还是 x0.00（真实免费），也决定保留积分的
+// 免费判定（IsFreeModel 读的是这份目录）。
 var DefaultPinnedModels = []PinnedModel{
 	{
 		ID:                "deepseek-v4.1-flash",
 		Name:              "Deepseek-V4.1-Flash",
-		Credits:           "x0.03",
+		Credits:           "x0.00",
 		ContextLength:     1000000,
 		MaxOutputTokens:   128000,
 		DefaultEffort:     "high",

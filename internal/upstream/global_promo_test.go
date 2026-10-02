@@ -133,7 +133,7 @@ func TestGlobalPromoFillOnlyKeepsEnterpriseSource(t *testing.T) {
 	// 本轮 v3/config 只剩能力字段（v3 侧无该模型的 promo）。
 	cap := map[string]ModelInfo{"glm-5.2": {ID: "glm-5.2", MaxTokens: 32768}}
 
-	got := applyGlobalV3Catalog(base, cap)
+	got := MergeCatalogOverlay(base, cap, nil)
 	if got[0].PromoFactor == nil || got[0].PromoCredits != "0.50x" ||
 		got[0].PromoLabel != "夜间折扣" || got[0].PromoNote != "23:00–07:50" {
 		t.Errorf("v3 未给 promo 时不得抹掉 base 的来源（企业端点）: %+v", got[0])
@@ -159,7 +159,7 @@ func TestGlobalPromoV3OverridesEnterprise(t *testing.T) {
 		ID: "glm-5.2", PromoFactor: &zf, PromoCredits: "0x", PromoLabel: "限时免费",
 	}}
 
-	got := applyGlobalV3Catalog(base, cap)
+	got := MergeCatalogOverlay(base, cap, nil)
 	if got[0].PromoFactor == nil || *got[0].PromoFactor != 0 {
 		t.Errorf("PromoFactor=%v want 0（v3 覆盖胜出）", got[0].PromoFactor)
 	}

@@ -1425,7 +1425,7 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 
 func TestMergeModelCapabilitiesKeepsCLIWhenOverlayEmpty(t *testing.T) {
 	base := []ModelInfo{{ID: "m", MaxTokens: 128000, DefaultEffort: "high"}}
-	got := mergeModelCapabilities(base, map[string]ModelInfo{"m": {ID: "m"}})
+	got := MergeCatalogOverlay(base, map[string]ModelInfo{"m": {ID: "m"}}, nil)
 	if got[0].MaxTokens != 128000 || got[0].DefaultEffort != "high" {
 		t.Errorf("empty overlay wiped CLI fields: %+v", got[0])
 	}

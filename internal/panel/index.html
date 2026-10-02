@@ -605,6 +605,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="mdNote">实时查询上游</span>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
+        <div class="pad md-bar">
+          <!-- realm 切换：CN 与国际版是两份不同目录（模型不同、价格不同），面板必须能对比。
+               按钮由 app.js 按 /panel/api/models 的 realm_servable 渲染——池内没有的域
+               不显示（点了必然 503）。 -->
+          <span class="chips" id="mdRealms"></span>
+          <span class="note" id="mdRealmCur">—</span>
+        </div>
         <div class="tbl-wrap">
         <table class="acc md">
           <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>

@@ -147,8 +147,8 @@ func TestPanelModelsGlobalRealmUsesV2Path(t *testing.T) {
 	if ds.Name != "Deepseek-V4.1-Flash" {
 		t.Errorf("deepseek name=%q want Deepseek-V4.1-Flash", ds.Name)
 	}
-	if ds.Credits != "x0.03" {
-		t.Errorf("deepseek credits=%q want x0.03", ds.Credits)
+	if ds.Credits != "x0.00" {
+		t.Errorf("deepseek credits=%q want x0.00（写死条目快照，实测 v3-CLI 原值）", ds.Credits)
 	}
 	if ds.DefaultEffort != "high" {
 		t.Errorf("deepseek default_effort=%q want high", ds.DefaultEffort)

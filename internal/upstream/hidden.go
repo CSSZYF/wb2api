@@ -18,6 +18,13 @@ import (
 // 上游按当时的策略转派到别的真实模型，因此其倍率、窗口、思考档随时会变，被列成独立
 // 模型只会误导（用户以为在选一个固定的模型）。
 //
+// auto-chat（2026-10-02 增补）：/v3/config 的 IDE 路下发的自动选档别名——实测
+// name 是 "Auto"（与 default-model 同名）、disabledMultimodal=true、无 reasoning
+// 字段，被 agent/chat 两个自动选档 agent 引用，是**同一条策略**在 IDE 侧的 id。
+// 它与 default-model 是同一回事，不隐藏会出现两个 "Auto"（用户无从分辨选哪个）。
+// 注意它**不是** v3 独有模型的代表——真正的 v3 独有可调用模型（deepseek 系列等）
+// 不受本名单影响（见 catalog.go 的追加步）。
+//
 // 想展示它们：config 里 models.hidden_models 显式给 [] （空数组 = 全不隐藏）。
 var DefaultHiddenModels = []string{
 	"default-model",
@@ -25,6 +32,7 @@ var DefaultHiddenModels = []string{
 	"balanced-model",
 	"primary-model",
 	"deep-model",
+	"auto-chat",
 }
 
 // HiddenSet 对外隐藏的模型名集合（大小写不敏感，nil 集合 = 不隐藏任何模型）。

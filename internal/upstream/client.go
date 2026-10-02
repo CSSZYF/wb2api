@@ -1372,7 +1372,12 @@ type ModelInfo struct {
 	CanDisableThinking bool     // reasoning.canDisableThinking：思考可关（off 档可用）
 	SupportsReasoning  bool     // supportsReasoning：模型支持思考
 	SupportsImages     bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
-	Credits            string   // credits：积分倍率（如 "x0.79"）
+	// Tags 上游条目的 tags（如 ["text-to-image"] / ["craft"] / ["badge:企业版:#…"]）。
+	// 只用于 nonChatModel 判定（image-to-image 等非对话模型没有 nes-/completion-/
+	// codewise- 前缀、maxOutputTokens 也非 tiny，tags 是唯一识别依据），
+	// 不透出到 /v1/models（面板也不需要）。
+	Tags    []string
+	Credits string // credits：积分倍率（如 "x0.79"）
 
 	// 优惠（modelPromotions，/v3/config data.modelPromotions，见 modelpromo.go）：
 	// Credits 是**牌价**（转正后基准倍率），Promo* 是当前生效的限时优惠——面板据此
@@ -1385,10 +1390,14 @@ type ModelInfo struct {
 }
 
 // nonChatModel 判定是否非对话模型（应从模型列表过滤掉）。
-// 来源：harness buddy.ts:547-555。三类规则：
+// 来源：harness buddy.ts:547-555。四类规则：
 //   - id 前缀 nes-/completion-/codewise-：嵌入/补全/代码专用模型，选了报 code=11102。
-//   - maxOutputTokens ≤ 256：tiny 输出非对话模型。
-//   - tags 含 text-to-image：图片生成模型，非本网关用途。
+//   - maxOutputTokens ≤ 256：tiny 输出非对话模型。**注意判据含 >0**：字段缺失（0）
+//     是"未知"而非"tiny"，不得据此过滤（enhance-1.0 就不返回 maxOutputTokens）。
+//   - tags 含 text-to-image / image-to-image：图像生成 / 图像编辑模型，非本网关用途
+//     （实测 CN 下发 hunyuan-image-alpha-edit 带 image-to-image，重写前漏挡）。
+//   - tags 里的营销/能力标注（"badge:企业版:#3B82F6"、"craft"）**不得**触发过滤：
+//     它们描述的是订阅档位与能力标签，不是模型类型（o4-mini 带 badge: 仍是对话模型）。
 func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
 	for _, p := range [...]string{"nes-", "completion-", "codewise-"} {
@@ -1400,7 +1409,8 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 		return true
 	}
 	for _, t := range tags {
-		if t == "text-to-image" {
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "text-to-image", "image-to-image", "text-to-image-edit":
 			return true
 		}
 	}
@@ -1457,6 +1467,13 @@ type ModelFetchDiag struct {
 	RawModelIDs []string          `json:"raw_model_ids"` // 上游 models[] 的原始 id（nonChatModel 过滤前）
 	AllModelIDs []string          `json:"all_model_ids"` // 通过 nonChatModel 过滤后的全部模型 id（保序）
 	Dropped     []string          `json:"dropped"`       // 在 AllModelIDs 但未进入结果（agents 未列 / disabled）
+	// V3OnlyIDs 企业端点**没有**、由 /v3/config 追加进目录的 id（升序）。
+	//
+	// 为什么单独摊出来：这批 id 是"面板上看不到某个模型"这类问题的第一个嫌疑
+	// （实测 2026-10-02：global 侧有 8 条，重写前面板路径缺追加步导致它们全部不可见）。
+	// 与 Dropped 配对读——Dropped 是"上游给了但被筛掉"，V3OnlyIDs 是"只有 v3 给了、
+	// 靠追加才进得来"，两者合起来能回答"这个模型为什么不在列表里"的全部成因。
+	V3OnlyIDs []string `json:"v3_only_ids"`
 }
 
 // ModelFetchAgent 上游 agents 数组的一项（只取诊断需要的字段）。
@@ -1608,7 +1625,8 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 	allIDs := make([]string, 0, len(env.Data.Models)) // 保上游返回序，供无 agents 时兜底
 	for _, m := range env.Data.Models {
 		// 非对话模型（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
-		// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
+		// tags 含 text-to-image / image-to-image）根本不进返回列表
+		// （来源：harness buddy.ts:547-555，image-to-image 为 2026-10-02 补）。
 		if nonChatModel(m.ID, m.MaxOutputTokens, m.Tags) {
 			continue
 		}
@@ -1627,7 +1645,8 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			SupportsReasoning:  m.SupportsReasoning,
 			SupportsImages:     m.SupportsImages,
-			Credits:            m.Credits,
+			Tags:               m.Tags,
+			Credits:            normalizeCredits(m.Credits),
 		}, m.Disabled}
 		allIDs = append(allIDs, m.ID)
 	}
@@ -1705,7 +1724,35 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 		}
 	}
 	if overlay, ok := c.v3OverlayFor(a); ok {
-		out = mergeModelCapabilities(out, overlay)
+		// 单一合并入口（catalog.go）：能力覆盖 + credits 以企业端点优先 +
+		// 追加 v3 独有 id。重写前这里调 mergeModelCapabilities——**没有追加步**，
+		// 于是 CLI 路独有的 5 条（deepseek-v4.1-flash-sg / glm-5.3-flash /
+		// kimi-k2.8-preview / gpt-6-astra / hy4-preview-f）在面板上一条都看不到，
+		// 而 /v1/models 路径看得到（同目录两种投影漂移）。
+		//
+		// upstreamIDs 取**过滤前的全表**（diag.AllModelIDs）∪ base：判据必须是
+		// "上游目录有没有列过它"，不是"白名单留没留它"——CN 的 agents[cli] 白名单
+		// 刻意排除了企业端点列出的 11 条（deepseek-v4-flash / glm-4.6 / kimi-k2.5 …），
+		// 用 base 当判据会把它们当成"v3 独有"重新追加回来，白名单语义被推翻。
+		upstreamIDs := StringSet(diag.AllModelIDs)
+		for i := range out {
+			upstreamIDs[out[i].ID] = true
+		}
+		//
+		// 追加清单入诊断（V3OnlyIDs）：这是"面板看不到某模型"类问题的第一嫌疑，
+		// 摊在 diag 里就不必靠猜（重写前的 diag 只记 Dropped——那是"上游给了但被筛掉"，
+		// 回答不了"只有 v3 给了、追加步有没有生效"）。
+		seenOut := make(map[string]bool, len(out))
+		for i := range out {
+			seenOut[out[i].ID] = true
+		}
+		out = MergeCatalogOverlay(out, overlay, upstreamIDs)
+		for i := range out {
+			if !seenOut[out[i].ID] {
+				diag.V3OnlyIDs = append(diag.V3OnlyIDs, out[i].ID)
+			}
+		}
+		sort.Strings(diag.V3OnlyIDs)
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
 	cache := make(map[string][]string, len(out))
@@ -1788,14 +1835,15 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		Code int `json:"code"`
 		Data struct {
 			Models []struct {
-				ID                string `json:"id"`
-				Name              string `json:"name"`
-				MaxInputTokens    int64  `json:"maxInputTokens"`
-				MaxOutputTokens   int64  `json:"maxOutputTokens"`
-				MaxAllowedSize    int64  `json:"maxAllowedSize"`
-				Credits           string `json:"credits"`
-				SupportsReasoning bool   `json:"supportsReasoning"`
-				SupportsImages    bool   `json:"supportsImages"`
+				ID                string   `json:"id"`
+				Name              string   `json:"name"`
+				MaxInputTokens    int64    `json:"maxInputTokens"`
+				MaxOutputTokens   int64    `json:"maxOutputTokens"`
+				MaxAllowedSize    int64    `json:"maxAllowedSize"`
+				Credits           string   `json:"credits"`
+				SupportsReasoning bool     `json:"supportsReasoning"`
+				SupportsImages    bool     `json:"supportsImages"`
+				Tags              []string `json:"tags"`
 				Reasoning         struct {
 					Effort             string   `json:"effort"`
 					DefaultEffort      string   `json:"defaultEffort"`
@@ -1847,7 +1895,8 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			SupportsReasoning:  m.SupportsReasoning,
 			SupportsImages:     m.SupportsImages,
-			Credits:            m.Credits,
+			Tags:               m.Tags,
+			Credits:            normalizeCredits(m.Credits),
 		}
 	}
 	// 补入试用横幅模型（ModelTrialBanner，吸收上游 b498416）：上游把「N 天免费试用」
@@ -1888,65 +1937,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	return out, nil
 }
 
-// mergeModelCapabilities 用 IDE /v3/config 覆盖 CLI 目录里同 id 的窗口与思考档。
-// 只填 overlay 里有值的字段，避免空配置把 CLI 已解析结果抹掉。
-func mergeModelCapabilities(base []ModelInfo, overlay map[string]ModelInfo) []ModelInfo {
-	if len(overlay) == 0 {
-		return base
-	}
-	for i, mi := range base {
-		ov, ok := overlay[mi.ID]
-		if !ok {
-			continue
-		}
-		if ov.ContextWindow > 0 {
-			mi.ContextWindow = ov.ContextWindow
-		}
-		if ov.MaxTokens > 0 {
-			mi.MaxTokens = ov.MaxTokens
-		}
-		if ov.MaxAllowedSize > 0 {
-			mi.MaxAllowedSize = ov.MaxAllowedSize
-		}
-		if len(ov.Efforts) > 0 {
-			mi.Efforts = ov.Efforts
-		}
-		if ov.DefaultEffort != "" {
-			mi.DefaultEffort = ov.DefaultEffort
-		}
-		if ov.CanDisableThinking {
-			mi.CanDisableThinking = true
-		}
-		if ov.SupportsReasoning {
-			mi.SupportsReasoning = true
-		}
-		if ov.SupportsImages {
-			mi.SupportsImages = true
-		}
-		if ov.Credits != "" {
-			mi.Credits = ov.Credits
-		}
-		// 限时优惠同样只填有值字段：overlay 未挂优惠（该模型无 modelPromotions 命中）
-		// 时不得清空基底已有的 promo（promo 只由 /v3/config 提供，企业端点没有）。
-		if ov.PromoFactor != nil {
-			mi.PromoFactor = ov.PromoFactor
-		}
-		if ov.PromoCredits != "" {
-			mi.PromoCredits = ov.PromoCredits
-		}
-		if ov.PromoLabel != "" {
-			mi.PromoLabel = ov.PromoLabel
-		}
-		if ov.PromoNote != "" {
-			mi.PromoNote = ov.PromoNote
-		}
-		if ov.Name != "" {
-			mi.Name = ov.Name
-		}
-		base[i] = mi
-	}
-	return base
-}
+// mergeModelCapabilities 已删除（2026-10-02 目录重写）：能力覆盖与追加 id 的语义
+// 收进 catalog.go 的 MergeCatalogOverlay，两条链路共用一份实现。
+// 删它的直接理由是它**缺追加步**——v3 独有 id 完全不进结果，面板因此比
+// /v1/models 少 8 个模型；保留一份"少一半语义"的合并函数就是留着第二次漂移的机会。
 
 // UserResource 查询账号积分余额与总额度（所有套餐聚合）。remain 负值钳 0；
 // total 取与 remain 同源的额度字段（CycleCapacitySize 优先，无周期额度退
