@@ -87,6 +87,54 @@ func TestMergePinnedUpstreamWins(t *testing.T) {
 	}
 }
 
+// TestFillMissingFromPinned 字段级兜底：上游给了条目但**字段缺失**时补写死快照，
+// 上游给了的字段一律不动（方向恒为上游优先）。
+//
+// 场景（2026-10-02 实测）：deepseek-v4.1-flash 只在 v3-CLI 下发（企业端点没有），
+// v3 探测半残（5min 负缓存 / schema 变更）时目录里仍有该 id 但 credits 为空——
+// 面板显示 "—"，而写死快照里 x0.00 是已知真值。
+func TestFillMissingFromPinned(t *testing.T) {
+	pinned := []PinnedModel{{
+		ID: "deepseek-v4.1-flash", Name: "Deepseek-V4.1-Flash", Credits: "x0.00",
+		ContextLength: 1000000, MaxOutputTokens: 128000, DefaultEffort: "high", SupportsReasoning: true,
+	}}
+
+	// 上游只给了裸 id（credits/窗口/档位全缺）→ 字段级补齐。
+	in := []ModelInfo{{ID: "deepseek-v4.1-flash"}}
+	got := FillMissingFromPinned(in, pinned)
+	if got[0].Credits != "x0.00" {
+		t.Errorf("credits=%q want x0.00（字段级兜底）", got[0].Credits)
+	}
+	if got[0].ContextWindow != 1000000 || got[0].MaxTokens != 128000 {
+		t.Errorf("窗口/输出未补齐：%+v", got[0])
+	}
+	if got[0].DefaultEffort != "high" || !got[0].SupportsReasoning {
+		t.Errorf("档位未补齐：%+v", got[0])
+	}
+
+	// 上游给了 credits/窗口 → 上游权威（写死快照让位，哪怕值不同）。
+	in = []ModelInfo{{ID: "deepseek-v4.1-flash", Credits: "x0.09", ContextWindow: 500000, MaxTokens: 64000}}
+	got = FillMissingFromPinned(in, pinned)
+	if got[0].Credits != "x0.09" || got[0].ContextWindow != 500000 || got[0].MaxTokens != 64000 {
+		t.Errorf("上游数据被写死快照覆盖：%+v", got[0])
+	}
+	// 能力字段 fill-only：上游给了 DefaultEffort 时不被写死值改写。
+	in = []ModelInfo{{ID: "deepseek-v4.1-flash", DefaultEffort: "low"}}
+	got = FillMissingFromPinned(in, pinned)
+	if got[0].DefaultEffort != "low" {
+		t.Errorf("上游 DefaultEffort 被覆盖：%q", got[0].DefaultEffort)
+	}
+
+	// 不在写死名单里的 id 不动；空名单原样返回。
+	in = []ModelInfo{{ID: "other-model"}}
+	if got := FillMissingFromPinned(in, pinned); got[0].Credits != "" || got[0].ContextWindow != 0 {
+		t.Errorf("名单外条目被改写：%+v", got[0])
+	}
+	if got := FillMissingFromPinned(in, nil); !reflect.DeepEqual(got, in) {
+		t.Errorf("空写死名单应原样返回，got %v", got)
+	}
+}
+
 // TestPinnedEntryShape /v1/models 的条目形态：空 supported_efforts 不输出该键。
 func TestPinnedEntryShape(t *testing.T) {
 	p := PinnedModel{

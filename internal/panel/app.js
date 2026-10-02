@@ -782,19 +782,45 @@ function outCell(m, pr) {
 /* rateCell 倍率列：牌价 vs 生效价（吸收上游 2b0eedd）。上游 credits 是牌价（转正后
    基准倍率），modelPromotions 给当前生效折扣（限时免费 factor=0 / 夜间五折 0.5 等）
    ——WorkBuddy 客户端显示的正是生效价。有折扣：生效价大字 + 标签 + 划线牌价，
-   悬停带时段说明；无 factor 只有标签（错峰类）：牌价 + 标签。 */
+   悬停带时段说明；无 factor 只有标签（错峰类）：牌价 + 标签。
+
+   真实价的两个口径（后端下发，前端只渲染不重算）：
+   - m.free：生效倍率 ≤ 0（有 promo 用 factor，否则解析牌价）→ 补「免费」标签，
+     x0.00 一眼可辨（判定与保留积分的免费判定同源，见 upstream.EffectiveMultiplier）；
+   - m.credits 为空且无 promo → "—"（**缺失 ≠ 免费**：绝不回填 0、绝不标免费）。 */
 function rateCell(m) {
   const tip = m.promo_note ? ' title="' + esc(m.promo_note) + '"' : '';
+  const freeTag = '<span class="tag ok">免费</span>';
   if (m.promo_factor != null && m.promo_credits) {
     const base = m.credits ? ' <s style="color:var(--ink-3);font-size:11.5px">' + esc(m.credits) + '</s>' : '';
-    const label = m.promo_label ? ' <span class="tag ok">' + esc(m.promo_label) + '</span>' : '';
+    // 有标签用上游标签（限时免费/夜间折扣…）；只有 factor=0 没标签时补「免费」。
+    const label = m.promo_label ? ' <span class="tag ok">' + esc(m.promo_label) + '</span>'
+      : (m.free ? ' ' + freeTag : '');
     return '<span' + tip + ' style="cursor:help"><b>' + esc(m.promo_credits) + '</b>' + label + base + '</span>';
   }
   if (m.promo_label) {
     return '<span' + tip + ' style="cursor:help">' + (m.credits ? esc(m.credits) : '—') +
       ' <span class="tag warn">' + esc(m.promo_label) + '</span></span>';
   }
-  return m.credits ? esc(m.credits) : '—';
+  if (!m.credits) return '—';
+  return esc(m.credits) + (m.free ? ' ' + freeTag : '');
+}
+
+/* REALM_BADGE 模型名下方的域徽章文案（用户口径：国际服 / 国服）。
+   与 REALM_LABEL（切换器里的「国际版/国内版」）分开：徽章要的是"手动加模型时该写
+   哪个前缀"的域名词，与前缀 global:/cn: 一一对应。 */
+const REALM_BADGE = { cn: '国服', global: '国际服' };
+
+/* prefixedModelID 拼「realm 前缀 + 裸 id」的完整模型名（复制到客户端用）。
+   前缀形式与后端路由协议严格一致（internal/server/resolve_model.go 的
+   splitRealmPrefix：第一个冒号前恰为 cn/global 才剥离）——自创形式（intl:）会被
+   当成裸模型名静默走缺省域。已带前缀的**不重复加**；空 id / 未知域原样返回。 */
+function prefixedModelID(realm, id) {
+  id = String(id == null ? '' : id).trim();
+  if (!id) return '';
+  if (/^(cn|global):/.test(id)) return id;
+  if (realm !== 'cn' && realm !== 'global') return id;
+  return realm + ':' + id;
 }
 
 /* ── 模型与档位 ─────────────────────────────────────────────────────── */
@@ -852,7 +878,15 @@ async function loadModels() {
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
       const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
         : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div></td>' +
+      // 域徽章 + 带前缀的完整 id：用户手动加模型只走一个域就靠这个 id
+      // （后端 prefixed_id 与本地构造同源，前者缺失时回退本地构造）。
+      const badge = REALM_BADGE[d.realm] ? ' <span class="realm-tag">' + esc(REALM_BADGE[d.realm]) + '</span>' : '';
+      const pid = m.prefixed_id || prefixedModelID(d.realm, m.id);
+      return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
+        '<td class="who"><div class="nm md-copy" data-copy-id="' + esc(pid) + '" title="点击复制：' + esc(pid) + '">' +
+        esc(m.id) + badge + '</div>' +
+        '<div class="id">' + esc(m.name || '') + '</div>' +
+        '<div class="pid" title="' + esc(pid) + '">' + esc(pid) + '</div></td>' +
         '<td class="num">' + rateCell(m) + '</td>' +
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -876,6 +910,15 @@ async function loadModels() {
     parts.push('已刷新降级缓存');
     if (hit) parts.push(hit + ' 个有实测上限');
     $('mdNote').textContent = parts.join(' · ');
+    // 点击模型名 → 复制「带 realm 前缀的完整 id」（用户手动加模型只走一个域用）。
+    // 在渲染后逐行绑（表体整体重建，旧监听随节点一起被回收，不会重复绑定）；
+    // copyText 自带非 secure context 的 execCommand 降级（见其注释）。
+    tb.querySelectorAll('.md-copy').forEach(el => el.onclick = async () => {
+      const id = el.dataset.copyId || '';
+      if (!id) return;
+      try { await copyText(id); toast('已复制 ' + id, 'ok'); }
+      catch (e) { toast('复制失败，请手动选择：' + id, 'err'); }
+    });
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }

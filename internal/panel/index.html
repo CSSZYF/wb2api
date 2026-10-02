@@ -251,10 +251,19 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc.md { min-width: 700px; }
 .acc.md th, .acc.md td { padding: 10px 9px; }
 .who { min-width: 118px; max-width: 200px; }
+/* 模型表放宽模型列：多了一行「带前缀的完整 id」（global:deepseek-v4.1-flash-sg 这类
+   比裸名长一截），200px 会把前缀截掉——复制场景下用户要能看清完整 id。 */
+#view-models .who { max-width: 280px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 带 realm 前缀的完整 id（点击复制的目标）：第三行小字，可点。
+   与 .nm 的「模型名 + 域徽章」分开——徽章是给人看的域标注，这行是给客户端抄的 id。 */
+.who .pid { font-family: var(--mono); font-size: 11px; color: var(--accent); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 模型名可点复制：hover 给一点可点暗示（虚线 + 指针），不加按钮（行内多一个按钮是噪音）。 */
+.md-copy { cursor: pointer; }
+.md-copy:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }

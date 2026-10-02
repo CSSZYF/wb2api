@@ -302,13 +302,28 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	// 国际站模型目录在 /v2 家族（/console 家族返回 500 网关错误页）——由
 	// upstream.FetchModels 的 modelsPaths 按 realm 选路。两个域走同一条解析路径，
 	// 面板才能拿到倍率/默认档/思考档/上下文/最大输出这五列。
+	//
+	// 价格口径（2026-10-02 复核，分支 feat/real-price）：本路径（fetchModelsOnce →
+	// MergeCatalogOverlay）**保留 credits 原文**，与 /v1/models 的探测口径不同——
+	// 那条链路刻意把倍率摘进旁表（PLAN §3.D2「倍率不进路由/列表口径」，见
+	// upstream.detachCredits），本面板路径是**展示口径**，要的正是"这个模型此刻
+	// 多少钱"。实测（真实 global 账号）：deepseek-v4.1-flash 走 v3-CLI 带出 x0.00、
+	// -sg 带出 x0.03、hy4-preview 取企业端点的 x0.00（计费目录权威，不被 v3 牌价
+	// x0.29 覆盖，见 MergeCatalogOverlay §2）。
 	infos, diag, err := p.cfg.Upstream.FetchModelsDiag(acct)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
 		return
 	}
 	countUpstream := len(infos)
-	// 写死条目兜底（上游没返回但可调用的模型）；上游给了同名条目时以上游为准。
+	// 写死条目兜底，两级（顺序固定：先补字段，再补条目）：
+	//   ① 字段级（FillMissingFromPinned）：上游给了条目但**没给该字段**时补——
+	//      典型是 v3 探测半残（5min 负缓存 / 上游改 schema）时 deepseek-v4.1-flash
+	//      仍在线（静态名单/裸 id）但 credits 为空；写死快照里 x0.00 是已知真值，
+	//      不该因为链路半残而显示 "—"（用户点名要「看到真实价格」）。
+	//   ② 条目级（MergePinned）：上游压根没有这个 id 时整条追加（既有语义不变）。
+	// 两个方向都是「上游数据优先」：上游给了的字段/条目一律不被写死快照覆盖。
+	infos = upstream.FillMissingFromPinned(infos, p.cfg.PinnedModels)
 	infos = upstream.MergePinned(infos, p.cfg.PinnedModels)
 	// 与 /v1/models 同一份隐藏名单：面板能看见的模型，客户端一定也能调用。
 	infos = p.cfg.HiddenModels.FilterInfo(infos)
@@ -326,6 +341,16 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			"supports_reasoning":   mi.SupportsReasoning,
 			"supports_images":      mi.SupportsImages,
 			"credits":              mi.Credits,
+			// prefixed_id：带 realm 前缀的完整模型名（后端路由协议 "cn:"/"global:"，
+			// 见 server.splitRealmPrefix）——用户手动加模型只走一个域就靠它（复制用）。
+			// id 字段保持裸名（既有契约不破，客户端/脚本按裸名比对）。
+			"prefixed_id": realmPrefixedID(realm, mi.ID),
+		}
+		// free：生效倍率 ≤ 0（有 promo 用 promo factor，否则解析牌价）——判定与保留
+		// 积分的免费判定同源（upstream.EffectiveMultiplier），前端只渲染不重算。
+		// 缺失/未知一律不给该键（**缺失 ≠ 免费**，前端据此显示 "—" 而不是 0）。
+		if f, ok := mi.EffectiveMultiplier(); ok && f <= upstream.FreeModelMultiplierThreshold {
+			entry["free"] = true
 		}
 		// 限时优惠（modelPromotions，吸收上游 2b0eedd）：credits 是**牌价**，
 		// promo_* 是当前生效折扣（限时免费 factor=0 / 夜间五折 0.5 等）——WorkBuddy
@@ -398,6 +423,22 @@ func (p *Panel) defaultRealm() string {
 		return "cn"
 	}
 	return "global"
+}
+
+// realmPrefixedID 拼「realm 前缀 + 裸 id」的完整模型名（面板显示与复制用）。
+//
+// 前缀形式与**后端路由协议**严格一致（internal/server/resolve_model.go 的
+// splitRealmPrefix：第一个冒号前恰为 cn/global 才剥离，大小写敏感）——用户把这个 id
+// 贴进客户端配置，网关才会按他指定的域路由。自创形式（intl: / 国际服:）会被
+// splitRealmPrefix 当成裸模型名，静默落到缺省域（用户以为锁定了域，其实没有）。
+//
+// realm 未知（空串/其它值）或 id 为空 → 原样返回裸 id（不编造前缀）。
+func realmPrefixedID(realm, id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" || (realm != "cn" && realm != "global") {
+		return id
+	}
+	return realm + ":" + id
 }
 
 // nonNil 把 nil 切片换成空切片，避免 JSON 里出现 null（前端 .length 会炸）。
