@@ -504,3 +504,42 @@ func snapshotCreditOf(infos []ModelInfo, id string) string {
 	}
 	return ""
 }
+
+// TestGlobalModelInfosStaleSnapshotKeepsLastSuccess 陈旧容错出口：TTL 过期后
+// GlobalModelInfosSnapshot 返回 nil（展示口径不变），但 GlobalModelInfosStaleSnapshot
+// 仍返回最近一次成功目录（含倍率旁表）——保留积分的免费判定用它，避免 global 域在
+// 目录刷新空档期把免费模型全误拦（对照 a4557dc：倍率表跨刷新持久、读时不判过期）。
+func TestGlobalModelInfosStaleSnapshotKeepsLastSuccess(t *testing.T) {
+	c, _ := globalTestClient(t, func(path string) (int, string) {
+		if path != "/v2/enterprises/personal/models" {
+			return 500, "<html>500</html>"
+		}
+		return 200, `{"code":0,"data":{"models":[{"id":"free-g","credits":"x0.00","maxInputTokens":131072}],"agents":[{"name":"cli","models":["free-g"]}]}}`
+	})
+	c.FetchGlobalModelInfos(globalAuth())
+
+	// 未过期：两个出口都给目录。
+	if got := c.GlobalModelInfosSnapshot(); len(got) == 0 {
+		t.Fatal("未过期时 GlobalModelInfosSnapshot 必须有目录")
+	}
+	if got := c.GlobalModelInfosStaleSnapshot(); len(got) == 0 {
+		t.Fatal("未过期时 GlobalModelInfosStaleSnapshot 必须有目录")
+	}
+
+	// 人为拨到 TTL 之外（模拟"启动 1 小时后客户端不再拉目录"）。
+	c.globalModels.Lock()
+	c.globalModels.fetched = time.Now().Add(-globalModelsTTL - time.Minute)
+	c.globalModels.Unlock()
+
+	if got := c.GlobalModelInfosSnapshot(); got != nil {
+		t.Fatalf("过期后 GlobalModelInfosSnapshot 必须返回 nil（展示口径不得放宽），got %d 条", len(got))
+	}
+	stale := c.GlobalModelInfosStaleSnapshot()
+	if len(stale) == 0 {
+		t.Fatal("过期后 GlobalModelInfosStaleSnapshot 必须仍返回最近一次成功目录（保底免费判定用）")
+	}
+	// 倍率旁表同样保留（否则"陈旧目录"里的免费模型仍判不出免费）。
+	if !IsFreeModel(stale, "free-g") {
+		t.Error("陈旧快照必须仍带倍率（x0.00 → 免费），否则免费判定在空档期整体失效")
+	}
+}

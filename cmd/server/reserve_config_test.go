@@ -289,3 +289,38 @@ func TestFreeModelLookupWiring(t *testing.T) {
 		t.Error("upstream.IsFreeModel 应把 x0.00 判为免费（倍率口径）")
 	}
 }
+
+// TestWarmModelCatalogWiring main 的启动预热接线必须存在（server.WarmModelCatalog）。
+//
+// 缺了这条接线，重启后到首次 /v1/models 或面板模型页被访问之前，两个目录缓存都是冷的
+// ——保留积分的免费判定按"缺失 ≠ 免费"答"非免费"，余额触底的号会把免费模型一并拦掉
+// （只剩内置白名单那三个），正是本功能要修的病灶。上游对同一空窗期的实测（a4557dc）：
+// "重启后 2 分钟，97 分的账号打收费模型归零；倍率表当时尚未建立"。
+//
+// 为什么是源码级断言而不是行为断言：本项是**进程启动时序**接线（main 里的一行 go），
+// 行为已由 internal/server 的 TestWarmModelCatalog* 系列逐条锁定（缓存填充 / 逃生门 /
+// ctx 取消 / 空池）。这里只锁"main 真的调了它"——漏接线时 server 侧用例全绿而生产
+// 空窗期照旧，正是本仓反复修的失效模式。
+func TestWarmModelCatalogWiring(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	if !strings.Contains(string(src), "go server.WarmModelCatalog(ctx, up, p)") {
+		t.Error("main.go 缺启动预热接线（go server.WarmModelCatalog(ctx, up, p)）：" +
+			"重启后目录空窗期内保留积分会把免费模型一起拦掉")
+	}
+}
+
+// TestStatusReserveCreditsWiring /status 必须透出保留积分的生效值（对齐上游
+// credit_floor 的 /status 透出）。行为断言在 internal/server（TestStatusExposesReserveCredits）；
+// 这里锁 handler 侧的接线不被误删。
+func TestStatusReserveCreditsWiring(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "internal", "server", "handler.go"))
+	if err != nil {
+		t.Fatalf("read handler.go: %v", err)
+	}
+	if !strings.Contains(string(src), `"reserve_credits": h.cfg.Pool.ReserveCredits()`) {
+		t.Error("/status 缺 reserve_credits 透出：运维无法确认闸门当前是否生效")
+	}
+}

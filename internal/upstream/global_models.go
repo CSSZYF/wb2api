@@ -236,6 +236,34 @@ func (c *Client) GlobalModelInfosSnapshot() []ModelInfo {
 	if len(c.globalModels.models) == 0 || time.Since(c.globalModels.fetched) >= globalModelsTTL {
 		return nil
 	}
+	return c.globalModelInfosLocked()
+}
+
+// GlobalModelInfosStaleSnapshot 同 GlobalModelInfosSnapshot，但**不判 TTL**：返回最近
+// 一次成功探测的目录（含已过 1h TTL 的陈旧快照）；从未成功探测过 → nil。
+//
+// 与 GlobalModelInfosSnapshot 并存的理由（两者服务的目标不同，不是重复）：
+//   - GlobalModelInfosSnapshot 服务 /v1/models 与 /v1/stats 的倍率透出：那里的 TTL 是
+//     刻意的取舍（面板实时、API 缓存），过期即视为"没有目录"，调用方整体省略倍率字段；
+//   - 本函数服务**保留积分的免费判定**（server.freeModelLookup）：那里的问题是
+//     "这个模型此刻要不要花钱"，判错的方向是**误拦**（把免费模型当收费拦掉）。
+//     global 侧探测同样只在懒触发路径上填充，启动 1 小时后快照恒为 nil → 免费判定把
+//     global 免费模型全误拦。陈旧倍率的错判方向是"按上一轮牌价判收费"，远好于
+//     "因为没数据而把一切当收费"（后者让保底在刷新空档期整体失效）。
+//
+// 只读、零上游探测（与 GlobalModelInfosSnapshot 同一纪律：本函数在选号热路径上被调用）。
+func (c *Client) GlobalModelInfosStaleSnapshot() []ModelInfo {
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	return c.globalModelInfosLocked()
+}
+
+// globalModelInfosLocked 快照的公共实现：拷贝 models 并把旁表倍率填回 Credits。
+// 调用方必须已持 c.globalModels（TTL 判定由各出口自行决定，见两个导出的差异）。
+func (c *Client) globalModelInfosLocked() []ModelInfo {
+	if len(c.globalModels.models) == 0 {
+		return nil
+	}
 	out := make([]ModelInfo, len(c.globalModels.models))
 	copy(out, c.globalModels.models)
 	for i := range out {

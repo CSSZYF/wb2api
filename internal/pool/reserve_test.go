@@ -362,3 +362,45 @@ func TestReserveCreditsSequentialSkipReason(t *testing.T) {
 		t.Errorf("纯 reserve 跳过不得刷汇总行（持久条件，每次请求都会命中）: %q", s)
 	}
 }
+
+// TestReserveCreditsUnknownModelIsBlockedByDesign 「无观测」模型（上游称 tier 1）在我们
+// 的口径下**被拦**——这是与上游 credit_floor 的**有意差异**，本用例把理由与后果锁死。
+//
+// 上游 tier 1（本地台账无观测）豁免的理由（d19add4 的 body 原文）：「保底保的是留余额给
+// 免费模型用；tier 1 若拦会让账本过期/重启清零的触底号死锁在学不回来」。那条理由的
+// 前提是**免费判定靠本号本模型实测学习**（tier 2 = 该号在该模型上实测 cost>0）：
+//   - 无观测 ⇒ 不知道贵不贵 ⇒ 放行 ⇒ 打一笔学到（可能被打穿）；
+//   - 拦了 ⇒ 永远学不到 ⇒ 永久失联（死锁）。
+//
+// 上游后来自己也发现这个豁免是漏洞（39af6b7：高价新模型全池无观测 → 保底全放行 →
+// 两笔打穿 100 分并硬冷却到次日），于是补了「上游目录倍率」作兜底判据——最终形态是
+// 「本地台账 或 目录倍率，任一说收费就拦」。
+//
+// **我们的判定从来不是"学习"式**：免费集合来自**共享目录快照**（倍率口径）+ 静态白名单，
+// 与"这个号有没有实测过该模型"完全无关。故：
+//   - 死锁链条不存在：目录快照是**池级共享**的（任一账号拉一次 /v1/models 即填充，
+//     启动预热还会主动灌热），不依赖触底号自己去试；且触底号照常签到回血
+//     （见 TestNoteConsumedCreditsRecoversViaCheckin）；
+//   - 「无观测」在我们这里等于「目录未覆盖」，按既有契约「缺失 ≠ 免费」处理 →
+//     保守拦截。这与上游 39af6b7 之后的最终形态**方向一致**（未知不豁免），
+//     只是我们连"本地实测台账"这一层都没有（我们没有成本台账）。
+//
+// 代价必须写清楚（诚实记录）：目录未覆盖的**内部/别名模型**若恰好免费，会被保底误拦。
+// 兜底是白名单（用户点名的三个 id）——目录覆盖不全时用户可把模型 id 加进
+// defaultFreeModels。这是"宁可误拦（换个号，服务仍可用）也不放行（打穿号，最坏
+// 11.5 小时不可用）"的取舍，与本功能的方向一致。
+func TestReserveCreditsUnknownModelIsBlockedByDesign(t *testing.T) {
+	bothModes(t, func(t *testing.T, p *Pool, _ PickMode) {
+		p.SetReserveCredits(50)
+		// 目录未覆盖该模型（freeModelLookup 返回 false），且不在白名单 → 触底号被拦。
+		p.SetFreeModelLookup(func(model string) bool { return false })
+		if got := p.PickExcludingForModel(map[string]bool{"rich": true}, "internal-alias-model"); got != nil {
+			t.Fatalf("目录未覆盖的模型在触底号上必须保守拦截（缺失 ≠ 免费），got %s", got.UID)
+		}
+		// 免费判定说免费 → 放行（判定的唯一权威，与"有没有实测过"无关）。
+		p.SetFreeModelLookup(func(model string) bool { return model == "internal-alias-model" })
+		if got := p.PickExcludingForModel(map[string]bool{"rich": true}, "internal-alias-model"); got == nil {
+			t.Fatal("免费判定放行时不得拦（判定与账号是否实测过无关）")
+		}
+	})
+}

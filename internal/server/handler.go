@@ -403,6 +403,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		// reserve_credits 保留积分的**生效值**（0 = 关闭）：运维据此确认闸门当前是否
+		// 生效、线在哪，不必翻 config.json（面板热改后 config.json 与内存值的一致性
+		// 本身也需要一次确认）。对齐上游 credit_floor 的 /status 透出。
+		// 只新增字段，既有键不变（零回归）。
+		"reserve_credits": h.cfg.Pool.ReserveCredits(),
 	})
 }
 
@@ -699,11 +704,28 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	// 元数据路径（PickExcludingForRealmMeta）：豁免保留积分闸门，理由同
 	// fetchGlobalModelInfos 的注释（本调用不消费积分，被闸门拦住只会让用户在最需要看
 	// 模型列表时看不到列表）。
-	acct := h.cfg.Pool.PickExcludingForRealmMeta(nil, "cn")
+	return fetchCNCatalogAndCache(h.cfg.Upstream, h.cfg.Pool)
+}
+
+// fetchCNCatalogAndCache 拉取 CN 模型目录并写入 dynamicModelsCache（含成功/失败两条
+// 缓存语义），返回本次探测结果（无可用 CN 账号或探测失败时 nil）。
+//
+// 为什么抽成包级函数：拉取与缓存写入的知识此前只存在于 fetchDynamicModels（handler
+// 方法）里，而**启动预热**（WarmModelCatalog）需要同一份知识却拿不到 handler——
+// 若在预热侧另写一遍，两处必然漂移（一处加了负缓存、另一处忘了；或一处换了选号口径、
+// 另一处照旧）。这里把它收成单一事实来源，handler 与预热共用。
+//
+// 与 fetchDynamicModels 的分工：那个先查缓存/负缓存（懒触发的正常路径），本函数
+// **不查缓存**（调用方负责判定是否需要拉）——预热正是"缓存冷才拉"的场景。
+func fetchCNCatalogAndCache(up *upstream.Client, p *pool.Pool) []upstream.ModelInfo {
+	if up == nil || p == nil {
+		return nil
+	}
+	acct := p.PickExcludingForRealmMeta(nil, "cn")
 	if acct == nil {
 		return nil
 	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
+	infos, err := up.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
 		// 拉取失败只进负缓存（5min lastFail），不 NoteError（P1-6/发现 6）：
 		// NoteError 喂的是 chat 熔断器，models 端点偶发 5xx 会跨界惩罚 chat 通道
@@ -730,6 +752,30 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 	if len(dynamicModelsCache.ids) == 0 || time.Since(dynamicModelsCache.fetched) >= dynamicModelsTTL {
 		return nil
 	}
+	return dynamicModelsCache.ids
+}
+
+// cachedCatalogSnapshot 只读模型目录缓存，但**不判 TTL**：返回最近一次成功目录
+// （含已过 10min TTL 的陈旧快照）；从未成功拉取过 → nil。
+//
+// 为什么需要它与 cachedModelsSnapshot 并存（两者服务的目标不同，不是重复）：
+//   - cachedModelsSnapshot 服务 /v1/models 与 gateway_hint：那里的 TTL 是刻意的取舍
+//     （「面板实时、API 缓存」——目录新增模型时面板立即可见、公开端点最多滞后一个
+//     TTL），过期即视为"没有目录"，由调用方回落静态表；
+//   - 本函数服务**保留积分的免费判定**（server.freeModelLookup）：那里的问题是
+//     "这个模型此刻要不要花钱"，判错的方向是**误拦**（把免费模型当收费拦掉，
+//     用户的免费模型用不了 = 本功能要修的病灶）。而 /v1/models 的唯一调用方是客户端，
+//     绝大多数客户端只在启动时拉一次——启动 10 分钟后 CN 快照恒为 nil，免费判定
+//     随之把 CN 免费模型全误拦，且**每 10 分钟复发**，比一次性的启动空窗期更糟。
+//
+// 上游的对应取舍（a4557dc / ModelRate）：倍率表**跨刷新持久**——每次目录刷新整体替换，
+// 但读时不判过期。陈旧倍率的错判方向是"按上一轮牌价判收费"，远好于"因为没数据而
+// 把一切当收费"（后者让保底在目录刷新空档期整体失效）。本函数对齐同一方向。
+//
+// 只读、零上游调用（与 cachedModelsSnapshot 同一纪律：本函数在选号热路径上被调用）。
+func cachedCatalogSnapshot() []upstream.ModelInfo {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
 	return dynamicModelsCache.ids
 }
 
@@ -908,6 +954,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(latencyMs)
 		}
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
+
+		// 保留积分的余额插值（pool.reserve_credits）：把本次**实测扣费**立刻反映到
+		// 账号观测余额上，堵住"签到 / 余额刷新之间（默认 5 分钟一轮）余额不降"的空窗
+		// ——贵模型一笔能扣上百分，空窗期内触底的号仍按旧余额参与选号，用户设的底线
+		// 会被花掉（上游 credit_floor 用同一口径：签到权威值 − 每笔 usage.credit 实扣，
+		// 只会偏低不会偏高，是保底需要的安全方向）。
+		//
+		// 只在 HasCredit 时调用：**usage.credit 缺失 ≠ 0 成本**（上游部分响应不带该
+		// 字段），把"缺失"当 0 会让保底漏放、当"有消耗"会让免费请求凭空扣余额。
+		// 缺失时不动余额——下一轮余额刷新会以权威值覆盖，方向安全。
+		if obs.HasCredit {
+			h.cfg.Pool.NoteConsumedCredits(uid, obs.Credit)
+		}
 
 		// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
 		// 没拿到任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。
