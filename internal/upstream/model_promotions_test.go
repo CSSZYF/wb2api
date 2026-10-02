@@ -238,7 +238,7 @@ func TestMergeModelCapabilitiesCarriesPromo(t *testing.T) {
 		"glm-5.2": {ID: "glm-5.2", ContextWindow: 200, PromoFactor: &f,
 			PromoCredits: "0.50x", PromoLabel: "夜间折扣", PromoNote: "23:00–07:50"},
 	}
-	got := mergeModelCapabilities(base, overlay)
+	got := MergeCatalogOverlay(base, overlay, nil)
 	if got[0].PromoFactor == nil || *got[0].PromoFactor != 0.5 {
 		t.Fatalf("promo_factor 未搬运: %+v", got[0])
 	}
@@ -250,7 +250,7 @@ func TestMergeModelCapabilitiesCarriesPromo(t *testing.T) {
 	}
 	// overlay 无 promo 时不得把基底已有的 promo 抹掉（只填有值字段的语义）。
 	base2 := []ModelInfo{{ID: "m", PromoLabel: "保留"}}
-	got2 := mergeModelCapabilities(base2, map[string]ModelInfo{"m": {ID: "m", ContextWindow: 5}})
+	got2 := MergeCatalogOverlay(base2, map[string]ModelInfo{"m": {ID: "m", ContextWindow: 5}}, nil)
 	if got2[0].PromoLabel != "保留" {
 		t.Errorf("overlay 无 promo 时不应清空基底 promo: %+v", got2[0])
 	}

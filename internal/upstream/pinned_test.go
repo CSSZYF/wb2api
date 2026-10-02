@@ -22,8 +22,10 @@ func TestDefaultPinnedModels(t *testing.T) {
 	if ds.Name != "Deepseek-V4.1-Flash" {
 		t.Errorf("name=%q", ds.Name)
 	}
-	if ds.Credits != "x0.03" {
-		t.Errorf("credits=%q want x0.03", ds.Credits)
+	// x0.00（2026-10-02 更正）：v3-CLI（唯一下发该 id 的端点）实测 x0.00；
+	// 旧值 x0.03 是新加坡版 deepseek-v4.1-flash-sg 的价，当初跟进时抄混了。
+	if ds.Credits != "x0.00" {
+		t.Errorf("credits=%q want x0.00（实测 v3-CLI 原值；x0.03 是 -sg 变体的价）", ds.Credits)
 	}
 	if ds.ContextLength != 1000000 {
 		t.Errorf("context_length=%d want 1000000（面板显示 1000K）", ds.ContextLength)

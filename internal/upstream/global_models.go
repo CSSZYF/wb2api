@@ -148,8 +148,9 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 		if v3OK {
 			// 企业端点失败但 v3 可用：以 v3 目录兜底（补静态独有 id），**不算失败**
 			// （不写负缓存——上游确实返回了可用目录，只是走了另一条端点）。
+			// 倍率从 v3 条目摘（v3 是这一档唯一的价格来源），理由见 detachCredits。
 			merged := mergeGlobalModelInfos(v3CatalogInfos(v3Cap))
-			return c.storeGlobalModels(merged, nil)
+			return c.storeGlobalModels(merged, detachCredits(merged))
 		}
 		// 两路全失败：负缓存 + 回落静态名单。倍率旁表一并清空（宁可省略，不可留旧值：
 		// 留下上一轮倍率会让 /v1/stats 展示与当前目录脱节的过期数字）。
@@ -167,20 +168,14 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 	// v3 是唯一的能力来源。v3 两路全失败 → 保持目录不变（能力字段由 context_catalog
 	// 知识表兜底，fail-soft：v3 挂了不得把目录整体打空）。
 	if v3OK {
-		merged = applyGlobalV3Catalog(merged, v3Cap)
+		// upstreamIDs=nil：global 探测路径的 base 就是企业端点全表（不过 agents 白名单），
+		// 故"base 已知"等价于"上游列过"（见 MergeCatalogOverlay 注释）。
+		merged = MergeCatalogOverlay(merged, v3Cap, nil)
 	}
-	// 倍率旁表从**探测结果**建（静态独有条目无倍率：它们上游没返回，倍率未知——
-	// 不编造；v3 追加的条目同样无倍率——v3 的 credits 是展示口径的优惠信息，
-	// 与探测端点的计费倍率不是同一事实）。探测结果里的 Credits 字段只在此处被读取，
-	// 落旁表后即从 models 抹掉。
-	credits := make(map[string]string, len(probed))
-	for i := range merged {
-		if cr := merged[i].Credits; cr != "" {
-			credits[merged[i].ID] = cr
-			merged[i].Credits = "" // D2：路由/列表口径恒无倍率
-		}
-	}
-	return c.storeGlobalModels(merged, credits)
+	// 倍率旁表：从合并后的目录摘（企业端点的 credits 优先，v3 只补企业端点没给的 id）。
+	// 静态独有条目无倍率——它们上游没返回，倍率未知，不编造。
+	// 摘取动作收在 detachCredits（两条分支共用，见其注释）。
+	return c.storeGlobalModels(merged, detachCredits(merged))
 }
 
 // storeGlobalModels 落缓存并返回目录（成功路径的公共尾巴：写 models/credits/fetched、
@@ -197,14 +192,19 @@ func (c *Client) storeGlobalModels(merged []ModelInfo, credits map[string]string
 
 // v3CatalogInfos 把 v3 能力表转成目录基底（企业端点不可用时的兜底源）：
 // 按 id 排序保证输出稳定（map 迭代序随机），并过 nonChatModel 过滤（v3 目录含
-// 嵌入/补全/图片生成类条目，选了会报 11102）。Credits 恒清空（PLAN §3.D2）。
+// 嵌入/补全/图片生成类条目，选了会报 11102）。
+//
+// Credits 保留在返回值里（**不再在此清空**）：调用方经 detachCredits 统一摘进倍率
+// 旁表并从目录条目抹掉（PLAN §3.D2 的"倍率不进路由/列表口径"仍成立，只是把
+// "摘"的动作收成一个函数，两条分支共用）。企业端点挂掉时 v3 是唯一价格来源——
+// 保留它，/v1/stats 与保留积分的免费判定才不至于在这一档整体失去依据。
 func v3CatalogInfos(cap map[string]ModelInfo) []ModelInfo {
 	ids := make([]string, 0, len(cap))
 	for id, mi := range cap {
 		if id == "" {
 			continue
 		}
-		if nonChatModel(mi.ID, mi.MaxTokens, nil) {
+		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 			continue
 		}
 		ids = append(ids, id)
@@ -212,11 +212,31 @@ func v3CatalogInfos(cap map[string]ModelInfo) []ModelInfo {
 	sort.Strings(ids)
 	out := make([]ModelInfo, 0, len(ids))
 	for _, id := range ids {
-		mi := cap[id]
-		mi.Credits = "" // D2：倍率不进路由/列表口径
-		out = append(out, mi)
+		out = append(out, cap[id])
 	}
 	return out
+}
+
+// detachCredits 把目录条目里的 Credits 摘进倍率旁表，并把条目上的字段清空
+// （PLAN §3.D2：倍率只经 GlobalModelInfosSnapshot 透出，不进 /v1/models 与路由口径）。
+//
+// 单一实现而非各处循环：重写前只有成功分支做了摘取，v3 兜底分支直接传 nil 旁表——
+// 同一条纪律两处写法，漏一处就是"企业端点挂掉时全部模型倍率未知"。
+// 返回 nil（而非空 map）表示"本轮没有任何倍率"——与 storeGlobalModels 的语义一致。
+func detachCredits(merged []ModelInfo) map[string]string {
+	var credits map[string]string
+	for i := range merged {
+		cr := merged[i].Credits
+		if cr == "" {
+			continue
+		}
+		if credits == nil {
+			credits = make(map[string]string, len(merged))
+		}
+		credits[merged[i].ID] = cr
+		merged[i].Credits = ""
+	}
+	return credits
 }
 
 // GlobalModelInfosSnapshot 只读 global 模型目录快照（TTL 内；含倍率原文）。
@@ -399,11 +419,23 @@ func (c *Client) probeGlobalV3Capabilities(a *auth.Auth) (map[string]ModelInfo, 
 	}
 }
 
-// mergeV3CapabilityMaps 两路 v3 能力表合并：primary（IDE 路）字段权威——响应更大、
-// 单条字段更全；secondary（CLI 路）只补 primary 没有的 id，不覆盖已有条目。
+// mergeV3CapabilityMaps 两路 v3 能力表合并：**逐字段 fill-only**（primary=IDE 路
+// 字段更全，优先；secondary=CLI 路只补 primary 的零值）。
+//
+// 2026-10-02 重写（此前是"primary 整条优先，secondary 只补 primary 没有的 id"）：
+// 整条优先会把 primary 的**空壳**留下来。实测形态：hy4-preview-f 只在
+// productFeaturesConfig.ModelTrialBanner 里，能力靠 targetModelId(hy4-preview) 继承
+// ——而 **IDE 路的 data.models 没有 hy4-preview**（IDE 只 13 条），继承不到任何能力，
+// 于是 IDE 路产出一个零能力空壳；CLI 路有 hy4-preview，能正常继承。
+// 「primary 整条优先」让空壳覆盖了 CLI 的完整条目，面板上 hy4-preview-f 的窗口 /
+// 输出上限全是 0（用户看到"试用模型没有上下文长度"）。
+// 逐字段 fill-only 让两路各自补对方缺的字段，空壳不再有害。
 func mergeV3CapabilityMaps(primary, secondary map[string]ModelInfo) map[string]ModelInfo {
 	out := make(map[string]ModelInfo, len(primary)+len(secondary))
 	for id, mi := range primary {
+		if sec, ok := secondary[id]; ok {
+			fillCapabilities(&mi, sec)
+		}
 		out[id] = mi
 	}
 	for id, mi := range secondary {
@@ -414,115 +446,13 @@ func mergeV3CapabilityMaps(primary, secondary map[string]ModelInfo) map[string]M
 	return out
 }
 
-// applyGlobalV3Catalog 把 v3 能力表并入 global 目录（吸收上游 9dce68a + b498416）：
+// applyGlobalV3Catalog 已删除（2026-10-02 目录重写）：合并语义收进 catalog.go 的
+// MergeCatalogOverlay，/v1/models 路径与面板路径共用一份实现。
 //
-//  1. **能力补全**：目录里已有的 id，用 v3 条目填补其零值能力字段（窗口 / 输出上限 /
-//     档位 / 能力旗标）——企业端点只给裸 id 时，v3 是唯一的能力来源（与 CN 侧
-//     mergeModelCapabilities 同哲学：只填有值的字段，不抹掉目录已解析出的结果）。
-//  2. **独有 id 补充**：v3 有而目录没有的 id（如 deepseek-v4.1-flash-sg、kimi-k2.8-preview、
-//     o4-mini，以及 ModelTrialBanner 的试用模型）追加进目录——它们**实际可调用**，
-//     不补则客户端选不到。追加前过 nonChatModel 过滤（v3 目录含嵌入/图片类条目），
-//     并按 id 排序保证输出稳定（map 迭代序随机）。
-//
-// 3. **限时优惠搬运**（Promo*，见下）：与能力字段相反，promo 是**覆盖**而非 fill-only。
-//
-// Credits 不进本路径（PLAN §3.D2）：调用方在建倍率旁表时从**探测结果**取，
-// 本函数追加的条目 Credits 恒空（试用模型更是刻意清空，见 fetchV3ConfigModelMap）。
-// Promo* 与 Credits 是**两个口径**（生效价 vs 牌价），搬 promo 不得顺手把 v3 的
-// credits 带进来——那会把"计费口径的牌价"污染成"展示口径的优惠价"（旁表只认探测端点）。
-func applyGlobalV3Catalog(base []ModelInfo, cap map[string]ModelInfo) []ModelInfo {
-	if len(cap) == 0 {
-		return base
-	}
-	seen := make(map[string]bool, len(base))
-	for i := range base {
-		seen[base[i].ID] = true
-		ov, ok := cap[base[i].ID]
-		if !ok {
-			continue
-		}
-		// 只填零值（fill-only）：目录已有真值时不覆盖，避免把企业端点的权威窗口
-		// 换成 v3 的另一个数（两者实测同源，但保守取值口径不变）。
-		if base[i].ContextWindow == 0 {
-			base[i].ContextWindow = ov.ContextWindow
-		}
-		if base[i].MaxTokens == 0 {
-			base[i].MaxTokens = ov.MaxTokens
-		}
-		if base[i].MaxAllowedSize == 0 {
-			base[i].MaxAllowedSize = ov.MaxAllowedSize
-		}
-		if len(base[i].Efforts) == 0 {
-			base[i].Efforts = ov.Efforts
-		}
-		if base[i].DefaultEffort == "" {
-			base[i].DefaultEffort = ov.DefaultEffort
-		}
-		if !base[i].CanDisableThinking {
-			base[i].CanDisableThinking = ov.CanDisableThinking
-		}
-		if !base[i].SupportsReasoning {
-			base[i].SupportsReasoning = ov.SupportsReasoning
-		}
-		if !base[i].SupportsImages {
-			base[i].SupportsImages = ov.SupportsImages
-		}
-		if base[i].Name == "" {
-			base[i].Name = ov.Name
-		}
-		// 限时优惠（modelPromotions）**fill-only**——与能力字段同口径。
-		//
-		// 2026-10-02 更正（本条此前是"无条件覆盖"，已修正）：那时的前提是
-		// 「promo 的唯一来源是 /v3/config，base 的 promo 恒为零值」，故覆盖等价于
-		// fill-only。该前提**已不成立**——企业端点现在也会下发 modelPromotions
-		// （见 parseGlobalModelInfos），base 进本函数时**可能已带 promo**。
-		// 若仍用覆盖，v3 未给 promo 的模型（cap 里 PromoFactor 为 nil）会被**清零**，
-		// 把企业端点刚挂上的生效价抹掉——实测症状就是「企业端点有 promo，面板却不显示」。
-		//
-		// 取 fill-only 后的语义：**cap 有值才覆盖**（v3 优先级更高，同模型两边都给时
-		// v3 胜出），cap 无值则保留 base（企业端点来源）。这同时满足两件事：
-		//   - v3 是更权威的 promo 源（含时段/优先级判定），有值时覆盖；
-		//   - 企业端点是**补充**源，补 v3 没给的那部分（例如 global 的 hy3 限时免费）。
-		//
-		// 时变语义的兜底：promo 过期后 applyModelPromotions 就不会再挂它，两侧
-		// 都不给值 → 字段自然保持零值；不存在"上一轮 promo 永久粘住"——因为 base
-		// 每轮由 probeGlobalModels 重新构造（parseGlobalModelInfos 现算 promo），
-		// 过期条目在源头就不会出现。CN 侧 mergeModelCapabilities 同为 fill-only，口径一致。
-		if ov.PromoFactor != nil {
-			base[i].PromoFactor = ov.PromoFactor
-		}
-		if ov.PromoCredits != "" {
-			base[i].PromoCredits = ov.PromoCredits
-		}
-		if ov.PromoLabel != "" {
-			base[i].PromoLabel = ov.PromoLabel
-		}
-		if ov.PromoNote != "" {
-			base[i].PromoNote = ov.PromoNote
-		}
-	}
-
-	extra := make([]string, 0, len(cap))
-	for id, mi := range cap {
-		if id == "" || seen[id] {
-			continue
-		}
-		if nonChatModel(mi.ID, mi.MaxTokens, nil) {
-			continue
-		}
-		extra = append(extra, id)
-	}
-	if len(extra) == 0 {
-		return base
-	}
-	sort.Strings(extra)
-	for _, id := range extra {
-		mi := cap[id]
-		mi.Credits = "" // D2：倍率不进路由/列表口径（旁表只从探测结果建）
-		base = append(base, mi)
-	}
-	return base
-}
+// 删它的理由：它与面板路径的 mergeModelCapabilities 是同一件事的两份实现，对
+// 「能力字段怎么合」「credits 谁优先」「独有 id 追加与否」各给一个答案——面板比
+// /v1/models 少 8 个模型、hy4-preview 显示牌价而非实扣价，都是这种漂移的产物。
+// 保留旧名会让后来者以为还有第二条合并链，故整体移除（无兼容包装）。
 
 // parseGlobalModelInfos 多信封兼容解析模型目录（吸收上游 c3cc888）。
 //
@@ -700,33 +630,7 @@ func fillGlobalMetadataFromLoose(out []ModelInfo, arr json.RawMessage) []ModelIn
 		if !ok {
 			continue
 		}
-		if out[i].ContextWindow == 0 {
-			out[i].ContextWindow = loose.ContextWindow
-		}
-		if out[i].MaxTokens == 0 {
-			out[i].MaxTokens = loose.MaxTokens
-		}
-		if out[i].MaxAllowedSize == 0 {
-			out[i].MaxAllowedSize = loose.MaxAllowedSize
-		}
-		if len(out[i].Efforts) == 0 {
-			out[i].Efforts = loose.Efforts
-		}
-		if out[i].DefaultEffort == "" {
-			out[i].DefaultEffort = loose.DefaultEffort
-		}
-		if !out[i].CanDisableThinking {
-			out[i].CanDisableThinking = loose.CanDisableThinking
-		}
-		if !out[i].SupportsReasoning {
-			out[i].SupportsReasoning = loose.SupportsReasoning
-		}
-		if !out[i].SupportsImages {
-			out[i].SupportsImages = loose.SupportsImages
-		}
-		if out[i].Name == "" {
-			out[i].Name = loose.Name
-		}
+		fillCapabilities(&out[i], loose)
 		if out[i].Credits == "" {
 			out[i].Credits = loose.Credits
 		}
@@ -749,7 +653,10 @@ type dynModelEntry struct {
 	// SupportsReasoning / SupportsImages 是能力旗标。
 	SupportsReasoning bool `json:"supportsReasoning"`
 	SupportsImages    bool `json:"supportsImages"`
-	Reasoning         struct {
+	// Tags 供 nonChatModel 判定（image-to-image 等非对话模型的唯一识别依据，
+	// 实测 CN 下发 hunyuan-image-alpha-edit 带该 tag）。
+	Tags      []string `json:"tags"`
+	Reasoning struct {
 		Effort             string   `json:"effort"`        // 老模型键
 		DefaultEffort      string   `json:"defaultEffort"` // 新模型键
 		CanDisableThinking bool     `json:"canDisableThinking"`
@@ -830,9 +737,11 @@ func parseGlobalModelEntries(entries []dynModelEntry) []ModelInfo {
 			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			SupportsReasoning:  m.SupportsReasoning,
 			SupportsImages:     m.SupportsImages,
-			// Credits 在此解析，但只作旁表来源：调用方落缓存时摘进 credits 旁表
-			// 并从返回条目抹掉（PLAN §3.D2：倍率不进 /v1/models 与路由口径）。
-			Credits: strings.TrimSpace(m.Credits),
+			Tags:               m.Tags,
+			// Credits 在此解析（归一 "x0.79 credits" 形态），但只作旁表来源：
+			// 调用方落缓存时经 detachCredits 摘进旁表并从返回条目抹掉
+			// （PLAN §3.D2：倍率不进 /v1/models 与路由口径）。
+			Credits: normalizeCredits(m.Credits),
 		})
 	}
 	return out
@@ -882,10 +791,21 @@ func parseGlobalModelLoose(obj map[string]any) (ModelInfo, bool) {
 		ContextWindow:  num("maxInputTokens", "contextWindow"),
 		MaxTokens:      num("maxOutputTokens", "maxTokens"),
 		MaxAllowedSize: num("maxAllowedSize"),
-		Credits:        str("credits"),
+		Credits:        normalizeCredits(str("credits")),
 	}
 	mi.SupportsReasoning, _ = obj["supportsReasoning"].(bool)
 	mi.SupportsImages, _ = obj["supportsImages"].(bool)
+	// tags 照常解析：nonChatModel 靠它识别 image-to-image 类非对话模型
+	// （该兜底路径此前完全不带 tags，等于把这类模型放行）。
+	if arr, ok := obj["tags"].([]any); ok {
+		for _, item := range arr {
+			if s, ok := item.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					mi.Tags = append(mi.Tags, s)
+				}
+			}
+		}
+	}
 	if r, ok := obj["reasoning"].(map[string]any); ok {
 		reasonStr := func(key string) string {
 			s, _ := r[key].(string)

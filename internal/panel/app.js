@@ -797,12 +797,51 @@ function rateCell(m) {
   return m.credits ? esc(m.credits) : '—';
 }
 
+/* ── 模型与档位 ─────────────────────────────────────────────────────── */
+/* realm 切换：CN 与国际版是**两份不同的上游目录**（模型集合与价格都不同——实测
+   CN 有 hy3-x / kimi-k2.7 / space-bunny，国际版有 deepseek-v4.1-flash-sg /
+   glm-5.3-flash / gpt-6-astra；同一模型两边价格也可能不同）。后端 models handler
+   一直支持 ?realm=，但面板没有选择器 → 用户永远只看得到一个域、无从对比。
+   选择器只渲染 realm_servable 为 true 的域（池内没账号的域不给按钮，点了必 503）。
+   当前域记在 mdRealm；首次进入由后端回显决定（纯 CN 部署 → cn）。 */
+let mdRealm = null;
+
+const REALM_LABEL = { cn: '国内版', global: '国际版' };
+
+/* renderModelRealms 按 realm_servable 渲染选择器 + 当前域与模型数回显。
+   数据来自同一次 /panel/api/models 响应（不再多打一次上游）：servable 与 realm
+   都是该响应的字段，切换时重新调用本函数即可。 */
+function renderModelRealms(d) {
+  const box = $('mdRealms');
+  const servable = d.realm_servable || {};
+  const realms = ['cn', 'global'].filter(r => servable[r]);
+  const cur = d.realm || 'global';
+  // 只有一个可用域时不渲染按钮（一个按钮的"选择器"是噪音），只留回显。
+  box.innerHTML = realms.length > 1
+    ? realms.map(r => '<button class="xs chip' + (r === cur ? ' on' : '') + '" data-realm="' + esc(r) + '">' +
+        esc(REALM_LABEL[r] || r) + '</button>').join('')
+    : '';
+  box.querySelectorAll('button[data-realm]').forEach(b => {
+    b.onclick = () => {
+      if (b.dataset.realm === mdRealm) return;
+      mdRealm = b.dataset.realm;
+      loadModels();
+    };
+  });
+  const n = (d.models || []).length;
+  $('mdRealmCur').textContent = (REALM_LABEL[cur] || cur) + ' · ' + n + ' 个模型' +
+    (realms.length > 1 ? '' : '（池内只有这一个域）');
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
+    const q = mdRealm ? '?realm=' + mdRealm : '';
+    const [d, pr] = await Promise.all([api('models' + q), api('model_probes').catch(() => ({}))]);
+    mdRealm = d.realm || mdRealm || 'global'; // 后端回显为准（缺省域由池内可用域决定）
+    renderModelRealms(d);
     const list = d.models || [];
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
@@ -830,6 +869,10 @@ async function loadModels() {
     if (!(dg.cli_agent_ids || []).length) parts.push('上游未给 agents 名单（按全表展示）');
     const dropped = dg.dropped || [];
     if (dropped.length) parts.push('未进列表 ' + dropped.length + ' 个（' + dropped.join(', ') + '）');
+    // v3 独有：企业端点没有、靠 /v3/config 追加进来的 id。与"未进列表"配对看——
+    // 前者是"上游给了但被筛掉"，这里是"只有 v3 给了、靠追加才进得来"。
+    const v3only = dg.v3_only_ids || [];
+    if (v3only.length) parts.push('v3 补充 ' + v3only.length + ' 个（' + v3only.join(', ') + '）');
     parts.push('已刷新降级缓存');
     if (hit) parts.push(hit + ' 个有实测上限');
     $('mdNote').textContent = parts.join(' · ');

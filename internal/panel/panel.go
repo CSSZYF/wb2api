@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -288,12 +289,8 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	realm := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("realm")))
 	if realm != "cn" && realm != "global" {
-		realm = "global"
-		if p.cfg.Pool.HasRealm("cn") && !p.cfg.Pool.HasRealm("global") {
-			realm = "cn" // 纯 CN 部署：默认查国内版
-		}
-	}
-	// 元数据路径（PickExcludingForRealmMeta）：本查询不消费积分，豁免保留积分闸门
+		realm = p.defaultRealm() // 纯 CN 部署回落国内版，两域都可用时取 global
+	} // 元数据路径（PickExcludingForRealmMeta）：本查询不消费积分，豁免保留积分闸门
 	// ——否则池内账号全部触底时面板「模型与档位」会 503，恰好是用户最需要看清
 	// "还剩什么免费模型"的时刻。理由见 internal/pool/reserve.go 文件头。
 	acct := p.cfg.Pool.PickExcludingForRealmMeta(nil, realm)
@@ -350,21 +347,57 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		"ok":     true,
 		"realm":  realm,
 		"models": out,
+		// realm_servable 两个域此刻是否可查（前端据此决定显示哪几个选择器）。
+		// 判据与缺省域回退同源：池内有没有该域的账号 + global 逃生门——池内没有的域
+		// 不给按钮，否则用户点一下必然吃 503「没有可用的 global 账号」。
+		"realm_servable": map[string]bool{
+			"cn":     p.realmServable("cn"),
+			"global": p.realmServable("global"),
+		},
 		// 只读诊断：上游到底给了什么、哪一步筛掉了谁。nil 切片统一序列化成 []，
 		// 前端与脚本都不用再判 null。
 		"diag": map[string]any{
-			"path":           diag.Path,
-			"cli_agent_ids":  nonNil(diag.CliAgentIDs),
-			"agents":         nonNilAgents(diag.Agents),
-			"raw_model_ids":  nonNil(diag.RawModelIDs),
-			"all_model_ids":  nonNil(diag.AllModelIDs),
-			"dropped":        nonNil(diag.Dropped),
+			"path":          diag.Path,
+			"cli_agent_ids": nonNil(diag.CliAgentIDs),
+			"agents":        nonNilAgents(diag.Agents),
+			"raw_model_ids": nonNil(diag.RawModelIDs),
+			"all_model_ids": nonNil(diag.AllModelIDs),
+			"dropped":       nonNil(diag.Dropped),
+			// v3_only_ids：企业端点没有、靠 /v3/config 追加进目录的 id。与 dropped
+			// 配对读能回答"某模型为什么不在列表里"的全部成因（上游没给 / 被筛掉 /
+			// 追加步失效——重写前面板路径缺追加步，这批 id 全部不可见）。
+			"v3_only_ids":    nonNil(diag.V3OnlyIDs),
 			"hidden":         p.cfg.HiddenModels.Names(),
 			"pinned":         nonNilPinned(p.cfg.PinnedModels),
 			"count_upstream": countUpstream,
 			"count_shown":    len(out),
 		},
 	})
+}
+
+// realmServable 报告该域此刻是否可查（供前端决定显示哪几个 realm 选择器）。
+//
+// 判据与缺省域回退**同源**（这是刻意的：两处若各写一份，会出现"选择器显示 global、
+// 点了却 503"）：池内有没有该域的账号；global 另受逃生门（auth.GlobalEnabled）约束
+// ——关掉逃生门时 global 账号会被 Realm() 判回 cn，选择器不该还留一个必 503 的按钮。
+func (p *Panel) realmServable(realm string) bool {
+	if p.cfg.Pool == nil || !p.cfg.Pool.HasRealm(realm) {
+		return false
+	}
+	if realm == "global" {
+		return auth.GlobalEnabled()
+	}
+	return true
+}
+
+// defaultRealm 缺省查询域：两域都可用时取 global（既有语义），只有 CN 时取 cn。
+// 与 models handler 的内联回退等价，抽出来是为了让 realm_servable 的判据能复用
+// 同一份知识（见 realmServable）。
+func (p *Panel) defaultRealm() string {
+	if p.cfg.Pool.HasRealm("cn") && !p.cfg.Pool.HasRealm("global") {
+		return "cn"
+	}
+	return "global"
 }
 
 // nonNil 把 nil 切片换成空切片，避免 JSON 里出现 null（前端 .length 会炸）。
