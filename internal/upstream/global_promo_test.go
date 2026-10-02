@@ -110,24 +110,33 @@ func TestGlobalPromoNotPollutingCredits(t *testing.T) {
 	}
 }
 
-// TestGlobalPromoOverwritesStale 时变语义（任务 ② 第 1 点）：promo 是**时变**的
-// （限时折扣会过期/切换档位），fill-only 会让上一轮的 promo 永久粘住。
-// 故本实现用**覆盖**：cap 里的 promo 是「本轮 /v3/config 的当前事实」，cap 未挂
-// promo 即代表此刻无生效优惠，必须把目录里的陈旧 promo 清掉。
+// TestGlobalPromoFillOnlyKeepsEnterpriseSource 口径更正（2026-10-02）：
+// 本函数对 promo 取 **fill-only**，而非此前的「无条件覆盖」。
 //
-// 对照：能力字段（窗口/档位）是慢变事实，仍保持 fill-only。
-func TestGlobalPromoOverwritesStale(t *testing.T) {
+// 为什么改：那条「覆盖」的前提是「promo 的唯一来源是 /v3/config，base 进本函数时
+// promo 恒为零值」。该前提**已不成立**——企业端点现在也会下发 modelPromotions
+// （global 的 /v2/enterprises/personal/models 实测 2 条），base 可能已带 promo。
+// 若仍覆盖，v3 未给 promo 的模型会被**清零**，把企业端点刚挂上的生效价抹掉
+// （实测症状：企业端点有 promo，面板却不显示）。
+//
+// 本用例锁定新语义：cap 无值 → base 的 promo 保留；能力字段照旧 fill-only。
+//
+// 时变语义（旧用例的关切）由**源头**保证：base 每轮由 probeGlobalModels 重建，
+// parseGlobalModelInfos 现算 promo（过期条目不挂）→ 不存在"上一轮 promo 永久粘住"。
+// 见 TestGlobalPromoFollowsCatalogRefresh（端到端两轮探测）。
+func TestGlobalPromoFillOnlyKeepsEnterpriseSource(t *testing.T) {
 	f := 0.5
 	base := []ModelInfo{{
 		ID: "glm-5.2", ContextWindow: 131072,
 		PromoFactor: &f, PromoCredits: "0.50x", PromoLabel: "夜间折扣", PromoNote: "23:00–07:50",
 	}}
-	// 本轮 v3/config 只剩能力字段（优惠已过期，modelPromotions 里没有它）。
+	// 本轮 v3/config 只剩能力字段（v3 侧无该模型的 promo）。
 	cap := map[string]ModelInfo{"glm-5.2": {ID: "glm-5.2", MaxTokens: 32768}}
 
 	got := applyGlobalV3Catalog(base, cap)
-	if got[0].PromoFactor != nil || got[0].PromoCredits != "" || got[0].PromoLabel != "" || got[0].PromoNote != "" {
-		t.Errorf("上一轮的 promo 粘住了（时变字段必须覆盖而非 fill-only）: %+v", got[0])
+	if got[0].PromoFactor == nil || got[0].PromoCredits != "0.50x" ||
+		got[0].PromoLabel != "夜间折扣" || got[0].PromoNote != "23:00–07:50" {
+		t.Errorf("v3 未给 promo 时不得抹掉 base 的来源（企业端点）: %+v", got[0])
 	}
 	// 能力字段仍是 fill-only：base 的窗口不被 cap 的零值抹掉，cap 的真值照常补进来。
 	if got[0].ContextWindow != 131072 {
@@ -135,6 +144,27 @@ func TestGlobalPromoOverwritesStale(t *testing.T) {
 	}
 	if got[0].MaxTokens != 32768 {
 		t.Errorf("MaxTokens=%d want 32768（cap 的真值应补入）", got[0].MaxTokens)
+	}
+}
+
+// TestGlobalPromoV3OverridesEnterprise cap 有值时**覆盖** base：v3 是更权威的
+// promo 源（含时段/优先级判定），同模型两边都给时 v3 胜出。
+func TestGlobalPromoV3OverridesEnterprise(t *testing.T) {
+	bf := 0.5
+	base := []ModelInfo{{
+		ID: "glm-5.2", PromoFactor: &bf, PromoCredits: "0.50x", PromoLabel: "企业端点标签",
+	}}
+	zf := 0.0
+	cap := map[string]ModelInfo{"glm-5.2": {
+		ID: "glm-5.2", PromoFactor: &zf, PromoCredits: "0x", PromoLabel: "限时免费",
+	}}
+
+	got := applyGlobalV3Catalog(base, cap)
+	if got[0].PromoFactor == nil || *got[0].PromoFactor != 0 {
+		t.Errorf("PromoFactor=%v want 0（v3 覆盖胜出）", got[0].PromoFactor)
+	}
+	if got[0].PromoLabel != "限时免费" || got[0].PromoCredits != "0x" {
+		t.Errorf("label=%q credits=%q want 限时免费/0x", got[0].PromoLabel, got[0].PromoCredits)
 	}
 }
 

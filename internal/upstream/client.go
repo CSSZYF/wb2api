@@ -1570,6 +1570,13 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 				Name   string   `json:"name"`
 				Models []string `json:"models"`
 			} `json:"agents"`
+			// 企业端点也会下发 modelPromotions（schema 与 /v3/config 同构）。
+			// 此前注释断言「企业端点不下发」——那对 CN 成立（实测 0 条），但对
+			// **global 不成立**：global 的 /v2/enterprises/personal/models 是
+			// 唯一会下发 promo 的端点（实测 2 条）。因为本结构缺该字段，
+			// global 企业端点的 promo 被 json.Unmarshal 结构性丢弃 ——
+			// 表现为「上游续期了限时免费，面板却一直不显示」。
+			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -1681,6 +1688,22 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 	// ——而静默跳过时日志里没有任何线索，只能猜是上游没给还是网关丢了（这正是"没显示"
 	// 类问题最贵的排查成本）。频率安全：本函数只在目录缓存 miss 时调用（/v1/models
 	// 10min 缓存、面板按需），不是请求级热路径。
+	//
+	// 上面那句「企业端点不下发」**对 global 不成立**（2026-10-02 实测更正）：global 的
+	// /v2/enterprises/personal/models 确实下发 modelPromotions（实测 2 条，schema 与
+	// /v3/config 同构）。所以这里先把企业端点的 promo 挂到基底，再让 v3 覆盖——
+	// 顺序不能反：v3 是更高优先级的来源（合并对 promo 取「有值即覆盖」），
+	// 企业端点只是**补上 v3 没给的那部分**（例如 global 的 hy3 限时免费）。
+	if len(env.Data.ModelPromotions) > 0 {
+		base := make(map[string]ModelInfo, len(out))
+		for i := range out {
+			base[out[i].ID] = out[i]
+		}
+		applyModelPromotions(base, env.Data.ModelPromotions)
+		for i := range out {
+			out[i] = base[out[i].ID]
+		}
+	}
 	if overlay, ok := c.v3OverlayFor(a); ok {
 		out = mergeModelCapabilities(out, overlay)
 	}

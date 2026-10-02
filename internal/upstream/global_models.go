@@ -470,31 +470,36 @@ func applyGlobalV3Catalog(base []ModelInfo, cap map[string]ModelInfo) []ModelInf
 		if base[i].Name == "" {
 			base[i].Name = ov.Name
 		}
-		// 限时优惠（modelPromotions）**覆盖**而非 fill-only——promo 是**时变**的：
-		// 限时折扣会过期、档位会切换（实测 glm-5.2 白天 badge-only 与夜间五折靠
-		// priority + daily 双轨切换），而 v3/config 每轮都是**重新**从
-		// env.Data.ModelPromotions 现算（applyModelPromotions 只挂当前生效的条目，
-		// 未命中就完全不设字段）。故本函数的契约定为「cap 的 promo 即本轮当前事实」：
-		// cap 挂了就照搬（含**清零**——上一轮 0x、本轮已恢复原价的模型必须回到无 promo
-		// 态），cap 没挂就清空。
+		// 限时优惠（modelPromotions）**fill-only**——与能力字段同口径。
 		//
-		// 与 fill-only 的实际差别（诚实说明）：当前调用链上两者等价——base 每轮都由
-		// probeGlobalModels 重新构造（parseGlobalModelInfos 从不设 Promo*），进本函数时
-		// base 的 promo 恒为零值，故"只填零值"同样能通过 TestGlobalCatalogCarriesPromo。
-		// 选覆盖是为了**契约正确**：promo 的语义是"此刻的折扣"而不是"能力"，把它写成
-		// fill-only 会让"折扣已结束"这一事实无法表达（一旦有人日后把缓存条目当 base
-		// 传进来，或上游改成增量下发，旧 promo 就会永久粘住且永不自我纠正）。
-		// 能力字段（窗口/档位）是慢变事实，照旧 fill-only。
+		// 2026-10-02 更正（本条此前是"无条件覆盖"，已修正）：那时的前提是
+		// 「promo 的唯一来源是 /v3/config，base 的 promo 恒为零值」，故覆盖等价于
+		// fill-only。该前提**已不成立**——企业端点现在也会下发 modelPromotions
+		// （见 parseGlobalModelInfos），base 进本函数时**可能已带 promo**。
+		// 若仍用覆盖，v3 未给 promo 的模型（cap 里 PromoFactor 为 nil）会被**清零**，
+		// 把企业端点刚挂上的生效价抹掉——实测症状就是「企业端点有 promo，面板却不显示」。
 		//
-		// 清零安全的前提：promo 的**唯一**来源是 /v3/config，而本函数只在 v3OK 时被调用
-		// （见 FetchGlobalModelInfos）——能走到这里，cap 就是本轮权威 promo 快照，
-		// 不存在"v3 这轮没给、上轮的 promo 仍有效"的情形。CN 侧 mergeModelCapabilities
-		// 保持 fill-only 是另一回事：那边是"overlay 可能没拿到"（单路 UA 缺失），
-		// 这边是"拿到了、且该模型此刻无生效优惠"。
-		base[i].PromoFactor = ov.PromoFactor
-		base[i].PromoCredits = ov.PromoCredits
-		base[i].PromoLabel = ov.PromoLabel
-		base[i].PromoNote = ov.PromoNote
+		// 取 fill-only 后的语义：**cap 有值才覆盖**（v3 优先级更高，同模型两边都给时
+		// v3 胜出），cap 无值则保留 base（企业端点来源）。这同时满足两件事：
+		//   - v3 是更权威的 promo 源（含时段/优先级判定），有值时覆盖；
+		//   - 企业端点是**补充**源，补 v3 没给的那部分（例如 global 的 hy3 限时免费）。
+		//
+		// 时变语义的兜底：promo 过期后 applyModelPromotions 就不会再挂它，两侧
+		// 都不给值 → 字段自然保持零值；不存在"上一轮 promo 永久粘住"——因为 base
+		// 每轮由 probeGlobalModels 重新构造（parseGlobalModelInfos 现算 promo），
+		// 过期条目在源头就不会出现。CN 侧 mergeModelCapabilities 同为 fill-only，口径一致。
+		if ov.PromoFactor != nil {
+			base[i].PromoFactor = ov.PromoFactor
+		}
+		if ov.PromoCredits != "" {
+			base[i].PromoCredits = ov.PromoCredits
+		}
+		if ov.PromoLabel != "" {
+			base[i].PromoLabel = ov.PromoLabel
+		}
+		if ov.PromoNote != "" {
+			base[i].PromoNote = ov.PromoNote
+		}
 	}
 
 	extra := make([]string, 0, len(cap))
@@ -568,7 +573,49 @@ func parseGlobalModelInfos(raw []byte) ([]ModelInfo, error) {
 	if !ok {
 		return fail(fmt.Errorf("global models empty list"))
 	}
-	return parseGlobalModelArray(arr)
+	out, err := parseGlobalModelArray(arr)
+	if err != nil {
+		return nil, err
+	}
+	// 企业端点也会下发 modelPromotions（2026-10-02 实测：global 的
+	// /v2/enterprises/personal/models 是**唯一**会下发 promo 的端点，实测 2 条，
+	// schema 与 /v3/config 同构）。本函数的解析主体只认 data.models 数组，
+	// promo 需在此单独挂上——否则「上游续期了限时免费，面板却一直不显示」。
+	//
+	// 与 v3 覆盖的关系：调用方（FetchGlobalModelInfos）随后用 applyGlobalV3Catalog
+	// 合并 v3，那里的 promo 搬运取「有值即覆盖」→ v3 优先，企业端点补 v3 没给的。
+	if promosRaw, ok := dataField(envelope, "modelPromotions"); ok {
+		var promos []v3ModelPromotion
+		if json.Unmarshal(promosRaw, &promos) == nil && len(promos) > 0 {
+			m := make(map[string]ModelInfo, len(out))
+			for i := range out {
+				m[out[i].ID] = out[i]
+			}
+			applyModelPromotions(m, promos)
+			for i := range out {
+				out[i] = m[out[i].ID]
+			}
+		}
+	}
+	return out, nil
+}
+
+// dataField 从信封里取 data.<key> 的原始字节（信封/键任一缺失 → false）。
+// 与上方 payload 定位同源：data 可能是对象或（裸数组形态下）不存在。
+func dataField(envelope map[string]json.RawMessage, key string) (json.RawMessage, bool) {
+	data, ok := envelope["data"]
+	if !ok {
+		return nil, false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) != nil {
+		return nil, false
+	}
+	v, ok := obj[key]
+	if !ok || len(strings.TrimSpace(string(v))) == 0 || strings.TrimSpace(string(v)) == "null" {
+		return nil, false
+	}
+	return v, true
 }
 
 // parseGlobalModelArray 解析已定位到的模型数组（主形态 → 窄表 → 宽松兜底）。
