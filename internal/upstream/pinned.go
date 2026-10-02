@@ -126,6 +126,47 @@ func (p PinnedModel) Entry() map[string]any {
 	return e
 }
 
+// FillMissingFromPinned 对**上游目录里已有**的条目做**字段级**兜底：条目缺倍率 /
+// 窗口 / 输出上限 / 档位时用写死快照补齐；上游给了的字段一律不动。
+//
+// 与 MergePinned 的分工（两件事，别混）：
+//   - MergePinned 管「上游压根没有这个 id」→ 整条追加（写死条目出场）；
+//   - 本函数管「上游给了条目但字段不全」→ 缺什么补什么。
+//
+// 为什么需要字段级：上游对同一 id 的字段完整度取决于端点——实测 deepseek-v4.1-flash
+// 只在 v3-CLI 的 data.models 里（企业端点完全没有），一旦 v3 探测失败（5min 负缓存 /
+// 上游改 schema），目录里仍有这条 id（静态名单 / 企业端点给了裸 id），但 credits 为空
+// → 面板显示 "—"，而写死快照里的 x0.00 是已知真值。用户点名要「看到真实价格」，
+// 已知的价不该因为探测链路半残而消失。
+//
+// 方向恒为「上游优先」：上游给了 credits（哪怕值与写死快照不同）就以上游为准——
+// 写死快照是人工跟进的，可能过期（deepseek 的价从 x0.03 更正到 x0.00 就是实例）。
+// 能力字段复用 fillCapabilities（fill-only，与目录合并的字段口径一致）。
+//
+// 就地更新 in 的元素并返回同一底层数组（与 MergePinned 同款，调用方无需换引用）。
+func FillMissingFromPinned(in []ModelInfo, pinned []PinnedModel) []ModelInfo {
+	if len(pinned) == 0 {
+		return in
+	}
+	byID := make(map[string]PinnedModel, len(pinned))
+	for _, p := range pinned {
+		if p.ID != "" {
+			byID[p.ID] = p
+		}
+	}
+	for i := range in {
+		p, ok := byID[in[i].ID]
+		if !ok {
+			continue
+		}
+		fillCapabilities(&in[i], p.Info())
+		if in[i].Credits == "" {
+			in[i].Credits = p.Credits
+		}
+	}
+	return in
+}
+
 // MergePinned 把写死条目并入探测结果：**上游已返回的同名模型原样优先**，
 // 只追加缺失的。顺序上追加在末尾，列表整体保持"上游目录在前、兜底在后"。
 func MergePinned(in []ModelInfo, pinned []PinnedModel) []ModelInfo {
