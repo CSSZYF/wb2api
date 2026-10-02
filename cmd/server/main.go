@@ -143,8 +143,9 @@ func main() {
 
 	up := upstream.New()
 	// 保留积分的「免费/低价模型」判定回调（pool.reserve_credits 的模型感知部分）：
-	// 数据源是 CN（cachedModelsSnapshot）与 global（GlobalModelInfosSnapshot）两个
-	// **只读目录快照**——回调在选号热路径上被调用，绝不发起上游请求（与 /v1/stats
+	// 数据源是 CN（cachedCatalogSnapshot）与 global（GlobalModelInfosStaleSnapshot）两个
+	// **只读目录快照**（都陈旧容错：超 TTL 后仍按最近一次成功目录作答，避免刷新空档期
+	// 把免费模型误拦）——回调在选号热路径上被调用，绝不发起上游请求（与 /v1/stats
 	// 的倍率透出同一纪律）。契约与取舍见 internal/server/freemodels.go。
 	p.SetFreeModelLookup(server.FreeModelLookup(up))
 	// 连接层四项（h2 开关 / TLS 握手 / 拨号 / 空闲池）按配置重建共享 Transport：
@@ -372,6 +373,20 @@ func main() {
 	// 后台冷却探活：每 CooldownProbeInterval 把「已到期的软冷却」试探一遍，成功即解冻。
 	// 与 authwatch 同一形态：即便 enabled=false 也调用（interval=0 → 空转等热启用）。
 	sch.StartCooldownProbe(ctx, cfg.CooldownProbeInterval)
+
+	// 启动即预热模型目录缓存（保留积分 pool.reserve_credits 的"免费判定"数据源）。
+	//
+	// 为什么必须有：免费判定读的是两个**只读目录快照**（CN 侧 cachedCatalogSnapshot、
+	// global 侧 GlobalModelInfosStaleSnapshot——两者都"陈旧容错"，即超 TTL 后仍按最近
+	// 一次成功目录作答），而快照本身只在懒触发路径上填充（/v1/models、面板「模型与档位」）。
+	// 重启后到首次触发之间的空窗期里快照**从未成功过**（nil，没有"最近一次成功目录"可
+	// 回落）→ 判定按既有契约「缺失 ≠ 免费」答"非免费" → 余额触底的号把免费模型一并拦掉
+	// （只剩内置白名单那三个），正是本功能要修的病灶。上游对同一问题的实测（a4557dc）：
+	// "重启后 2 分钟，97 分的账号打收费模型归零；倍率表当时尚未建立"。
+	//
+	// 异步：不阻塞监听启动；单域失败只记 WARN（后续懒触发仍会补上，非致命）；
+	// ctx 取消（SIGINT/SIGTERM）时放弃剩余域，不拖住进程退出。
+	go server.WarmModelCatalog(ctx, up, p)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

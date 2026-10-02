@@ -414,6 +414,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
 | `pool.idle_weight_per_hour` | `0.5` | 闲置补偿：每小时未使用 +0.5 权重 |
 | `pool.idle_weight_max` | `5.0` | 闲置补偿权重封顶 |
+| `pool.reserve_credits` | `50` | **保留积分**：账号余额 ≤ 本值时，它只对**免费/低价模型**可用（贵模型跳过它换别的号）——防止贵模型把余额吃到连免费的 4.1 都用不了。免费判定两层取并集：① 模型目录的**生效倍率** ≤ 0（牌价 `x0.00` 或 `modelPromotions` 限时免费；数据源是 CN/global 两个目录快照，**陈旧容错**——目录超 TTL 后仍按最近一次成功目录判定，避免刷新空档期把免费模型误拦）；② 兜底白名单 `hy4-preview` / `hy3` / `deepseek-v4.1-flash`。余额口径为**本地插值**（签到权威值 − 每笔 `usage.credit` 实扣），刷新间隔内触底的号立即出池，不必等下一轮余额刷新。余额**未知**（`credits_total` 为 0，从未刷新过）时 fail-open。`0` = 关闭；负值非法（启动报错）。含会话粘性路径（粘性号触底则解绑换号）与全冷却兜底；元数据路径（拉模型目录/面板查询，不消费积分）豁免。生效值经 `/status` 的 `reserve_credits` 字段透出 |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
