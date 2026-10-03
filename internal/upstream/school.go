@@ -152,7 +152,7 @@ func mpEventBase(a *auth.Auth) map[string]any {
 		"machineId":    "0655736a-607f-4d9d-b430-58176ee9a090",
 		"timezone":     "Asia/Shanghai",
 		"userId":       a.UID,
-		"userNickname": a.Nickname,
+		"userNickname": a.NicknameValue(),
 	}
 }
 

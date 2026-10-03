@@ -4,8 +4,44 @@
 package pool
 
 import (
+	"log"
 	"time"
 )
+
+// SetNickname 更新账号昵称并回写 auths 凭证文件（上游 f1496d0 / issue #94：
+// 上游改名后同步，免重登）。昵称未变化时不写盘；uid 不存在 / 昵称为空返回 false。
+// 与 token 刷新共用 auth 自身的锁与 SaveAtomic 原子写，无半更新窗口。
+//
+// 返回 false 的两种情形要分开看（面板只需计数）：
+//   - 未变化 / 入参非法 / uid 不存在：什么都没发生；
+//   - 内存已更新但落盘失败（无 FilePath、磁盘满…）：**不回滚内存**——面板本次刷新
+//     即可显示新昵称，下次成功刷新会再落盘；返回 false 只表示「没写盘」。
+func (p *Pool) SetNickname(uid, nickname string) bool {
+	if uid == "" || nickname == "" {
+		return false
+	}
+	p.mu.RLock()
+	e, ok := p.byUID[uid]
+	p.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	a := e.a
+	a.Lock()
+	changed := a.Nickname != nickname
+	if changed {
+		a.Nickname = nickname
+	}
+	a.Unlock()
+	if !changed {
+		return false
+	}
+	if err := a.SaveAtomic(); err != nil {
+		log.Printf("WARN: [pool] nickname save %s: %v", uid, err)
+		return false
+	}
+	return true
+}
 
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()

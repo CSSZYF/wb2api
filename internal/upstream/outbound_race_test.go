@@ -22,6 +22,7 @@ package upstream
 // 任一入口残留锁外直读即报竞争。
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -182,6 +183,48 @@ func TestGlobalRegisterPathsRaceRefreshToken(t *testing.T) {
 			_ = c.GlobalSubmitRegion(a, GlobalCountry{Code: "HK", EnName: "Hong Kong", IOS2: "HK"})
 		}
 	})
+}
+
+// TestNicknamePathsRaceNicknameSync 昵称同步（issue #94 / 上游 f1496d0）引入的
+// **新**竞争面：Nickname 从「登录写一次、之后只读」变成运行期可变字段。写侧 =
+// Pool.SetNickname（a.mu 内改），读侧散布在出站请求体与日志行——修复前 desktop.go
+// 的 userNickname/username、school.go 的 userNickname、server 选号日志都是锁外直读。
+//
+// 本测试的写侧逐字模拟 Pool.SetNickname 的写法（a.Lock + 赋值 + a.Unlock），
+// 读侧覆盖全部曾被直读的路径（桌面指纹 / Web 上报 / 小程序指纹 / 访问器）。
+// 任一入口残留锁外直读即被 -race 抓住（修复前 desktop.go:66-67 实测报红）。
+func TestNicknamePathsRaceNicknameSync(t *testing.T) {
+	a := raceTestAuth()
+	a.Nickname = "n0"
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// 与 Pool.SetNickname 同形：a.mu 内改写昵称。
+			a.Lock()
+			a.Nickname = fmt.Sprintf("nick-%d", i)
+			a.Unlock()
+			i++
+		}
+	}()
+
+	// 读侧：昵称参与构造的全部出站路径 + 加锁访问器。
+	for i := 0; i < 200; i++ {
+		_ = desktopFingerprint(a)
+		_ = mpEventBase(a)
+		_ = a.NicknameValue()
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // TestChatHeadersConcurrentWithRefreshValueStable 并发正确性（非竞争）：修复后

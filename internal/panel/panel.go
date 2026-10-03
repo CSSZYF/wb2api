@@ -814,14 +814,81 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 // 刷新一致：仅硬冷却账号余额恢复即解冻，软冷却/6004 模型级冷却不被解冻，见 issue #199），
 // 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
 // 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
+//
+// 顺带同步昵称（上游 f1496d0 / issue #94）：昵称是登录时快照，官方改名后面板一直
+// 显示旧名；这里在手动刷新路径补一次 /console/account 拉取，改名后点一下刷新即可。
+// 只在此手动路径调用——后台余额定时器（RunBalanceRefreshNow 的排程入口）不碰资料
+// 接口（用户明确要求资料接口仅手动触达）。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
 	p.cfg.Scheduler.RunBalanceRefreshNow()
+	p.syncNicknames()
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
+}
+
+// syncNicknames 手动刷新时的昵称同步（上游 f1496d0 / issue #94：上游改名免重登）。
+// 只在面板手动「刷新」路径调用——后台余额定时器不触发（用户明确要求资料接口
+// 仅手动触达）。逐号拉 /console/account，只取 nickname（手机号等敏感字段在
+// upstream.FetchAccountProfile 内即被丢弃，见其隐私边界注释）；单号失败静默跳过，
+// 不打断余额刷新的既有结果。
+//
+// global 容错：/console/account 在 workbuddy.ai 域是否同形**未验证**，global 号
+// 失败（404 路径不存在、头域不符…）一律按「静默跳过」处理——不写脏、不打 error、
+// 不影响其他账号。这里是「单号失败静默跳过」的既有语义，覆盖 404 而非只是网络失败。
+//
+// 并发 3：与 packages/schoolVouchers 同款限流，避免瞬时打满上游。
+func (p *Panel) syncNicknames() {
+	type job struct {
+		uid string
+		a   *auth.Auth
+	}
+	var jobs []job
+	for _, st := range p.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.AccessTokenValue() != "" {
+			jobs = append(jobs, job{uid: st.UID, a: a})
+		}
+	}
+	if len(jobs) == 0 {
+		return
+	}
+	var (
+		mu      sync.Mutex
+		updated int
+		failed  int
+		sem     = make(chan struct{}, 3)
+		wg      sync.WaitGroup
+	)
+	for _, j := range jobs {
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
+			if err != nil {
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			if p.cfg.Pool.SetNickname(j.uid, nick) {
+				mu.Lock()
+				updated++
+				mu.Unlock()
+			}
+		}(j)
+	}
+	wg.Wait()
+	if updated > 0 || failed > 0 {
+		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
+	}
 }
 
 // cooldownProbeRun 手动触发一轮后台冷却探活（POST /panel/api/cooldown_probe/run）。

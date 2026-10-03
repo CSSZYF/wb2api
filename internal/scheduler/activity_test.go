@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -397,6 +399,293 @@ func TestNextWakeSameHourTravelAndCheckin(t *testing.T) {
 	}
 	if !hasKind(kinds, taskCheckin) || !hasKind(kinds, taskTravel) {
 		t.Errorf("kinds=%v want 含 checkin+travel（同 09:00 两任务）", kinds)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 国际版活跃上报：global 账号不再被跳过（上游 47112c7 / PR #45）
+// ---------------------------------------------------------------------------
+
+// withGlobalSwitch 临时打开 global realm 开关并复位（生产缺省即开，此辅助确保测试隔离）。
+func withGlobalSwitch(t *testing.T) {
+	t.Helper()
+	old := auth.GlobalEnabled()
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(old) })
+}
+
+// globalAccount 构造一个 realm=global 的账号（BackfillRealmFor 落显式标识）。
+func globalAccount(t *testing.T, uid string) *auth.Auth {
+	t.Helper()
+	a := &auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
+	if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor(global): %v", err)
+	}
+	if !a.IsGlobal() {
+		t.Fatalf("%s IsGlobal()=false want true", uid)
+	}
+	return a
+}
+
+// TestRunActivityNowReportsGlobalAccount 纯 global 池：账号必须上报。
+// 修复前 runActivity 里 `if a.IsGlobal() { continue }`（D4 门控）把国际版全部跳过
+// → 连登永远点不亮。上游 PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK。
+func TestRunActivityNowReportsGlobalAccount(t *testing.T) {
+	withGlobalSwitch(t)
+	fastActivity(t)
+	var cnHits, globalHits atomic.Int32
+	cnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/report" {
+			cnHits.Add(1)
+		}
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer cnSrv.Close()
+	globalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/report" {
+			globalHits.Add(1)
+		}
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer globalSrv.Close()
+
+	p := pool.New("")
+	p.Add(globalAccount(t, "g1"))
+	// global base 单独指向另一台 server：断言路由按 realm 切，不碰 CN 端点。
+	up := &upstream.Client{
+		HTTP:              cnSrv.Client(),
+		GlobalEnabled:     true,
+		ChatBaseCN:        cnSrv.URL,
+		BillingBaseCN:     cnSrv.URL,
+		ChatBaseGlobal:    globalSrv.URL,
+		BillingBaseGlobal: globalSrv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunActivityNow()
+
+	if n := globalHits.Load(); n == 0 {
+		t.Error("global 账号未上报：/v2/report 未打到 global base（国际版将永远点不亮连登）")
+	}
+	if n := cnHits.Load(); n != 0 {
+		t.Errorf("CN base hits=%d want 0（global 账号不应打到 CN 端点）", n)
+	}
+}
+
+// TestRunActivityNowMixedPoolReportsBoth 混池：CN 与 global 各上报一次，
+// 且分别路由到各自 realm 的 base。
+func TestRunActivityNowMixedPoolReportsBoth(t *testing.T) {
+	withGlobalSwitch(t)
+	fastActivity(t)
+	var cnHits, globalHits atomic.Int32
+	cnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/report" {
+			cnHits.Add(1)
+		}
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer cnSrv.Close()
+	globalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/report" {
+			globalHits.Add(1)
+		}
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer globalSrv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(globalAccount(t, "g1"))
+	up := &upstream.Client{
+		HTTP:              cnSrv.Client(),
+		GlobalEnabled:     true,
+		ChatBaseCN:        cnSrv.URL,
+		BillingBaseCN:     cnSrv.URL,
+		ChatBaseGlobal:    globalSrv.URL,
+		BillingBaseGlobal: globalSrv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunActivityNow()
+
+	if n := cnHits.Load(); n != 1 {
+		t.Errorf("CN report hits=%d want 1", n)
+	}
+	if n := globalHits.Load(); n != 1 {
+		t.Errorf("global report hits=%d want 1", n)
+	}
+}
+
+// TestRunActivityNowGlobalErrorDoesNotSkipCN global report 失败（404）时
+// CN 账号照常上报：单账号失败只影响该号，不中断遍历。
+func TestRunActivityNowGlobalErrorDoesNotSkipCN(t *testing.T) {
+	withGlobalSwitch(t)
+	fastActivity(t)
+	var cnHits atomic.Int32
+	cnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/report" {
+			cnHits.Add(1)
+		}
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer cnSrv.Close()
+	// global 侧一律 404：模拟国际版端点不可用（路径不存在）。
+	globalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", 404)
+	}))
+	defer globalSrv.Close()
+
+	p := pool.New("")
+	p.Add(globalAccount(t, "g1"))
+	p.Add(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{
+		HTTP:              cnSrv.Client(),
+		GlobalEnabled:     true,
+		ChatBaseCN:        cnSrv.URL,
+		BillingBaseCN:     cnSrv.URL,
+		ChatBaseGlobal:    globalSrv.URL,
+		BillingBaseGlobal: globalSrv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunActivityNow() // 不应 panic
+
+	if n := cnHits.Load(); n != 1 {
+		t.Errorf("CN report hits=%d want 1（global 失败不应影响 CN 账号）", n)
+	}
+}
+
+// TestRunActivityNowGlobalStreakReadbackIsTheIncrement 放开活跃上报的**增量**：
+// global 上报成功后 checkActivityStreak 会跟着跑一次 growth streak 回读
+// （GET /activity/growth/streak，走 global chatBase）——每号每天多一次 global
+// growth GET。此测试把该增量钉住（commit message 里也据此说明）。
+func TestRunActivityNowGlobalStreakReadbackIsTheIncrement(t *testing.T) {
+	withGlobalSwitch(t)
+	fastActivity(t)
+	var cnStreak, globalStreak atomic.Int32
+	cnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/activity/growth/streak" {
+			cnStreak.Add(1)
+		}
+		w.Write([]byte(`{"code":0,"data":{"streak":{"days":1}}}`))
+	}))
+	defer cnSrv.Close()
+	globalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/report":
+			w.Write([]byte(`{"code":0,"msg":"OK"}`))
+		case "/activity/growth/streak":
+			globalStreak.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"streak":{"days":1}}}`))
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer globalSrv.Close()
+
+	p := pool.New("")
+	p.Add(globalAccount(t, "g1"))
+	up := &upstream.Client{
+		HTTP:              cnSrv.Client(),
+		GlobalEnabled:     true,
+		ChatBaseCN:        cnSrv.URL,
+		BillingBaseCN:     cnSrv.URL,
+		ChatBaseGlobal:    globalSrv.URL,
+		BillingBaseGlobal: globalSrv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunActivityNow()
+
+	if n := globalStreak.Load(); n != 1 {
+		t.Errorf("global streak 回读 hits=%d want 1（放开活跃上报的既定增量）", n)
+	}
+	if n := cnStreak.Load(); n != 0 {
+		t.Errorf("CN streak hits=%d want 0（global 账号不应打到 CN 端点）", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 回归护栏：本次**只**放开活跃上报，其余 5 处 global 门控一律不动
+// ---------------------------------------------------------------------------
+
+// TestGlobalAccountsStillSkippedOutsideActivity 签到 / 连登管家 / 旅行三条
+// 遍历路径上，纯 global 池必须**零上游调用**（上游 47112c7 明确 checkin/travel
+// 门控不动；连登管家同属 CN 任务体系）。误删任一门控都会让国际版去打 CN 专属端点。
+func TestGlobalAccountsStillSkippedOutsideActivity(t *testing.T) {
+	withGlobalSwitch(t)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer srv.Close()
+
+	newGlobalOnly := func() *Scheduler {
+		p := pool.New("")
+		p.Add(globalAccount(t, "g1"))
+		up := &upstream.Client{
+			HTTP:              srv.Client(),
+			GlobalEnabled:     true,
+			ChatBaseCN:        srv.URL,
+			BillingBaseCN:     srv.URL,
+			ChatBaseGlobal:    srv.URL,
+			BillingBaseGlobal: srv.URL,
+		}
+		return New(Config{Pool: p, Upstream: up})
+	}
+
+	// 签到：仍跳过 global。
+	hits.Store(0)
+	newGlobalOnly().RunCheckinNow()
+	if n := hits.Load(); n != 0 {
+		t.Errorf("checkin global 上游调用=%d want 0（签到仍应跳过 global）", n)
+	}
+
+	// 连登管家（兑换/抽奖，runCheckin 末尾与面板手动路径共用）。
+	hits.Store(0)
+	newGlobalOnly().RunStreakBonusNow()
+	if n := hits.Load(); n != 0 {
+		t.Errorf("streak-bonus global 上游调用=%d want 0（连登管家仍应跳过 global）", n)
+	}
+
+	// 旅行。
+	hits.Store(0)
+	newGlobalOnly().RunTravelNow()
+	if n := hits.Load(); n != 0 {
+		t.Errorf("travel global 上游调用=%d want 0（旅行仍应跳过 global）", n)
+	}
+}
+
+// TestGlobalGateSitesStillPresent 源码级护栏：5 处 global 门控
+// （checkin / travel / streak / blackcat / school）必须逐处保留。
+//
+// 为什么用源码扫描而不是纯行为断言：blackcat 的遍历被 InNightWindow（23:00–08:00）
+// 与 school 的活动期（9/13–9/24）挡在前面，行为测试在窗口外/期外**恒真通过**，
+// 删掉门控也照样绿——那是假护栏。这里直接钉住 5 个文件里各有一处 `a.IsGlobal()`
+// 门控（少一处即失败），行为侧再由上面三条遍历路径覆盖。
+func TestGlobalGateSitesStillPresent(t *testing.T) {
+	// 每处门控所在文件（各自恰好一处）：签到/活跃在 scheduler.go（活跃那处已删，
+	// 故该文件计数从 2 变 1），其余四处一文件一处。
+	cases := []struct {
+		file string
+		want int
+	}{
+		{"scheduler.go", 1}, // checkin（runActivity 那处已按 47112c7 删除）
+		{"streak.go", 1},    // 连登管家
+		{"travel.go", 1},    // 旅行
+		{"blackcat.go", 1},  // 夜猫子
+		{"school.go", 1},    // 开学季
+	}
+	for _, c := range cases {
+		raw, err := os.ReadFile(c.file)
+		if err != nil {
+			t.Fatalf("read %s: %v", c.file, err)
+		}
+		got := strings.Count(string(raw), "a.IsGlobal()")
+		if got != c.want {
+			t.Errorf("%s 的 global 门控数=%d want %d（本次只放开活跃上报，其余一律不动）", c.file, got, c.want)
+		}
 	}
 }
 

@@ -326,6 +326,290 @@ func TestRepackToolResultBlocksThreeConsecutiveGroups(t *testing.T) {
 	assertRepackPairsContiguous(t, out)
 }
 
+// ---------------------------------------------------------------------------
+// #81 兜底加固：出站 tool_call id 唯一化
+// ---------------------------------------------------------------------------
+
+// TestPrepareBodyDedupesTruncatedToolCallIDs 复刻 #81 的真实现场：库里三条
+// 49 字符的唯一 tool_call id（…-0/-1/-2），客户端发送前统一**截断到 40 字符**
+// → 出站三条 id 完全相同。上游按唯一性/序列校验 → 400/11148；单号池重试全败 →
+// 客户端收 503 自动重试 5 次 → 会话彻底无法继续。
+//
+// 根因在客户端截断（#81 作者两度更正后的结论），网关侧无法阻止截断本身；
+// 这里锁的是**兜底加固**：出站前把第 2..n 次出现的同 id 改名 <id>_d<n>，并同步
+// 改写对应 tool 结果的 tool_call_id——出站 id 唯一、配对仍然正确、顺序不变。
+func TestPrepareBodyDedupesTruncatedToolCallIDs(t *testing.T) {
+	hexTail := "0123456789abcdef0123456789abcdef0123" // 36 hex
+	full := []string{
+		"toolu_call-" + hexTail + "-0",
+		"toolu_call-" + hexTail + "-1",
+		"toolu_call-" + hexTail + "-2",
+	}
+	for _, id := range full {
+		if len(id) != 49 {
+			t.Fatalf("构造 id 长度=%d want 49: %q", len(id), id)
+		}
+	}
+	trunc := full[0][:40] // 客户端截断口径：三条 → 同一个 40 字符 id
+	for _, id := range full {
+		if id[:40] != trunc {
+			t.Fatalf("三条 id 截断后应同形，%q → %q", id, id[:40])
+		}
+	}
+	body := `{"model":"glm-5.2","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":"","tool_calls":[
+			{"id":"` + trunc + `","type":"function","function":{"name":"read_a","arguments":"{}"}},
+			{"id":"` + trunc + `","type":"function","function":{"name":"read_b","arguments":"{}"}},
+			{"id":"` + trunc + `","type":"function","function":{"name":"read_c","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"` + trunc + `","content":"body-a"},
+		{"role":"tool","tool_call_id":"` + trunc + `","content":"body-b"},
+		{"role":"tool","tool_call_id":"` + trunc + `","content":"body-c"},
+		{"role":"user","content":"next"}
+	]}`
+	out := PrepareBodyOpt([]byte(body), false)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 6 {
+		t.Fatalf("消息数不应变化，实际 %d（重复 id 不得触发任何删除）", len(msgs))
+	}
+	asst := msgs[1].(map[string]any)
+	tcs, _ := asst["tool_calls"].([]any)
+	if len(tcs) != 3 {
+		t.Fatalf("tool_calls 数不应变化，实际 %d", len(tcs))
+	}
+	// 1) 出站调用侧 id 必须唯一（上游按唯一性/序列校验）。
+	callIDs := make([]string, 0, len(tcs))
+	seen := map[string]bool{}
+	for i, tci := range tcs {
+		tc, _ := tci.(map[string]any)
+		id, _ := tc["id"].(string)
+		if id == "" {
+			t.Fatalf("tool_calls[%d] id 丢失: %#v", i, tc)
+		}
+		if seen[id] {
+			t.Fatalf("出站 tool_call id 仍重复: %q（上游判 400/11148，会话报废）", id)
+		}
+		seen[id] = true
+		callIDs = append(callIDs, id)
+	}
+	if callIDs[0] != trunc {
+		t.Fatalf("首次出现应保持原名（纯改名、最小改动），实际 %q", callIDs[0])
+	}
+	// 2) 结果侧唯一且与调用侧**逐个正确配对**（顺序保持：第 i 份结果 ↔ 第 i 个调用）。
+	results := msgs[2:5]
+	resSeen := map[string]bool{}
+	for i, m := range results {
+		mm, _ := m.(map[string]any)
+		id, _ := mm["tool_call_id"].(string)
+		if id == "" || !seen[id] {
+			t.Fatalf("结果[%d] id=%q 无对应 tool_call（改名未同步结果侧 = 制造孤儿）", i, id)
+		}
+		if resSeen[id] {
+			t.Fatalf("结果侧 id 重复: %q", id)
+		}
+		resSeen[id] = true
+		if id != callIDs[i] {
+			t.Fatalf("结果[%d] 应配到调用[%d]=%q，实际 %q（配对错位）", i, i, callIDs[i], id)
+		}
+	}
+	// 3) 内容零改动（纯改名）。
+	if fn := tcs[1].(map[string]any)["function"].(map[string]any); fn["name"] != "read_b" {
+		t.Fatalf("tool_calls[1].function.name 被改动: %v", fn["name"])
+	}
+	if results[2].(map[string]any)["content"] != "body-c" {
+		t.Fatalf("结果内容被改动: %#v", results[2])
+	}
+}
+
+// TestPrepareBodyDedupeNoDuplicateZeroChange 无重复 id 的完整配对会话经全链路
+// **零改动**：消息数、id、顺序、内容全部原样（兜底加固不得改写正常载荷）。
+func TestPrepareBodyDedupeNoDuplicateZeroChange(t *testing.T) {
+	body := `{"model":"glm-5.2","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":"","tool_calls":[
+			{"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}},
+			{"id":"call_2","type":"function","function":{"name":"grep","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"a"},
+		{"role":"tool","tool_call_id":"call_2","content":"b"},
+		{"role":"user","content":"next"}
+	]}`
+	out := PrepareBodyOpt([]byte(body), false)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 5 {
+		t.Fatalf("消息数变化: %d", len(msgs))
+	}
+	tcs := msgs[1].(map[string]any)["tool_calls"].([]any)
+	if id, _ := tcs[0].(map[string]any)["id"].(string); id != "call_1" {
+		t.Fatalf("id 被改动: %q", id)
+	}
+	if id, _ := tcs[1].(map[string]any)["id"].(string); id != "call_2" {
+		t.Fatalf("id 被改动: %q", id)
+	}
+	if id, _ := msgs[2].(map[string]any)["tool_call_id"].(string); id != "call_1" {
+		t.Fatalf("结果 id 被改动: %q", id)
+	}
+	if id, _ := msgs[3].(map[string]any)["tool_call_id"].(string); id != "call_2" {
+		t.Fatalf("结果 id 被改动: %q", id)
+	}
+}
+
+// TestDedupeToolCallIDsZeroChangeNoTraffic 无工具流量 → changed=false 且返回原 slice。
+func TestDedupeToolCallIDsZeroChangeNoTraffic(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "system", "content": "hi"},
+		map[string]any{"role": "user", "content": "hello"},
+	}
+	out, changed := dedupeToolCallIDs(messages)
+	if changed {
+		t.Fatal("无工具流量应零改动")
+	}
+	if &out[0] != &messages[0] {
+		t.Fatal("零改动应返回原 slice")
+	}
+}
+
+// TestDedupeToolCallIDsAcrossBatches 同名 id 跨批重复（不同 assistant 消息）同样
+// 改名，且结果侧按各自批次正确消费——跨批时后批的调用仍必须唯一。
+func TestDedupeToolCallIDsAcrossBatches(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "dup", "type": "function", "function": map[string]any{"name": "a", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "dup", "content": "r1"},
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "dup", "type": "function", "function": map[string]any{"name": "b", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "dup", "content": "r2"},
+	}
+	out, changed := dedupeToolCallIDs(messages)
+	if !changed {
+		t.Fatal("跨批重复 id 应改名")
+	}
+	first := out[0].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["id"]
+	second := out[2].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["id"]
+	if first == second {
+		t.Fatalf("跨批 id 仍重复: %q", first)
+	}
+	if r1 := out[1].(map[string]any)["tool_call_id"]; r1 != first {
+		t.Fatalf("第一批结果 %v 未跟第一批调用 %v 配对", r1, first)
+	}
+	if r2 := out[3].(map[string]any)["tool_call_id"]; r2 != second {
+		t.Fatalf("第二批结果 %v 未跟第二批调用 %v 配对", r2, second)
+	}
+}
+
+// TestDedupeToolCallIDsAvoidsExistingNameCollision 极端防御：payload 里已存在
+// `<id>_d2` 这个字面 id 时，改名不得与既有 id 撞名（否则又把重复带回来）。
+func TestDedupeToolCallIDsAvoidsExistingNameCollision(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "x", "type": "function", "function": map[string]any{"name": "a", "arguments": "{}"}},
+			map[string]any{"id": "x", "type": "function", "function": map[string]any{"name": "b", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "x", "content": "r1"},
+		map[string]any{"role": "tool", "tool_call_id": "x", "content": "r2"},
+		map[string]any{"role": "tool", "tool_call_id": "x_d2", "content": "orphan-existing"},
+	}
+	out, _ := dedupeToolCallIDs(messages)
+	seen := map[string]bool{}
+	for _, m := range out {
+		mm, _ := m.(map[string]any)
+		if mm["role"] != "assistant" {
+			continue
+		}
+		for _, tci := range mm["tool_calls"].([]any) {
+			id, _ := tci.(map[string]any)["id"].(string)
+			if seen[id] {
+				t.Fatalf("改名与既有 id 撞名，重复回归: %q", id)
+			}
+			seen[id] = true
+		}
+	}
+}
+
+// TestDedupeToolCallIDsIdempotent 幂等：对已唯一化的载荷再跑一次 → 零改动
+// （客户端把改名后的 id 持久化再回放时不会二次改名）。
+func TestDedupeToolCallIDsIdempotent(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "x", "type": "function", "function": map[string]any{"name": "a", "arguments": "{}"}},
+			map[string]any{"id": "x_d2", "type": "function", "function": map[string]any{"name": "b", "arguments": "{}"}},
+		}},
+		map[string]any{"role": "tool", "tool_call_id": "x", "content": "r1"},
+		map[string]any{"role": "tool", "tool_call_id": "x_d2", "content": "r2"},
+	}
+	_, changed := dedupeToolCallIDs(messages)
+	if changed {
+		t.Fatal("已唯一化的载荷应零改动（幂等）")
+	}
+}
+
+// TestDedupeToolCallIDsOutOfOrderDuplicates 乱序 + 重复 id：结果出现在调用**之前**
+// 且两侧都重复。两侧各自按出现序计数、经同一张 alias 记忆表取别名，故仍是
+// 「第 i 次出现 ↔ 第 i 次出现」对齐——这条用例专门锁住「两侧共用计数器」的实现
+// 错误（那会让调用侧拿 _d2、结果侧拿 _d3，把原本能配上的对拆散）。
+func TestDedupeToolCallIDsOutOfOrderDuplicates(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "tool", "tool_call_id": "dup", "content": "r1"},
+		map[string]any{"role": "tool", "tool_call_id": "dup", "content": "r2"},
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "dup", "type": "function", "function": map[string]any{"name": "a", "arguments": "{}"}},
+			map[string]any{"id": "dup", "type": "function", "function": map[string]any{"name": "b", "arguments": "{}"}},
+		}},
+	}
+	out, changed := dedupeToolCallIDs(messages)
+	if !changed {
+		t.Fatal("乱序重复 id 应改名")
+	}
+	var calls, results []string
+	for _, m := range out {
+		mm, _ := m.(map[string]any)
+		if mm["role"] == "tool" {
+			id, _ := mm["tool_call_id"].(string)
+			results = append(results, id)
+			continue
+		}
+		for _, tci := range mm["tool_calls"].([]any) {
+			id, _ := tci.(map[string]any)["id"].(string)
+			calls = append(calls, id)
+		}
+	}
+	if len(calls) != 2 || len(results) != 2 {
+		t.Fatalf("数量变化: calls=%v results=%v", calls, results)
+	}
+	if calls[0] == calls[1] {
+		t.Fatalf("调用侧仍重复: %v", calls)
+	}
+	if results[0] == results[1] {
+		t.Fatalf("结果侧仍重复: %v", results)
+	}
+	if calls[0] != results[0] || calls[1] != results[1] {
+		t.Fatalf("两侧改名不一致（配对被拆散）: calls=%v results=%v", calls, results)
+	}
+}
+
+// TestDedupeToolCallIDsEmptyIDUntouched 空 id 的调用（客户端没给 id）不改名：
+// 空 id 无法配对，交由 cleanupOrphanToolCalls 处理，改名只会制造噪声。
+func TestDedupeToolCallIDsEmptyIDUntouched(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"id": "", "type": "function", "function": map[string]any{"name": "a", "arguments": "{}"}},
+			map[string]any{"id": "", "type": "function", "function": map[string]any{"name": "b", "arguments": "{}"}},
+		}},
+	}
+	if _, changed := dedupeToolCallIDs(messages); changed {
+		t.Fatal("空 id 不应触发改名")
+	}
+}
+
 func repackSeqOf(msgs []any) []string {
 	var s []string
 	for _, m := range msgs {
