@@ -45,13 +45,18 @@ func (f *growthFake) handler() http.Handler {
 func growthTestPanel(t *testing.T, srv *httptest.Server) *Panel {
 	t.Helper()
 	oldGap, oldBatch, oldPoll, oldAttempts, oldMpGap := reportGap, acceptBatchGap, claimPollGap, claimPollAttempts, mpActionGap
+	oldChatGap, oldChatJit := mpChatEventGap, mpChatEventJitter
 	reportGap, acceptBatchGap = time.Millisecond, time.Millisecond
 	claimPollGap, claimPollAttempts = time.Millisecond, 2
 	mpActionGap = time.Millisecond // accept 回读验证的写动作间隔（生产 2s）
+	// mp 对话事件真人节奏（生产 45s + 0~10s 抖动）：队列用例会经
+	// Sequential_Tasks_1 走补报循环，不压掉就要白等 45s+。
+	mpChatEventGap, mpChatEventJitter = time.Millisecond, 0
 	t.Cleanup(func() {
 		reportGap, acceptBatchGap = oldGap, oldBatch
 		claimPollGap, claimPollAttempts = oldPoll, oldAttempts
 		mpActionGap = oldMpGap
+		mpChatEventGap, mpChatEventJitter = oldChatGap, oldChatJit
 	})
 
 	p := pool.New("")

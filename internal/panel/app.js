@@ -149,7 +149,16 @@ function go(v) {
   if (v === 'taskscenter') { loadSchoolStatus(true); reattachQueueView(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
-go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
+/* 首屏 go() 延到整份脚本求值之后再执行（v1.9.30 的 TDZ 回归修复，上游 981bbe2 同法）。
+   根因：go() 同步触发视图数据加载，而 loadModels 读的 mdRealm 等模块级 let/const 在
+   文件下半段才初始化——以 #models 深链直接打开（刷新停在模型页 / 书签 / 外链）时，
+   go() 求值期间 mdRealm 仍在 TDZ，抛 "Cannot access 'mdRealm' before initialization"，
+   首屏必显「读取失败」；点导航进入则因脚本已求值完而正常。
+   setTimeout(0) 让整份脚本先求值完再进路由，是修这一类问题最省事也最不易再犯的办法。 */
+setTimeout(() => {
+  const hash = (location.hash || '#accounts').slice(1);
+  go(hash in TITLES ? hash : 'accounts');
+}, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 /* 模型级冷却台账（overview 的 rate_limited_models，issue #36）：6004 模型级限流 /
@@ -2043,10 +2052,41 @@ function usWindowText(hours) {
   return '近 ' + Math.round(h / 24) + ' 天';
 }
 
+/* cacheRateText 缓存命中率纯文本（issue #92 / 上游 5e0adb3 同口径）。
+   分母 = 命中 + 未命中（**不含写入**：写入是为后续命中付的费，计入会把首次
+   命中率压低——与 internal/usage 的 stats.go/usage.go 一致）。
+   无观测（miss 字段缺席且 hit 也缺席）返回 '—'，不渲染成 0%。 */
+function cacheRateText(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
+  if (!total) return '—';
+  return String(Math.round(h / total * 1000) / 10) + '%';
+}
+
+/* cacheRateClass KPI 卡片的语义色类（与 cacheRateCell 同一档位口径：
+   ≥90% 绿 / 80–90% 黄 / <80% 红；无观测返回空串 = 默认色，不谎称健康）。 */
+function cacheRateClass(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
+  if (!total) return '';
+  const pct = h / total * 100;
+  return pct >= 90 ? 'good' : (pct >= 80 ? 'warn' : 'bad');
+}
+
+/* cacheRateCell 缓存命中率单元格（颜色即健康度：≥90% 绿 / 80–90% 黄 / <80% 红，
+   样本不足灰）。title 带命中/未命中绝对量，供逐项核对。 */
+function cacheRateCell(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
+  if (!total) return '<span style="color:var(--ink-3)">—</span>';
+  const pct = h / total * 100;
+  const color = pct >= 90 ? 'var(--ok)' : (pct >= 80 ? 'var(--warn)' : 'var(--bad)');
+  return '<span style="color:' + color + '" title="命中 ' + fmtTok(h) + ' / 未命中 ' + fmtTok(m) + ' tok">' +
+    cacheRateText(h, m) + '</span>';
+}
+
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
    withPerf 控制是否追加延迟/速率两列——只有「按账号」表的表头带这两列；
    模型表与域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
-   判断，调用方稍一改动就会错列，故改为显式参数。 */
+   判断，调用方稍一改动就会错列，故改为显式参数。
+   缓存命中率列对所有表都输出（三张表表头都有该列）。 */
 function usRow(name, sub, a, mid, withPerf) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
@@ -2057,6 +2097,7 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    '<td class="num">' + cacheRateCell(a.cache_hit_tokens, a.cache_miss_tokens) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -2072,7 +2113,9 @@ function renderUsage(d) {
     usStat(fmtTok(t.prompt_tokens), 'prompt') +
     usStat(fmtTok(t.completion_tokens), 'completion') +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
-    usStat(fmtMs(t.avg_latency_ms), '平均延迟');
+    usStat(fmtMs(t.avg_latency_ms), '平均延迟') +
+    usStat(cacheRateText(t.cache_hit_tokens, t.cache_miss_tokens), '缓存命中率',
+      cacheRateClass(t.cache_hit_tokens, t.cache_miss_tokens));
 
   // 「窗口：近 N 天」用后端回报的**实际生效**值（d.hours，非法入参已回退），不是
   // 下拉框的 value——两者不一致时必须显示后者，用户才能确认窗口真的生效了。
@@ -2085,13 +2128,13 @@ function renderUsage(d) {
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
       '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
 
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
   // 粒度由后端单选并显式回报（d.granularity），前端只按它渲染一种，不逐点猜。
   renderUsageChart(d.series || [], d.granularity);

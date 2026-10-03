@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -1454,5 +1455,275 @@ func TestAppJSConcurrencyColumnWiring(t *testing.T) {
 	// CFG_MAP 映射：缺了它下拉只是装饰（保存时 collectConfig 收不到该键，静默不生效）。
 	if !strings.Contains(s, `pick_mode: ['pool', 'pick_mode']`) {
 		t.Error("app.js 缺 pick_mode 的 CFG_MAP 映射（表单值无法读写 pool.pick_mode）")
+	}
+}
+
+// TestAppJSDeepLinkNoTDZ v1.9.30 回归护栏：#models 深链（刷新停在模型页 / 书签 /
+// 外链）首屏不得踩 TDZ。
+//
+// 缺陷现场：顶层 go() 同步进入路由 → loadModels() 读 mdRealm，而 mdRealm 声明在
+// 文件下半段（loadModels 之前一行）——go() 求值期间它仍在 TDZ，抛
+// "Cannot access 'mdRealm' before initialization"，首屏必显「读取失败」；点导航
+// 进入则一切正常（脚本已求值完）。修复：顶层 go() 包进 setTimeout(..., 0)。
+//
+// 为什么 TestAppJSTopLevelSmoke 拦不住：它的 getElementById 返回惰性 Proxy，
+// `$('mdBody').children.length` 恒为 truthy → `!children.length` 为 false →
+// loadModels() 根本不会被调用，TDZ 恰好落在未被触发的分支里。本用例的 DOM 桩给出
+// 真实元素（children 为空数组）并记录 innerHTML 写入序列，让 go() 真的走进
+// loadModels 的同步段；同时断言「已进入 loadModels」（正控，防测试假绿）。
+func TestAppJSDeepLinkNoTDZ(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS deep-link check skipped")
+	}
+	harness := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const writes = {};
+function makeEl(id) {
+  let html = '';
+  const el = {
+    id, children: [], dataset: {}, style: {},
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    hidden: false, value: '', textContent: '', checked: false, disabled: false, title: '',
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, remove() {},
+    focus() {}, click() {},
+    querySelector: () => null, querySelectorAll: () => [],
+    scrollTop: 0, clientHeight: 0, scrollHeight: 0,
+    getBoundingClientRect: () => ({ top: 0, left: 0, height: 0, width: 0 }),
+  };
+  Object.defineProperty(el, 'innerHTML', {
+    get() { return html; },
+    set(v) { html = String(v); (writes[id] = writes[id] || []).push(html); },
+  });
+  return el;
+}
+const els = new Map();
+const byId = id => { if (!els.has(id)) els.set(id, makeEl(id)); return els.get(id); };
+const sandbox = {
+  location: { hash: process.env.SMOKE_HASH || '#models' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: {
+    querySelectorAll: () => [], querySelector: () => null,
+    getElementById: byId, addEventListener() {},
+    documentElement: { dataset: {} }, head: makeEl('head'), body: makeEl('body'),
+    createElement: () => makeEl('new'),
+  },
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set,
+  RegExp, Error, TypeError, isNaN, parseInt, parseFloat,
+  encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox;
+sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+const failures = [];
+try {
+  vm.runInContext(src, sandbox, { filename: 'app.js' });
+} catch (e) {
+  failures.push('sync: ' + String((e && e.stack) || e));
+}
+setTimeout(() => {
+  const bad = [];
+  for (const id of Object.keys(writes)) {
+    for (const v of writes[id]) {
+      if (/Cannot access .* before initialization|ReferenceError/.test(v)) bad.push(id + ' <= ' + v.slice(0, 160));
+    }
+  }
+  const loaded = !!(writes.mdBody && writes.mdBody.length);
+  const wantLoad = (process.env.SMOKE_HASH || '#models') === '#models';
+  console.log('MD_WRITES=' + JSON.stringify((writes.mdBody || []).map(s => s.slice(0, 80))));
+  if (failures.length || bad.length) { console.log('SMOKE FAIL:\n' + failures.concat(bad).join('\n')); process.exit(1); }
+  if (wantLoad && !loaded) { console.log('SMOKE FAIL: #models 未进入 loadModels（正控缺失）'); process.exit(1); }
+  console.log('SMOKE OK');
+  process.exit(0);
+}, 50);
+`
+	hf, err := os.CreateTemp(t.TempDir(), "tdz-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hf.WriteString(harness); err != nil {
+		t.Fatal(err)
+	}
+	hf.Close()
+	for _, hash := range []string{"#models", "#usage", "#packages", "#taskscenter", "#config", "#logs", "#accounts"} {
+		cmd := exec.Command(node, hf.Name(), "app.js")
+		cmd.Dir = "."
+		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
+		out, err := cmd.CombinedOutput()
+		if err != nil || !bytes.Contains(out, []byte("SMOKE OK")) {
+			t.Fatalf("深链 %s 首屏踩 TDZ/运行时错误: %v\n%s", hash, err, out)
+		}
+	}
+	// 结构断言：顶层 go() 必须包在 setTimeout 里（防止有人改回同步调用）。
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	i := strings.Index(s, "document.querySelectorAll('.nav a').forEach")
+	if i < 0 {
+		t.Fatal("app.js 缺导航绑定")
+	}
+	rest := s[i:]
+	j := strings.Index(rest, "\n/* ──")
+	if j < 0 {
+		j = len(rest)
+	}
+	navBlock := rest[:j]
+	if !strings.Contains(navBlock, "setTimeout(() => {") {
+		t.Error("顶层 go() 必须延到脚本求值之后（setTimeout），否则 #models 深链会踩 mdRealm 的 TDZ")
+	}
+	if strings.Contains(navBlock, "\ngo((location.hash") {
+		t.Error("顶层 go(...) 仍为同步调用（v1.9.30 回归形态）")
+	}
+}
+
+// TestAppJSUsageCacheRateWiring 面板用量页的缓存命中率接线必须齐全（issue #92 /
+// 上游 5e0adb3）：后端 usage.Snapshot 的 Agg 已出三个字段，前端必须有
+//   - cacheRateText / cacheRateCell 两个渲染函数（后者带健康度配色）；
+//   - renderUsage 的 KPI 卡 + usRow 的「缓存命中率」列（三张表共用 usRow）；
+//   - index.html 三张表的表头与 app.js 三处空行 colspan 同步 +1（漏改一处就错列）。
+//
+// app.js/index.html 是 go:embed 静态资源，Go 编译器不校验其内容——少一处列，
+// 面板上就是「命中率列整体错位一格」或「没有这一列」，而所有 Go 测试仍全绿。
+func TestAppJSUsageCacheRateWiring(t *testing.T) {
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(js)
+	for _, want := range []string{
+		"function cacheRateText(",
+		"function cacheRateCell(",
+		"cache_hit_tokens",  // 后端字段被引用
+		"cache_miss_tokens", // 同上
+		// 注意：前端**故意不读** totals.cache_hit_rate —— 后端该字段带 omitempty，
+		// 全未命中（hit=0, miss>0）时率为 0 会被省略，读它会把「有观测的全 miss」
+		// 渲染成「无观测」；由 hit/miss 现算才能把 0% 与「—」分开。
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("app.js 缺缓存命中率接线：%q", want)
+		}
+	}
+	ru := jsFuncBody(s, "function renderUsage(")
+	if ru == "" {
+		t.Fatal("app.js 缺 renderUsage")
+	}
+	if !strings.Contains(ru, "缓存命中率") {
+		t.Error("renderUsage 的 KPI 未加「缓存命中率」卡")
+	}
+	// 列在 usRow（三张表共用）：缺插值 = 表头多一列而数据行少一列，整行错位。
+	ur := jsFuncBody(s, "function usRow(")
+	if ur == "" {
+		t.Fatal("app.js 缺 usRow")
+	}
+	if !strings.Contains(ur, "cacheRateCell(") {
+		t.Error("usRow 未渲染缓存命中率列（表头与数据行会错列）")
+	}
+	// 空行 colspan 必须与列数一致（账号表 11：mark+名+域+请求+失败+pt+ct+合计+缓存+延迟+速率；
+	// 模型/域表 8：mark+名+请求+失败+pt+ct+合计+缓存）。
+	for _, want := range []string{`colspan="11"`, `colspan="8"`} {
+		if !strings.Contains(ru, want) {
+			t.Errorf("renderUsage 空行 %s 未同步（漏改即错列）", want)
+		}
+	}
+
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	// 三处静态表头（账号/模型/域）都要有该列。
+	if n := strings.Count(h, ">缓存命中率</th>"); n != 3 {
+		t.Errorf("index.html 表头「缓存命中率」出现 %d 次，want 3（账号/模型/域三张表）", n)
+	}
+}
+
+// TestAppJSCacheRatePureFunctions 缓存命中率的纯函数口径（node 实跑）：
+//   - 分母 = 命中 + 未命中（**不含写入**——写入是为后续命中付的费，计入会压低
+//     首次命中率；与 internal/usage 的 stats.go/usage.go 同口径）；
+//   - 无观测 → '—'（不得渲染 0%）；
+//   - 全未命中 → 0%（有观测，与无观测必须可区分）；
+//   - 配色三档：≥90 绿 / 80–90 黄 / <80 红；无观测不着色。
+func TestAppJSCacheRatePureFunctions(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping JS logic check")
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	fnTok := jsFuncFull(src, "function fmtTok(")
+	fnText := jsFuncFull(src, "function cacheRateText(")
+	fnCell := jsFuncFull(src, "function cacheRateCell(")
+	fnCls := jsFuncFull(src, "function cacheRateClass(")
+	if fnText == "" || fnCell == "" || fnCls == "" {
+		t.Fatal("app.js 缺 cacheRateText/cacheRateCell/cacheRateClass")
+	}
+	script := fnTok + "\n" + fnText + "\n" + fnCell + "\n" + fnCls + `
+const out = {
+  half: cacheRateText(500, 500),          // 50%
+  high: cacheRateText(900, 100),          // 90%
+  none: cacheRateText(undefined, undefined),
+  zero: cacheRateText(0, 100),            // 全未命中 = 0%（有观测）
+  // 分母不含写入：写入不参与，故与 (900,100) 同值。
+  clsHigh: cacheRateClass(900, 100),
+  clsMid:  cacheRateClass(850, 150),
+  clsLow:  cacheRateClass(700, 300),
+  clsNone: cacheRateClass(0, 0),
+  cellNone: cacheRateCell(undefined, undefined),
+  cellZero: cacheRateCell(0, 100),
+  cellHigh: cacheRateCell(900, 100),
+};
+console.log(JSON.stringify(out));
+`
+	fp := filepath.Join(t.TempDir(), "cache_rate_check.js")
+	if err := os.WriteFile(fp, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, fp).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node 运行失败: %v\n%s", err, out)
+	}
+	var got struct {
+		Half, High, None, Zero                string
+		ClsHigh, ClsMid, ClsLow               string
+		ClsNone, CellNone, CellZero, CellHigh string
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("node 输出解析失败: %v\n%s", err, out)
+	}
+	if got.Half != "50%" || got.High != "90%" {
+		t.Errorf("cacheRateText 基本换算错误：half=%q high=%q", got.Half, got.High)
+	}
+	if got.None != "—" {
+		t.Errorf("无观测应为 '—'（不得渲染成 0%%）：%q", got.None)
+	}
+	if got.Zero != "0%" {
+		t.Errorf("全未命中（有观测）应为 0%%，与无观测可区分：%q", got.Zero)
+	}
+	if got.ClsHigh != "good" || got.ClsMid != "warn" || got.ClsLow != "bad" {
+		t.Errorf("配色档位错误：high=%q mid=%q low=%q（want good/warn/bad）", got.ClsHigh, got.ClsMid, got.ClsLow)
+	}
+	if got.ClsNone != "" {
+		t.Errorf("无观测不得着色：%q", got.ClsNone)
+	}
+	if !strings.Contains(got.CellNone, "—") {
+		t.Errorf("无观测单元格应显示 '—'：%q", got.CellNone)
+	}
+	if !strings.Contains(got.CellZero, "0%") {
+		t.Errorf("全未命中单元格应显示 0%%：%q", got.CellZero)
+	}
+	if !strings.Contains(got.CellHigh, "90%") || !strings.Contains(got.CellHigh, "title=") {
+		t.Errorf("命中率单元格应带百分比与 title 绝对量：%q", got.CellHigh)
 	}
 }

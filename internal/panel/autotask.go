@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -643,6 +644,38 @@ var schoolSeasonSettle = 2 * time.Second
 // 变量化以便单测压到毫秒级（同 reportGap/acceptBatchGap 口径）。
 var mpActionGap = 2 * time.Second
 
+// mpChatEventGap mp 对话事件（chat_request_send）的真人节奏间隔。
+//
+// 上游对 Sequential_Tasks_3「5 次有效对话」有**节奏反作弊**校验：数秒级连发的事件
+// 先被计入进度（回读 5/5，accept_status 甚至短暂转 completed），随后被整体判无效
+// 回滚，claim 返回 400 "task not completed"。2026-09-26 三账号实测：
+//   - 2s 连发 4 条 → 全灭（回滚后进度回落，claim 400）；
+//   - 45s 间隔逐条 → 全存活，claim +300c+5e 成功。
+//
+// 故每条上报前 sleep gap + 0~10s 抖动（见 mpChatEventJitter），首条也等——上一轮
+// 被判无效回滚后立即重报同样无效。mpActionGap(2s) 自此只管 accept/领奖间隔。
+//
+// 时长影响：单账号 Tasks_3 补 5 条 ≈ 4 分钟、Tasks_6 补 9 条 ≈ 8 分钟（链条每日
+// 零点只解锁一环，通常一晚只跑其中一条）；夜间队列并发 1、账号内串行，10 个号
+// 约 40~80 分钟。growth_hours 缺省 [1]（凌晨 1 点），与其余时点（9/10/21/22/23）
+// 不撞窗口。勿「优化」回连发——那是白报。
+// 变量化以便单测压到毫秒级（同 reportGap/acceptBatchGap 口径）。
+var mpChatEventGap = 45 * time.Second
+
+// mpChatEventJitter 真人节奏的随机抖动上限（每条上报前额外等待 0~该值）。
+// 变量化以便单测归零（否则每个用例白等最多 10s×条数）。
+var mpChatEventJitter = 10 * time.Second
+
+// sleepMPChatEventGap 每条 mp 对话事件上报前的真人节奏等待：
+// mpChatEventGap + [0, mpChatEventJitter) 抖动（首条也等，见上）。
+func sleepMPChatEventGap() {
+	d := mpChatEventGap
+	if mpChatEventJitter > 0 {
+		d += time.Duration(rand.Int64N(int64(mpChatEventJitter)))
+	}
+	time.Sleep(d)
+}
+
 // taskByCodeMP 以小程序口径拉取任务列表并定位单个任务；未找到返回 nil。
 // mp 限定任务（school_season / Sequential_Tasks_1..7）在默认口径列表里不出现。
 func (p *Panel) taskByCodeMP(a *auth.Auth, code string) (*upstream.Task, error) {
@@ -703,9 +736,21 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityID bool
 	if t.Claimed {
 		return "已领取", nil
 	}
+	if t.AcceptStatus == "not_accepted" || t.AcceptStatus == "" {
+		if !p.acceptWithVerifyMP(a, code) {
+			return "accept 未登记生效（上游 200+OK 但未落账形态），待下次重试", nil
+		}
+		// accept 前的任务进度为 null（target 下发 0），兜底 target=1 会少报——
+		// Tasks_6 首轮实测：accept 后真实 target=10，只补 1 条就误判达标去领奖
+		// （claim 400 task not completed）。接受后回读一次拿真实 target/current，
+		// 用回读值做补报上界（上游 d9edc06）。
+		if t2, err := p.taskByCodeMP(a, code); err == nil && t2 != nil {
+			t = t2
+		}
+	}
 	target := t.Target
 	if target <= 0 {
-		target = 1 // 未 accept 的 mp 任务 progress 为 null，target 兜底（上游实测）
+		target = 1 // 仍未下发 target 时兜底（上游实测）
 	}
 	// 已达标（含 completed 未领）：直接领奖。
 	if t.Current >= target || t.AcceptStatus == "completed" {
@@ -715,17 +760,14 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityID bool
 		}
 		return fmt.Sprintf("已领取奖励（+%dc +%de）", credit, energy), nil
 	}
-	if t.AcceptStatus == "not_accepted" || t.AcceptStatus == "" {
-		if !p.acceptWithVerifyMP(a, code) {
-			return "accept 未登记生效（上游 200+OK 但未落账形态），待下次重试", nil
-		}
-	}
-	// 判据上报：按差额补 mini chat 事件。
+	// 判据上报：按差额补 mini chat 事件。每条前 sleep mpChatEventGap+抖动——
+	// 连发会被上游反作弊判无效（见 mpChatEventGap 注释），宁可慢不可白报。
 	need := target - t.Current
 	if need <= 0 {
 		need = 1
 	}
 	for i := int64(0); i < need; i++ {
+		sleepMPChatEventGap()
 		conv := fmt.Sprintf("wb2api-mp-%d-%d", time.Now().UnixMilli(), i)
 		var ev map[string]any
 		if withActivityID {
@@ -739,9 +781,6 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityID bool
 		}
 		if err := p.cfg.Upstream.ReportMPEvent(a, ev); err != nil {
 			return fmt.Sprintf("完成 %d/%d 次上报后中断: %v", i, need, err), nil
-		}
-		if i < need-1 {
-			time.Sleep(mpActionGap)
 		}
 	}
 	// 回读（异步计分，两轮各隔 claimPollGap——与 runMiniExpert 同预算）。

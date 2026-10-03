@@ -182,6 +182,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 }
 @media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+/* 用量总览有 7 张 KPI 卡（多一张「缓存命中率」）：沿用 6 列会把第 7 张甩到第二行
+   孤零零一格。ID 选择器优先级高于上面的类选择器，故响应式断点需一并覆盖。 */
+#usStats { grid-template-columns: repeat(7, 1fr); }
+@media (max-width: 980px) { #usStats { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 560px) { #usStats { grid-template-columns: repeat(2, 1fr); } }
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
@@ -681,6 +686,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num" title="上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大">缓存命中率</th>
               <th class="num">均延迟</th><th class="num">均速率</th>
             </tr></thead>
             <tbody id="usAccBody"></tbody>
@@ -696,6 +702,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="mark" aria-hidden="true"></th><th>模型</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num" title="上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大">缓存命中率</th>
             </tr></thead>
             <tbody id="usModelBody"></tbody>
           </table>
@@ -710,6 +717,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="mark" aria-hidden="true"></th><th>realm</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num" title="上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大">缓存命中率</th>
             </tr></thead>
             <tbody id="usRealmBody"></tbody>
           </table>

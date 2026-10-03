@@ -28,7 +28,13 @@ type seqFake struct {
 	states map[string]int
 	target map[string]int
 
+	// nullProgress 为 true 的 code 在**未接受**（state=0）时渲染 "progress":null
+	// ——上游真实形态：未 accept 的 mp 任务没有进度对象，target 因此读成 0。
+	// 用于复现「accept 前 target 兜底 1、accept 后真实 target=10」的少报误领。
+	nullProgress map[string]bool
+
 	reportEvents []map[string]any // 收到的全部上报事件（判据形状断言用）
+	reportTimes  []time.Time      // 每条上报的到达时刻（真人节奏断言用）
 	acceptHits   int32
 	claimHits    int32
 	claimNoMP    int32
@@ -36,7 +42,7 @@ type seqFake struct {
 }
 
 func newSeqFake() *seqFake {
-	f := &seqFake{states: map[string]int{}, target: map[string]int{
+	f := &seqFake{states: map[string]int{}, nullProgress: map[string]bool{}, target: map[string]int{
 		"Sequential_Tasks_1": 1, "Sequential_Tasks_2": 1, "Sequential_Tasks_3": 5,
 		"Sequential_Tasks_4": 1, "Sequential_Tasks_5": 1, "Sequential_Tasks_6": 10,
 		"Sequential_Tasks_7": 1,
@@ -73,8 +79,13 @@ func (f *seqFake) seqTaskJSON(code string) string {
 	case 3:
 		ast, cur = "claimed", tgt
 	}
+	// 未接受的 mp 任务：上游下发 "progress":null（真实形态，target 读成 0）。
+	prog := `"progress":{"current":` + itoaN(cur) + `,"target":` + itoaN(tgt) + `},`
+	if st == 0 && f.nullProgress[code] {
+		prog = `"progress":null,`
+	}
 	return `{"task_code":"` + code + `","title":"` + code + `","accept_status":"` + ast + `",` +
-		`"progress":{"current":` + itoaN(cur) + `,"target":` + itoaN(tgt) + `},` +
+		prog +
 		`"reward_credit":200,"reward_energy":5}`
 }
 
@@ -135,6 +146,7 @@ func (f *seqFake) handler() http.Handler {
 			_ = json.NewDecoder(r.Body).Decode(&events)
 			f.mu.Lock()
 			f.reportEvents = append(f.reportEvents, events...)
+			f.reportTimes = append(f.reportTimes, time.Now())
 			f.mu.Unlock()
 			// 按事件形状点亮：本 fake 不区分环，任何判据事件都推进 Tasks_2（供形状断言）。
 			for _, ev := range events {
@@ -162,12 +174,18 @@ func (f *seqFake) handler() http.Handler {
 	})
 }
 
+// newSeqPanel 构造带假上游的面板，并把全部节流压到毫秒级（否则单测白等数分钟）。
+// mpChatEventGap/mpChatEventJitter 必须一并重置：生产值 45s + 0~10s 抖动，漏掉
+// 任何一条，TestSequentialTask3ReportsByTargetDelta 都会真的等 4 分钟。
 func newSeqPanel(t *testing.T, srv *httptest.Server) *Panel {
 	t.Helper()
 	oldGap, oldPoll, oldAttempts, oldSettle, oldMpGap := acceptBatchGap, claimPollGap, claimPollAttempts, schoolSeasonSettle, mpActionGap
+	oldChatGap, oldChatJit := mpChatEventGap, mpChatEventJitter
 	acceptBatchGap, claimPollGap, claimPollAttempts, schoolSeasonSettle, mpActionGap = time.Millisecond, time.Millisecond, 3, time.Millisecond, time.Millisecond
+	mpChatEventGap, mpChatEventJitter = time.Millisecond, 0
 	t.Cleanup(func() {
 		acceptBatchGap, claimPollGap, claimPollAttempts, schoolSeasonSettle, mpActionGap = oldGap, oldPoll, oldAttempts, oldSettle, oldMpGap
+		mpChatEventGap, mpChatEventJitter = oldChatGap, oldChatJit
 	})
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", Domain: "www.codebuddy.cn", AccessToken: "tok"})
@@ -326,6 +344,91 @@ func TestSequentialTask3ReportsByTargetDelta(t *testing.T) {
 	f.mu.Unlock()
 	if n != 5 {
 		t.Errorf("上报条数=%d want 5（按 target 差额补足）", n)
+	}
+}
+
+// TestNewSeqPanelResetsMPChatGap newSeqPanel 必须把 mp 对话真人节奏变量一并重置。
+//
+// 生产值 45s + 0~10s 抖动：漏重置任何一条，TestSequentialTask3ReportsByTargetDelta
+// 会真的等 4 分钟（Tasks_6 的用例等 8 分钟）——用例不会失败，只会「卡到超时」，
+// 极难归因。本用例同时钉住生产默认值（防被「优化」回连发，实测依据见
+// mpChatEventGap 注释）。
+func TestNewSeqPanelResetsMPChatGap(t *testing.T) {
+	if mpChatEventGap != 45*time.Second {
+		t.Errorf("mpChatEventGap 生产值=%v want 45s（2026-09-26 实测：2s 连发全灭，45s 逐条全存活）", mpChatEventGap)
+	}
+	if mpChatEventJitter != 10*time.Second {
+		t.Errorf("mpChatEventJitter 生产值=%v want 10s（0~10s 抖动）", mpChatEventJitter)
+	}
+	f := newSeqFake()
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	_ = newSeqPanel(t, srv) // 重置在构造内完成，cleanup 在本用例结束时恢复
+	if mpChatEventGap > time.Second {
+		t.Errorf("newSeqPanel 未重置 mpChatEventGap（%v）——单测会真等 4~8 分钟", mpChatEventGap)
+	}
+	if mpChatEventJitter != 0 {
+		t.Errorf("newSeqPanel 未重置 mpChatEventJitter（%v）——单测白等最多 10s×条数", mpChatEventJitter)
+	}
+}
+
+// TestSequentialTask3ReportsAtHumanCadence 吸收上游 c675297：补报必须按真人节奏
+// 逐条上报（每条前 sleep mpChatEventGap，首条也等）——数秒级连发会被上游反作弊
+// 整体判无效（回读短暂达标、随后回滚，claim 400 "task not completed"）。
+//
+// 变量化把 45s 压到 50ms 来测：断言相邻上报间隔 ≥ 设定 gap、首条也被推迟
+// （整轮耗时 ≥ 条数×gap）。实现前（只在两条之间 sleep 2s、首条不等）本用例必红。
+func TestSequentialTask3ReportsAtHumanCadence(t *testing.T) {
+	f := newSeqFake()
+	f.setState("Sequential_Tasks_3", 1) // 已接受，进度 0/5
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	pn := newSeqPanel(t, srv)
+
+	const gap = 50 * time.Millisecond // 代表生产的 45s 量级
+	mpChatEventGap, mpChatEventJitter = gap, 0
+
+	start := time.Now()
+	postTaskAuto(t, pn, "u1", "Sequential_Tasks_3")
+	elapsed := time.Since(start)
+
+	f.mu.Lock()
+	times := append([]time.Time(nil), f.reportTimes...)
+	f.mu.Unlock()
+	if len(times) != 5 {
+		t.Fatalf("上报条数=%d want 5", len(times))
+	}
+	for i := 1; i < len(times); i++ {
+		if d := times[i].Sub(times[i-1]); d < gap {
+			t.Errorf("第 %d→%d 条上报间隔=%v < %v（连发会被上游反作弊判无效）", i, i+1, d, gap)
+		}
+	}
+	// 首条也等：整轮 5 条 × gap，若首条不等待会少一个 gap。
+	if min := time.Duration(len(times)) * gap; elapsed < min {
+		t.Errorf("整轮耗时=%v < %v（首条未等待：整轮应含每条前等待）", elapsed, min)
+	}
+}
+
+// TestSequentialTask6ReadsRealTargetAfterAccept 吸收上游 d9edc06：accept 之后必须
+// 回读真实 target。未 accept 的 mp 任务上游下发 "progress":null（target 读成 0），
+// 兜底 target=1 会只补 1 条；Tasks_6 真实 target=10，旧代码只补 1 条后与陈旧
+// target 比较，误判达标去领奖（claim 400 "task not completed"）。
+//
+// 本用例构造「accept 前 progress=null、accept 后真实 target=10」，断言补报 10 条；
+// 实现前只补 1 条，必红。
+func TestSequentialTask6ReadsRealTargetAfterAccept(t *testing.T) {
+	f := newSeqFake()
+	f.nullProgress["Sequential_Tasks_6"] = true // accept 前 progress:null（target=0）
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	pn := newSeqPanel(t, srv)
+
+	postTaskAuto(t, pn, "u1", "Sequential_Tasks_6")
+	f.mu.Lock()
+	n := len(f.reportEvents)
+	f.mu.Unlock()
+	if n != 10 {
+		t.Errorf("上报条数=%d want 10（accept 后必须回读真实 target=10，不能用兜底 1）", n)
 	}
 }
 
