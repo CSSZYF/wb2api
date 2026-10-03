@@ -1721,11 +1721,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 				return
 			}
 			// 未达阈值：有界软冷却（到期自愈）。reason 带 code 便于运维在 /status 区分
-			// 11140 与 14017 两种 account fault。
-			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (11140)")
+			// 11140 与 14017 两种 account fault。基数取 h.softCooldown()（热改优先，
+			// 面板改 soft_rate 后立即生效）——与 ErrSoftRate 分支同一口径。
+			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (11140)")
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)

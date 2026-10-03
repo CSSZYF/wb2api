@@ -503,8 +503,18 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	}
 	switch headerName {
 	case "Retry-After":
+		// 先做上限校验再乘 time.Second：16 位数字乘 1e9 会溢出 int64 回绕成
+		// 小正数（9223372036854776 → 192ms），进而通过调用方的 retryAfterSanity
+		// 校验被当作合法等待时长。上限与 sanity 同口径（2h）。
+		if n > int64(retryAfterSanity/time.Second) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Second, true
 	case "Retry-After-Ms":
+		// 同上：乘 1e6 的回绕路径（同值回绕到 192µs）一并拦截。
+		if n > int64(retryAfterSanity/time.Millisecond) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Millisecond, true
 	default: // X-Ratelimit-Reset：epoch → 剩余量
 		sec := n
@@ -2208,7 +2218,14 @@ func (c *Client) UserResourceDetailedDiag(a *auth.Auth, soon time.Duration) (rem
 		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
+	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
+	var data json.RawMessage
+	err = c.retryBillingTransient(func() error {
+		var e error
+		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+		return e
+	})
 	if err != nil {
 		return 0, 0, 0, diag, err
 	}
@@ -2272,9 +2289,14 @@ func (c *Client) UserResourceDetailedDiag(a *auth.Auth, soon time.Duration) (rem
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
+// 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
+// 让该账号整天漏签；「已签到」等业务错误不重试。逐号串行调用，重试只延长单号耗时，
+// 不阻塞其它账号（每号之间另有既有间隔）。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-	return err
+	return c.retryBillingTransient(func() error {
+		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+		return err
+	})
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。

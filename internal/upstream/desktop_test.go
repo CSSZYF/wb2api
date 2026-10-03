@@ -119,3 +119,30 @@ func TestSetAppearanceTheme(t *testing.T) {
 		t.Errorf("body=%v want kind=theme resource_key=theme-tkmw7j", got)
 	}
 }
+
+// TestDesktopChatWithExpertSkipsNonMatchingID SSE 里 `"id":"` 首个命中不是服务端
+// requestId 形状（如消息 id）时，必须继续向后找，而不是反复命中同一位置读满 1MB
+// 后误报「未找到 requestId」。
+func TestDesktopChatWithExpertSkipsNonMatchingID(t *testing.T) {
+	const wantID = "cmb-0123456789abcdef0123456789abcdef"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/chat/completions" {
+			t.Errorf("path=%s want /v2/chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		// 首个 id 是消息 id（不匹配 idRegex）；真正的 requestId 在后面的帧里。
+		_, _ = w.Write([]byte("data: {\"id\":\"msg-abc\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"" + wantID + "\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	_, gotID, err := c.DesktopChatWithExpert(&auth.Auth{AccessToken: "at", UID: "u1"}, "expert-1")
+	if err != nil {
+		t.Fatalf("首个 id 不匹配时应继续向后找到真 requestId, err=%v", err)
+	}
+	if gotID != wantID {
+		t.Fatalf("requestId=%q want %q", gotID, wantID)
+	}
+}
