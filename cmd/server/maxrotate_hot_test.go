@@ -25,14 +25,21 @@ type rotateTripFunc func(*http.Request) (*http.Response, error)
 
 func (f rotateTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-// badParamsResponse 上游 400 + 11101（ErrBadParams）：不罚账号但**仍然轮转**，
-// 每轮必换新号——上游调用次数因此恰好等于本轮生效的换号上限，是量上限的干净探针。
+// badParamsResponse 上游 400 + 11133（model_param_invalid，归 ErrBadParams 但
+// **保留轮转**）：不罚账号、零动作、每轮必换新号——上游调用次数因此恰好等于本轮
+// 生效的换号上限，是量上限的干净探针。
+//
+// 为什么探针改用 11133 而不是 11101：11101 已请求级化（吸收上游 PR #99）——上游在
+// 解析请求体阶段拒绝即终止轮转、400 透传原文，一次请求只打一次上游，量不出换号上限。
+// 11133 是 ErrBadParams 里**仍然轮转**的那一支（参数被模型供应商拒绝，可能是账号侧
+// 后端差异，见 upstream.IsBadParamsBody 注释），正好继续充当探针（行为与旧探针一致：
+// 不罚号 + 每轮换新号）。
 func badParamsResponse() *http.Response {
 	return &http.Response{
 		StatusCode: 400,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body: io.NopCloser(strings.NewReader(
-			`{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`)),
+			`{"code":11133,"msg":"Invalid request parameters"}`)),
 	}
 }
 

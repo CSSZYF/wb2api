@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -1184,11 +1186,40 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = uerr.Status
 		}
 		if uerr == nil && terr != nil {
+			// 上游超时 / 停滞：**不换号、不罚号**（吸收上游 PR #93 的 isUpstreamTimeout）。
+			//
+			// 超时不是账号的问题：同一份请求换到别的号，撞上的是同一个慢上游，只会把
+			// 客户端拖到 MaxRotate × header_timeout，期间还给一串健康号白喂连败计数。
+			// 此前全仓没有任何超时识别，超时和「网络抖动」共用同一条换号路径（见下方
+			// IsTransient 分支的 i/o timeout 归类）。
+			//
+			// 判定三态（isUpstreamTimeout）：
+			//   1. net.Error.Timeout()（ResponseHeaderTimeout / Client.Timeout / ETIMEDOUT）；
+			//   2. 显式 deadline（context.DeadlineExceeded / os.ErrDeadlineExceeded）；
+			//   3. **客户端仍在但 ctx 被取消**——那只能是我们自己的空闲看门狗掐的流
+			//      （见 upstream/idle.go），也就是上游停滞。客户端主动断连时
+			//      r.Context().Err() != nil，走下面的抖动分支（人已走，语义不同）。
+			//
+			// 判定优先于 IsTransient：i/o timeout 同时命中 IsTransient 的抖动词表，但
+			// 超时换号注定白换（同一份请求撞同一个慢上游），必须先止损。
+			//
+			// **有意让 MaxRotate 在超时场景失效**：这里直接 break（终止轮转），不再
+			// 消耗换号名额。超时是上游/链路问题，换号无用——把它当作「本请求的一次性
+			// 终态」比按 MaxRotate 重复打上游更省资源，也让客户端更快拿到可区分的
+			// upstream_timeout 文案（末端分支）。
+			if isUpstreamTimeout(terr, r.Context().Err() != nil) {
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptObs{Stream: peek.Stream}, attemptStarted)
+				st.status = http.StatusServiceUnavailable
+				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
+				log.Printf("WARN: [server] upstream timeout uid=%s: %v (rotation stopped, account not penalized)",
+					uidPrefix(acct.UID), terr)
+				break
+			}
 			// 传输层错误（非 *Error 信封）：**只换号退避重试，不喂熔断**——传输层错误
 			// 对连续失败连坐熔断过于严苛（既有语义）。
 			//
 			// 连败兜底（issue #114）按**抖动判定**分流（本项修复点）：
-			//   - IsTransient=true（unexpected EOF / connection reset / i/o timeout /
+			//   - IsTransient=true（unexpected EOF / connection reset /
 			//     TLS 握手失败 / DNS 失败 / 连接被本地回收 / CONNECT 隧道 502·503·504）：
 			//     这是**出口链路**条件，同一链路对池内全部账号一视同仁——一个请求里 N 个
 			//     账号全中恰恰证明根因不在账号上。若照旧每个账号各喂一次连败，达阈（默认 5）
@@ -1198,6 +1229,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			//     只 fail（释放租约）+ 退避后换号。上游参照 hub f7bf4e2 is_transient()：
 			//     换号退避重试、不记冷却，抖动熬过重试后如实抛 502（本项仍回 503 +
 			//     lastErr，末端错误透传语义不变）。
+			//     注意：i/o timeout 虽在 IsTransient 词表里，但已被上方 isUpstreamTimeout
+			//     提前截走（超时不换号）——此分支收到的只剩真正的链路抖动。
 			//   - IsTransient=false（含**未知错误串**与裸 io.EOF）：保持既有语义继续喂连败
 			//     ——**保守优先**（取舍见 upstream.IsTransient 注释）：宁可误罚也不能让真
 			//     故障账号永远留在池内（漏判真故障 = 坏号持续被选中、白耗健康号配额；
@@ -1353,6 +1386,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 11101「请求体解析失败」（Unmarshal chat params failed / code 11101）：
+			// 请求级**终态**（吸收上游 PR #99）——与 11115 / 11135 同一哲学：同一 body
+			// 换任何账号都是同样的解析结果，轮转只会放大无效请求（每号一次上游调用 +
+			// rotateBackoff 占用在途名额）。更要紧的是：继续轮转后末端会落到 503
+			// no_healthy_account，把确定失败的请求伪装成「账号不可用、稍后再试」，
+			// OpenAI 兼容客户端于是对必然失败的请求无限重试。立即透传上游原文回 400。
+			//
+			// **11101 与 11133 的分野**（两者同归 upstream.ErrBadParams 分类，处置不同）：
+			//   - 11101（IsBadParamsBody 命中）：上游在**解析请求体**阶段就拒了，还没走到
+			//     模型路由 → 终止轮转。「不同账号可能有不同模型权限」是 11102
+			//     （ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让；
+			//   - 11133 model_param_invalid（IsBadParamsBody 不命中）：参数被**模型供应商**
+			//     拒绝，可能是账号侧后端差异（11102 的 (账号,模型) 负缓存证明同模型在不同
+			//     账号上可用性不同）→ **保留轮转**（零动作、不喂连败）。
+			if kind == upstream.ErrBadParams && upstream.IsBadParamsBody(string(respBody)) {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr, errDedup)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "chat request body was rejected by upstream"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg,
+					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/Status（末端映射与冷却时长共用）+ RetryAfter
 			// （末端 429 映射与冷却对齐共用）。
@@ -1374,14 +1433,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
-		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
+		// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核），
+		// 此前在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
+		// 记成健康、11102 负缓存被误清、粘性把会话钉死在它身上，后续每一轮都打同一个
+		// 限流号。三件套见下方流式 default / sErr != nil 与非流式成功分支。
+		//
+		// markSuccess 账号侧「这一跳真成功」的三件套（记成功 + 清 11102 负缓存 +
+		// 粘性跟随最终成功号），只在确认成功（或客户端断连、上游帧无恙）后调用：
+		//   - 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+		//     BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004。
+		//   - 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
+		//     若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳
+		//     不再随机抽。
+		// 为什么收成一个闭包：三处调用（流式真成功 / 流式客户端断连 / 非流式成功）
+		// 必须逐字同口径——各写一份迟早漂移（漏一处就是「某个分支不记成功」的静默缺陷）。
+		markSuccess := func() {
+			h.cfg.Pool.NoteSuccess(acct.UID)
+			h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+			if sessKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.Bind(sessKey, acct.UID)
+			}
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
@@ -1390,9 +1462,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
+			// errFrame：上游 error 帧原文（观察者旁路采集，见 WithErrorFrameObserver），
+			// 用于流尾的账号处置——error 帧形态下账号**不得**被记成功。
+			var errFrame string
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}))
+			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }))
 			// 流式观测收敛（上游缺陷 → 502）：两种上游缺陷哨兵共用同一口径，
 			// 与「客户端已走」严格区分——两道闸门，缺一不可：
 			//   1) 哨兵闸：终结帧（error 帧/[DONE]）写失败时 Stream 返回**写错误**
@@ -1412,18 +1487,39 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// **观测**（日志/状态列 502），与非流式 Aggregate 失败→502 upstream_parse
 			// 同语义。不罚账号：流中断多是上游静默/链路问题，空流路径既有口径亦不罚
 			// （与 4xx/5xx 信封错误走 applyErrorPolicy 的路径不同）。
+			// markSuccess 的说明见上方（本分支与流式 default 同口径）。
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream uid=%s model=%s: empty upstream stream (200+0 frames)", uidPrefix(acct.UID), bareModel)
+			case errFrame != "":
+				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
+				// 处置账号——**不记成功、不清 11102 负缓存、不绑粘性**。此前这些动作
+				// 在流开始前就做了，于是一个正在限流的号被当成健康号，粘性还会把
+				// 整个会话钉在它身上，后续每轮都失败。
+				kind := upstream.FrameKind(errFrame)
+				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil, errDedup)
+				st.status = http.StatusServiceUnavailable
+				log.Printf("WARN: [server] stream uid=%s model=%s: upstream error frame kind=%s payload=%s",
+					uidPrefix(acct.UID), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case upstream.IsStreamAbortedError(sErr):
 				if r.Context().Err() != nil {
 					// 客户端已走：中断是下游取消引起，不是上游缺陷——不误标 502。
+					// 账号侧照常记成功（上游帧无恙，这一跳是被下游掐掉的，与 sErr != nil
+					// 同语义——改前成功三件套在开流前就执行，此处保持该口径不回归）。
 					log.Printf("INFO: [server] stream uid=%s model=%s: stream aborted by client disconnect (no 502)", uidPrefix(acct.UID), bareModel)
+					markSuccess()
 					break
 				}
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream uid=%s model=%s: %v (200+partial frames)", uidPrefix(acct.UID), bareModel, sErr)
+			case sErr != nil:
+				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
+				// （与 default 同语义），请求日志归为中断（人已走，未完成）。
+				markSuccess()
+			default:
+				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
+				markSuccess()
 			}
 			// 流式观测一并带出：缓存三段 / 真实扣费 / 首字延迟（供 /v1/stats）。
 			// 与成本账本、pool 账本同源同口径（都读末帧 usage），不二次解析。
@@ -1463,6 +1559,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
+		markSuccess()
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
@@ -1470,6 +1568,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		msg += ": " + lastErr.Error()
 	}
 	code := "no_healthy_account"
+	// 上游超时：轮转已在传输层分支止损（见 isUpstreamTimeout），这里给一条**能区分**
+	// 的文案，别混进「没有可用账号」——两者的排查方向完全不同（超时看上游/链路，
+	// 无号看池子）。
+	if errors.Is(lastErr, errUpstreamTimeout) {
+		code = "upstream_timeout"
+		msg = "upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later"
+	}
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定（11133/11135
 	// 在 hint 层自带形态判定，ErrClient 家族也能带上 hint）；本地调度类错误
 	// （无上游原文）固定 no_healthy_account hint。上游错误若属未覆盖形态，
@@ -1606,9 +1711,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //     请求的问题，同一张图换任何号都被拒）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败，同 ErrContentBlocked/ErrPromptTooLong 待遇），chatCompletions 已直接
 //     透传原文返回不轮转——该分支只为文档完备，不指望走到换号路径。
-//   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
-//     11133 model_param_invalid 也归本类（轮转有价值：不同账号可能路由到不同后端、
-//     模型能力/权限不同；但绝不喂连败——轮转 N 个号 = N 次计数）。
+//   - ErrBadParams → 11101 请求体解析失败：请求级终态（吸收上游 PR #99）——不罚号
+//     且**不轮转**，chatCompletions 已直接透传原文回 400（换号必然同样失败）。
+//     11133 model_param_invalid 同归本类但**保留轮转**（账号侧后端差异），分野理由
+//     见 upstream.IsBadParamsBody 注释。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
 //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
@@ -1749,12 +1855,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
-		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
-		// ——不同账号可能有不同的模型权限，值得换号再试一次。
-		// 11133 model_param_invalid 同归本类（Classify 见 isModelParamInvalid）：它可能
-		// 是「该模型不支持图片」这类与账号无关的参数拒绝，也可能是账号侧后端差异——
-		// 轮转仍有价值（11102 的 (账号,模型) 负缓存证明同模型在不同账号上可用性不同），
-		// 但绝不能喂连败：本分支零动作即天然满足（ErrClient 的连败喂入不经过这里）。
+		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）。**11101 不轮转**
+		// ——chatCompletions 已直接透传原文返回 400（吸收上游 PR #99，见该处分支注释）。
+		// 11133 model_param_invalid 同归本类（Classify 见 isModelParamInvalid），但
+		// **保留轮转**：它可能是「该模型不支持图片」这类与账号无关的参数拒绝，也可能是
+		// 账号侧后端差异——轮转仍有价值（11102 的 (账号,模型) 负缓存证明同模型在不同
+		// 账号上可用性不同）；两者都绝不能喂连败：本分支零动作即天然满足（ErrClient
+		// 的连败喂入不经过这里）。
+		// 11101 vs 11133 的分野理由集中在 upstream.IsBadParamsBody 的注释（单一事实来源）。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
 		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
@@ -1779,6 +1887,39 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			}
 		}
 	}
+}
+
+// errUpstreamTimeout 上游超时的哨兵：末端出口据此给出与「没号可用」可区分的文案
+// （code=upstream_timeout），两者排查方向完全不同（超时看上游/链路，无号看池子）。
+var errUpstreamTimeout = errors.New("upstream timeout")
+
+// isUpstreamTimeout 判断这一跳的失败是否属于「上游超时 / 停滞」。超时不是账号的
+// 问题，换号注定白换（同一份请求撞同一个慢上游），必须止损：不轮转、不罚号。
+//
+// 三态判定（吸收上游 PR #93）：
+//  1. net.Error.Timeout()——ResponseHeaderTimeout / Client.Timeout / 系统 ETIMEDOUT
+//     的统一形态（net.OpError 包装后仍可 errors.As 命中）；
+//  2. 显式 deadline——context.DeadlineExceeded / os.ErrDeadlineExceeded（包装链上
+//     任一层）；
+//  3. **客户端仍在但 ctx 被取消**——那只能是我们自己的空闲看门狗掐的流
+//     （见 upstream/idle.go 的 IdleTimeout），也就是上游停滞。clientGone=true
+//     （客户端主动断连，r.Context().Err() != nil）时不算：人已走，语义是「中断」
+//     不是「上游超时」，且这种情形下重试本来就没有意义（既有路径已按 ctx 闸门处理）。
+//
+// 调用方注意：本判定**优先于** upstream.IsTransient（i/o timeout 同时命中两者的
+// 抖动词表）——超时若走抖动路径会换号重试，而换号对超时注定无效（见调用点注释）。
+func isUpstreamTimeout(err error, clientGone bool) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	return !clientGone && errors.Is(err, context.Canceled)
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：
