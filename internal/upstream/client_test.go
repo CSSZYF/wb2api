@@ -277,6 +277,35 @@ func TestParseRetryAfter(t *testing.T) {
 			t.Errorf("oversized Retry-After must fall back, got %v", d)
 		}
 	})
+	t.Run("16-digit overflow wraparound rejected", func(t *testing.T) {
+		// 16 位数字乘 time.Second(1e9) 溢出 int64 回绕成小正数：9223372036854776
+		// 恰好回绕到 192ms，旧实现（只守 len>16）会把它当合法等待。上限校验必须在
+		// 乘法之前拦截（Python 复算：n*1e9 mod 2^64 → 192000000ns）。
+		for _, v := range []string{"9223372036854776", "9223372036854775"} {
+			h := http.Header{}
+			h.Set("Retry-After", v)
+			if d := ParseRetryAfter(h); d != 0 {
+				t.Errorf("Retry-After=%s (16-digit wrap) must be rejected, got %v", v, d)
+			}
+		}
+		// 同口径覆盖 Retry-After-Ms（乘 1e6 的回绕路径）。
+		h := http.Header{}
+		h.Set("Retry-After-Ms", "9223372036854776")
+		if d := ParseRetryAfter(h); d != 0 {
+			t.Errorf("Retry-After-Ms 16-digit wrap must be rejected, got %v", d)
+		}
+		// 边界：恰好 2h（7200s）仍合法，7201s 拒绝——上限校验不得误伤合法头。
+		h2 := http.Header{}
+		h2.Set("Retry-After", "7200")
+		if d := ParseRetryAfter(h2); d != 2*time.Hour {
+			t.Errorf("Retry-After=7200 (== sanity cap) must stay valid, got %v", d)
+		}
+		h3 := http.Header{}
+		h3.Set("Retry-After", "7201")
+		if d := ParseRetryAfter(h3); d != 0 {
+			t.Errorf("Retry-After=7201 must be rejected, got %v", d)
+		}
+	})
 	t.Run("expired reset epoch", func(t *testing.T) {
 		h := http.Header{}
 		h.Set("X-Ratelimit-Reset", fmt.Sprintf("%d", time.Now().Add(-time.Minute).Unix()))

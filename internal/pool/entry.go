@@ -323,10 +323,17 @@ func (e *entry) healthy(now time.Time) bool {
 }
 
 // modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
-// 模型级冷却（modelCooldowns 非空），且尚未禁用、未临时停用、未熔断、未降权。
-// 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
+// 模型级冷却（modelCooldowns 非空），且尚未禁用、未临时停用、未账号级冷却、未熔断、
+// 未降权。此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
+//
+// 账号级冷却（until）纳入本形态判定：until 是「整体出池」的痕迹，账号对所有模型都
+// 不可选（healthy 或门直接 false）。不排除会出现这条口径裂缝：全冷却兜底选中一个
+// 软冷却号 → 撞 6004（带重置）→ CooldownSoftForModel 只写 modelCooldowns 而 until
+// 仍在未来 → /healthz 报 servable 而 chat 选号实际无候选。形态判定只看字段是否被
+// 设过（与 breakerUntil 同风格）；until 自然到期后由 healthy(now) 覆盖该账号的可
+// 服务性，不产生假阴性。
 //
 // 连败降权（degradeUntil）纳入本形态判定：降权是「临时整体出池」，账号对**所有**
 // 模型都不可选（healthy 或门直接 false），不是"仅某模型不可用"的豁免形态。不排除
@@ -336,7 +343,8 @@ func (e *entry) healthy(now time.Time) bool {
 // （degradeUntil 过期即 healthy=true），不产生假阴性。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && !e.manualDisabled && e.breakerUntil.IsZero() && e.degradeUntil.IsZero()
+		!e.disabled && !e.manualDisabled && e.until.IsZero() &&
+		e.breakerUntil.IsZero() && e.degradeUntil.IsZero()
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
