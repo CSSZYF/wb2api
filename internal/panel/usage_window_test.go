@@ -131,3 +131,55 @@ func TestPanelUsageInvalidHoursReportsEffectiveWindow(t *testing.T) {
 		t.Errorf("hours=1440（上限）应原样生效，得到 hours=%v", body["hours"])
 	}
 }
+
+// TestPanelUsageExposesCacheHitRate 面板用量端点必须把缓存命中率维度透出到前端
+// （issue #92）：totals / by_account / by_model / series 全部带
+// cache_hit_tokens / cache_miss_tokens / cache_hit_rate。数据层早已累加（usage.go
+// 的桶 + stats.go 的 /v1/stats），面板吃的 Snapshot 此前没有这三个字段——用量页
+// 因此看不到缓存命中率（费用数倍放大的直接信号）。
+//
+// 分母口径在 HTTP 层再锁一次：= 命中 + 未命中，**不含写入**。
+func TestPanelUsageExposesCacheHitRate(t *testing.T) {
+	p, rec := usagePanelFixture(t)
+	now := time.Now()
+	// 一笔带缓存观测：hit 800 / miss 200 / write 9000 → 命中率 0.8（写不含在分母）。
+	rec.Add(now, "cn", "u1", "glm-5.2", usage.Delta{
+		PromptTokens: 1000, HasPromptTokens: true,
+		CacheHit: 800, CacheMiss: 200, CacheWrite: 9000, HasCache: true,
+	}, true)
+	// 一笔无缓存观测（旧客户端）：只计请求，不进缓存分母。
+	rec.Add(now, "cn", "u1", "old", usage.Delta{PromptTokens: 10, HasPromptTokens: true}, true)
+
+	body := getUsage(t, p, "?hours=24")
+	tot := body["totals"].(map[string]any)
+	if tot["cache_hit_tokens"] != float64(800) || tot["cache_miss_tokens"] != float64(200) {
+		t.Errorf("totals cache hit/miss = %v/%v want 800/200（HTTP 层透出）",
+			tot["cache_hit_tokens"], tot["cache_miss_tokens"])
+	}
+	if r, _ := tot["cache_hit_rate"].(float64); r < 0.7999 || r > 0.8001 {
+		t.Errorf("totals cache_hit_rate=%v want 0.8（分母不含写入）", tot["cache_hit_rate"])
+	}
+	// 按模型行也带（前端 usRow 直接读这三个键）。
+	rows := body["by_model"].([]any)
+	found := false
+	for _, raw := range rows {
+		row := raw.(map[string]any)
+		if row["key"] == "glm-5.2" {
+			found = true
+			if row["cache_hit_tokens"] != float64(800) {
+				t.Errorf("by_model glm-5.2 cache_hit_tokens=%v want 800", row["cache_hit_tokens"])
+			}
+		}
+		// 无缓存观测的行不得出现这三个键（omitempty）——前端据此渲染「—」而非 0%。
+		if row["key"] == "old" {
+			for _, k := range []string{"cache_hit_tokens", "cache_miss_tokens", "cache_hit_rate"} {
+				if _, ok := row[k]; ok {
+					t.Errorf("无缓存观测的 by_model 行不得带 %s（omitempty），得到 %v", k, row[k])
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("by_model 缺 glm-5.2 行")
+	}
+}

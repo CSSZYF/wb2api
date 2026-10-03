@@ -452,6 +452,14 @@ func (r *Recorder) Save() { r.flush(true) }
 // ---------------------------------------------------------------- 聚合 ----
 
 // Agg 一组累计量。
+//
+// 缓存三字段与 stats.go 同口径（上游 5e0adb3 / issue #92）：命中率分母 =
+// 命中 + 未命中，**不含写入**——写入是「为后续命中付的费」，计入会把首次请求的
+// 命中率压低（见 stats.go finish 的注释）。
+//
+// omitempty 是硬要求：Agg 被 KeyedAgg 与 Point 内嵌，时序每个点、每张表每行都会
+// 带上这三个字段；无缓存观测的旧数据若输出 0 值，会被读成「命中率 0%」（比
+// 「未观测」更坏的误导）。分母为 0 时字段整体缺席，前端渲染「—」。
 type Agg struct {
 	Requests      int64   `json:"requests"`
 	Errors        int64   `json:"errors"`
@@ -460,6 +468,10 @@ type Agg struct {
 	TotalTokens   int64   `json:"total_tokens"`
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
+
+	CacheHitTokens  int64   `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64   `json:"cache_miss_tokens,omitempty"`
+	CacheHitRate    float64 `json:"cache_hit_rate,omitempty"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -470,6 +482,8 @@ type aggAcc struct {
 	latSamples int64
 	tpsSum     float64
 	tpsSamples int64
+	cacheHit   int64
+	cacheMiss  int64
 }
 
 func (g *aggAcc) add(b *bucket) {
@@ -482,6 +496,10 @@ func (g *aggAcc) add(b *bucket) {
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
+	// 缓存命中/未命中在 add 阶段只进累加器，不在 finish 前写进 Agg：命中率要等
+	// 全部桶累加完才能算（中间值写进 Agg 只会是半成品）。
+	g.cacheHit += b.CH
+	g.cacheMiss += b.CM
 }
 
 func (g *aggAcc) finish() Agg {
@@ -491,6 +509,12 @@ func (g *aggAcc) finish() Agg {
 	}
 	if g.tpsSamples > 0 {
 		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)
+	}
+	// 有观测才输出（omitempty）：分母 0 = 该窗口无缓存观测，不得显示成 0%。
+	if denom := g.cacheHit + g.cacheMiss; denom > 0 {
+		a.CacheHitTokens = g.cacheHit
+		a.CacheMissTokens = g.cacheMiss
+		a.CacheHitRate = float64(g.cacheHit) / float64(denom)
 	}
 	return a
 }

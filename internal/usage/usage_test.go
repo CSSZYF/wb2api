@@ -599,3 +599,89 @@ func TestFlushTempFileSameDirAndMode(t *testing.T) {
 		}
 	}
 }
+
+// TestSnapshotAggCacheHitRate 面板用量聚合（Agg）必须带缓存命中率维度（issue #92）：
+// 数据层 usage.go 的桶早已累加 CH/CM/CW（/v1/stats 也早已输出），但面板吃的
+// Snapshot.Agg 没有这三个字段——面板上看不到缓存命中率，而这是费用数倍放大的
+// 直接信号。口径与 stats.go 一致：分母 = 命中 + 未命中，**不含写入**（写入是为
+// 后续命中付的费，计入会压低首次命中率）。
+func TestSnapshotAggCacheHitRate(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 两笔观测：hit 900/miss 100，hit 700/miss 300 → 1600/400 → 80%。
+	// 写入 5000 若进分母，命中率会被压到 1600/6600 ≈ 24%——断言 0.8 即同时锁住分母口径。
+	r.Add(now, "cn", "u1", "glm-5.2", Delta{CacheHit: 900, CacheMiss: 100, CacheWrite: 5000, HasCache: true}, true)
+	r.Add(now, "cn", "u1", "glm-5.2", Delta{CacheHit: 700, CacheMiss: 300, CacheWrite: 0, HasCache: true}, true)
+	// 无缓存观测的一笔（旧客户端/非缓存模型）：只计请求，不得进缓存分母。
+	r.Add(now, "cn", "u1", "old-model", Delta{PromptTokens: 42, HasPromptTokens: true}, true)
+
+	s := r.Snapshot(24, nil)
+	if s.Totals.CacheHitTokens != 1600 || s.Totals.CacheMissTokens != 400 {
+		t.Errorf("totals cache hit/miss = %d/%d want 1600/400", s.Totals.CacheHitTokens, s.Totals.CacheMissTokens)
+	}
+	if s.Totals.CacheHitRate < 0.7999 || s.Totals.CacheHitRate > 0.8001 {
+		t.Errorf("totals cache_hit_rate=%.4f want 0.8（分母不含写入：含则约 0.24）", s.Totals.CacheHitRate)
+	}
+	// 时序每个点也带（Agg 内嵌 Point）：至少有一个点带观测。
+	seen := false
+	for _, p := range s.Series {
+		if p.CacheHitTokens > 0 {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Error("series 点未带缓存命中字段（Agg 内嵌 Point，三个字段应随点输出）")
+	}
+	// 按模型聚合同样带上（KeyedAgg 内嵌 Agg）。
+	found := false
+	for _, x := range s.ByModel {
+		if x.Key == "glm-5.2" {
+			found = true
+			if x.CacheHitRate < 0.7999 || x.CacheHitRate > 0.8001 {
+				t.Errorf("by_model glm-5.2 cache_hit_rate=%.4f want 0.8", x.CacheHitRate)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("by_model 缺 glm-5.2 行")
+	}
+}
+
+// TestSnapshotAggCacheOmitEmpty 无缓存观测（旧落盘数据 / 全非缓存请求）时三个字段
+// **必须整体缺席**（omitempty）——Agg 被 KeyedAgg 与 Point 内嵌，若输出 0 值，
+// 面板会把「未观测」渲染成「命中率 0%」，据此做成本判断就全错。
+//
+// 注意：命中率恰为 0 的真实观测（全未命中）与「未观测」在 JSON 上的区分依据是
+// miss 字段在场（miss>0 必输出）——前端据此计算 0%，而不是把缺席当 0%。
+func TestSnapshotAggCacheOmitEmpty(t *testing.T) {
+	r := New("")
+	r.Add(time.Now(), "cn", "u1", "m1", Delta{PromptTokens: 10, HasPromptTokens: true}, true)
+	raw, err := json.Marshal(r.Snapshot(24, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	tot := body["totals"].(map[string]any)
+	for _, k := range []string{"cache_hit_tokens", "cache_miss_tokens", "cache_hit_rate"} {
+		if _, ok := tot[k]; ok {
+			t.Errorf("无缓存观测时 totals.%s 不得出现（omitempty），得到 %v", k, tot[k])
+		}
+	}
+	// 反向：全未命中（hit=0, miss=100）→ miss 在场、命中率可由前端算出 0%；
+	// hit_tokens 因 omitempty 省略（值为 0），这是可接受的——前端以 miss 在场判定
+	// 「有观测」，用 hit||0 参与计算。
+	r.Add(time.Now(), "cn", "u1", "m2", Delta{CacheHit: 0, CacheMiss: 100, HasCache: true}, true)
+	raw, _ = json.Marshal(r.Snapshot(24, nil))
+	body = map[string]any{}
+	_ = json.Unmarshal(raw, &body)
+	tot = body["totals"].(map[string]any)
+	if _, ok := tot["cache_miss_tokens"]; !ok {
+		t.Error("全未命中（miss>0）时 cache_miss_tokens 必须输出——前端靠它判定「有观测」并算出 0%")
+	}
+	if _, ok := tot["cache_hit_rate"]; ok {
+		t.Error("全未命中时 cache_hit_rate=0 被 omitempty 省略（符合既定口径）；前端应从 miss 在场推 0%，不得依赖该字段")
+	}
+}
