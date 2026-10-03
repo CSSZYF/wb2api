@@ -126,6 +126,24 @@ func (a *Auth) RefreshTokenValue() string {
 	return a.RefreshToken
 }
 
+// NicknameValue 加锁读取昵称（issue #94 / 上游 f1496d0：昵称同步）。
+//
+// 为什么需要它：Nickname 原本是「登录时写一次、之后只读」的静态字段，锁外直读与
+// 其他字段同族但从无竞争。昵称同步（panel 手动刷新 → Pool.SetNickname）把它变成
+// **运行期可改写**字段：写侧在 a.mu 内改（与 SaveAtomic 同锁，见 Pool.SetNickname），
+// 而读侧散布在日志行（server/logging.go 选号时取）、面板视图（taskcenter/packages）、
+// 上游请求体（desktop/school 的 userNickname）——锁外直读即构成数据竞争。
+// 本访问器给这些读点一个统一入口，与 AccessToken/Domain/RefreshToken/ExpiresAt
+// 同形（想读凭证字段就一定有加锁入口）。
+func (a *Auth) NicknameValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Nickname
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭

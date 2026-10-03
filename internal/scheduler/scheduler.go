@@ -568,9 +568,29 @@ func (s *Scheduler) RunActivityNow() {
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
 // 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
+// CN 与 global 账号**都上报**（上游 47112c7 / PR #45 实测：国际版 /v2/report 在
+// workbuddy.ai 上 code=0 OK，点亮连登）。
 // 一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务。
 // 上报成功后续跑 streak 自检（checkActivityStreak）：回读连登天数，发现
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
+//
+// 为什么删掉 global 门控（我们的主动放开，与 D4 的保守口径相反）：
+//   - 原注释「D4 门控：global 无任务中心/活跃体系」已被上游实测证伪——国际版
+//     /v2/report 可用（PR #45）；上游 a190252 已同口径删掉同一处 gate，本仓这行
+//     是从上游旧版本同步而来的废弃判断。
+//   - 我们的实测：7 个 global 号 11 天 9625 次成功对话，credits_total 恒 350
+//     （两个注册包），只消耗 3 分——这否掉了「有效对话 → 每日 30/50 积分」，但
+//     **没有否掉「连登计数」**：连登是 growth 域计数，而我们从未对 global 发过
+//     任何 growth 请求，这条证据链里那一环是空的。本次放开即补上这一环。
+//   - 无需改 upstream：billingBase(a) 按 realm 切 base，BillingHeaders 按 realm
+//     切 Origin/Referer/UA，删掉 gate 即自动打到国际版端点。
+//   - 增量：上报成功后 checkActivityStreak 会跟着跑一次 growth streak 回读
+//     （GET /activity/growth/streak，走 global chatBase）——每号每天多一次
+//     global growth GET。
+//
+// 范围严格限定在活跃上报：checkin / travel / streak / blackcat / school 的
+// global 门控**一律不动**（上游 a190252 明确「checkin/travel 门控不动」），
+// 由 activity_test.go 的行为断言 + 源码级门控计数护栏锁住。
 func (s *Scheduler) runActivity(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
@@ -580,9 +600,6 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
-		}
-		if a.IsGlobal() {
-			continue // D4 门控：global 无任务中心/活跃体系，不发起任何上游调用
 		}
 		if !first {
 			if !sleepCtx(ctx, activityAccountDelay) {

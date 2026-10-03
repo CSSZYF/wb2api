@@ -629,9 +629,11 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
 		Realm:             e.a.Realm(),
-		Nickname:          e.a.Nickname,
-		Credits:           e.credits,
-		CreditsTotal:      e.creditsTotal,
+		// NicknameValue 加锁读：昵称自昵称同步（issue #94）起可被 Pool.SetNickname
+		// 在运行期改写（写侧持 a.mu），锁外直读即数据竞争。
+		Nickname:     e.a.NicknameValue(),
+		Credits:      e.credits,
+		CreditsTotal: e.creditsTotal,
 		// 快过期积分子集（credits 的一部分）：与 credits/creditsTotal 同源同快照，
 		// 面板据此显示「快过期 N」。0 时经 omitempty 省略——前端配合 credits_total
 		// 判「窗口内确实没有」（总额已知）还是「未知」（旧 state）。

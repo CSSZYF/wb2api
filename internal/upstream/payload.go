@@ -87,15 +87,22 @@ func PrepareBodyOptRealmHistory(src []byte, realm string, sanitize, zeroWidth bo
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
-	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
-	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
-	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
-	// 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，
+	// tool 配对三步（见 tool_pairing.go）：先唯一化 id，再重排，最后清理。所有模型
+	// 一律执行（独立于 deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网
+	// ——不完整配对的 tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行
+	// 剔除；插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，
 	// 先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
+	//
+	// dedupe 必须排在最前（#81 兜底）：客户端发送前把 tool_call id 截断到 40 字符，
+	// 三条唯一 id 截成同一个 → 上游判 400/11148，单号池重试全败会话报废。唯一化
+	// 同时改写调用侧 id 与结果侧 tool_call_id，故下游 repack 的 want map 与 cleanup
+	// 的 keepCalls 看到的都是新 id，配对不被破坏（顺序敏感：改名在剪枝之前，剪枝
+	// 依据的 id 才是唯一且自洽的）。
 	if msgs, ok := obj["messages"].([]any); ok {
+		msgs, _ = dedupeToolCallIDs(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
-		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
+		// 无改动时三步都返回原 slice，这里回写等于零操作；任一步改名/重排/删除
 		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
 		obj["messages"] = msgs

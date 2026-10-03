@@ -59,12 +59,14 @@ type DesktopEvent map[string]any
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
+	// 昵称加锁快照：昵称同步（issue #94）后该字段运行期可变（写侧持 a.mu）。
+	nick := a.NicknameValue()
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
 		"userId":       a.UID,
-		"username":     a.Nickname,
-		"userNickname": a.Nickname,
+		"username":     nick,
+		"userNickname": nick,
 		"product":      "SaaS",
 		"releaseDate":  int64(1789036585355),
 		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
@@ -270,7 +272,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": ua,
 		"machineId": deriveID(a, "webmachine"), "userId": a.UID,
-		"userNickname": a.Nickname, "enterpriseId": a.EnterpriseID,
+		"userNickname": a.NicknameValue(), "enterpriseId": a.EnterpriseID,
 	}
 	raw, err := json.Marshal([]map[string]any{ev})
 	if err != nil {

@@ -11,6 +11,8 @@
 // 的条目让会话自愈，宁可丢一轮工具上下文，也好过整条会话死亡。
 package upstream
 
+import "fmt"
+
 // repackToolResultBlocks 把插在 assistant.tool_calls 与其 tool 结果之间的非 tool 消息
 // 挪到整组之后，保证同一批 tool_call 的结果在 wire 上连续。
 //
@@ -105,6 +107,167 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 		return messages, false
 	}
 	return out, true
+}
+
+// dedupeToolCallIDs 出站前把重复的 tool_call id 唯一化（#81 兜底加固）。
+//
+// 背景（#81 的最终结论，作者两度更正）：会话历史里的 tool_call id 本应唯一，但
+// **客户端在发送前把 id 截断到 40 字符**——库里 `toolu_call-…-0` / `-1` / `-2`
+// 三条唯一 49 字符 id，截断后变成同一个 40 字符 id。上游按唯一性/序列校验 →
+// HTTP 400 / code 11148（tool_call_sequence_broken）；单号池时重试全败 →
+// 客户端收 503 自动重试 5 次 → **会话彻底无法继续**。
+//
+// 根因在客户端截断，网关拦不住；本函数是**兜底加固**：按消息顺序遍历，同一 id
+// 在**同一侧**第 2..n 次出现时改名为 `<id>_d<n>`，调用侧（assistant.tool_calls[].id）
+// 与结果侧（role:tool 的 tool_call_id）各自按出现序对齐。纯改名——不动顺序、
+// 不动内容、不删任何消息。
+//
+// 为什么两侧各自计数而非共用一个计数器：正常载荷里一个 id 天然出现两次（一次调用
+// + 一次结果），共用计数器会把所有正常配对的结果都改成 `_d2`；分侧计数才能做到
+// 「只对真重复动刀」，正常载荷零改动。
+//
+// 与下游两步的衔接（必须同步覆盖两处口径，否则改名反而制造孤儿）：
+//   - repackToolResultBlocks 的 want map；
+//   - cleanupOrphanToolCalls 的 callIDs / resultIDs / keepCalls 集合。
+//
+// 两者都从改写后的消息读取，本函数**同时**改写调用侧 id 与结果侧 tool_call_id，
+// 两处看到的是同一套新 id。故本函数必须排在两步之前（先唯一化身份，再重排，再剪枝）。
+//
+// 幂等：对已唯一化的载荷零改动；改名后缀避开载荷里已存在的字面 id（见 dedupName）。
+func dedupeToolCallIDs(messages []any) ([]any, bool) {
+	if len(messages) == 0 {
+		return messages, false
+	}
+	// 第一遍：统计各 id 在两侧的出现次数，并收集载荷里全部字面 id（用于避碰——
+	// 若 `x_d2` 已是另一条调用的真 id，`x` 的第 2 次出现就不得改成 `x_d2`，
+	// 否则刚消掉的重复又撞回来）。
+	callCount := map[string]int{}
+	resultCount := map[string]int{}
+	taken := map[string]bool{}
+	hasTraffic := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch msg["role"] {
+		case "tool":
+			if id, _ := msg["tool_call_id"].(string); id != "" {
+				resultCount[id]++
+				taken[id] = true
+				hasTraffic = true
+			}
+		case "assistant":
+			tcs, ok := msg["tool_calls"].([]any)
+			if !ok {
+				continue
+			}
+			for _, tci := range tcs {
+				tc, ok := tci.(map[string]any)
+				if !ok {
+					continue
+				}
+				if id, _ := tc["id"].(string); id != "" {
+					callCount[id]++
+					taken[id] = true
+					hasTraffic = true
+				}
+			}
+		}
+	}
+	if !hasTraffic {
+		return messages, false
+	}
+	dup := false
+	for _, n := range callCount {
+		if n > 1 {
+			dup = true
+			break
+		}
+	}
+	if !dup {
+		for _, n := range resultCount {
+			if n > 1 {
+				dup = true
+				break
+			}
+		}
+	}
+	if !dup {
+		return messages, false // 无重复：零改动，原 slice 原样返回
+	}
+	// 第二遍：按消息顺序改写，两侧各持独立出现计数。同一 (原 id, 出现序号) 的别名
+	// 必须两侧一致——别名经 alias 记忆表统一生成，两侧只查表不各自造名，否则调用侧
+	// 拿到 `_d2`、结果侧拿到 `_d3`，配对反而被拆散（改名必须双侧同口径）。
+	seenCalls := map[string]int{}
+	seenResults := map[string]int{}
+	alias := map[string]string{} // 键：原 id + "#" + 出现序号
+	changed := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch msg["role"] {
+		case "tool":
+			id, _ := msg["tool_call_id"].(string)
+			if id == "" {
+				continue
+			}
+			seenResults[id]++
+			if seenResults[id] == 1 {
+				continue // 首次出现保持原名
+			}
+			msg["tool_call_id"] = aliasFor(id, seenResults[id], alias, taken)
+			changed = true
+		case "assistant":
+			tcs, ok := msg["tool_calls"].([]any)
+			if !ok {
+				continue
+			}
+			for _, tci := range tcs {
+				tc, ok := tci.(map[string]any)
+				if !ok {
+					continue
+				}
+				id, _ := tc["id"].(string)
+				if id == "" {
+					continue
+				}
+				seenCalls[id]++
+				if seenCalls[id] == 1 {
+					continue // 首次出现保持原名
+				}
+				tc["id"] = aliasFor(id, seenCalls[id], alias, taken)
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return messages, false
+	}
+	return messages, true
+}
+
+// aliasFor 返回原 id 第 n 次出现（n>=2）的别名，同一 (id, n) 恒返回同一个名字
+// （两侧共用，见 dedupeToolCallIDs 第二遍）。名字优先 `<id>_d<n>`，被载荷里既有
+// 字面 id 或已分配别名占用则递增后缀。分配即登记，保证同轮内不撞名。
+func aliasFor(id string, n int, alias map[string]string, taken map[string]bool) string {
+	key := fmt.Sprintf("%s#%d", id, n)
+	if name, ok := alias[key]; ok {
+		return name
+	}
+	name := ""
+	for k := n; ; k++ {
+		cand := fmt.Sprintf("%s_d%d", id, k)
+		if !taken[cand] {
+			name = cand
+			break
+		}
+	}
+	alias[key] = name
+	taken[name] = true
+	return name
 }
 
 // cleanupOrphanToolCalls 剔除无法配对的 tool_call 与 tool 结果（所有模型，独立于
