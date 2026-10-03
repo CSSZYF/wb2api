@@ -35,7 +35,7 @@ const (
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文（11133 同归本类但保留轮转，见 IsBadParamsBody）
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrInvalidImage                  // 11135「invalid_image_data」→ 请求级终态（图片数据无效是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
@@ -249,7 +249,8 @@ func contentBlockedKeyword(body string) string {
 
 // badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
-// 与账号健康无关——不罚号，但仍轮转（commit B）。
+// 与账号健康无关——不罚号，且**不轮转**（请求级终态，吸收上游 PR #99：
+// 11101 发生在上游解析请求体阶段，还没走到模型路由，换号必然同样失败）。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
 
 // alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
@@ -257,6 +258,22 @@ var badParamsMarkerMsg = "Unmarshal chat params failed"
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinMarkers = []string{"已签到", "already"}
 var badParamsMarkerCode = `"code":11101`
+
+// IsBadParamsBody 报告上游错误 body 是否属 **11101 请求体解析失败**（"Unmarshal
+// chat params failed" / code 11101）。handler 的请求级终态分支据此把该形态与
+// **11133 model_param_invalid** 区分开——两者同归 ErrBadParams 分类，但处置不同：
+//
+//   - 11101（本函数命中）：上游在**解析请求体**阶段就拒了，还没走到模型路由，
+//     同一 body 换任何账号结果相同 → 终止轮转、400 透传原文（吸收上游 PR #99）。
+//   - 11133（本函数不命中，见 isModelParamInvalid）：参数被**模型供应商**拒绝，
+//     可能是账号侧后端差异（11102 的 (账号,模型) 负缓存证明同模型在不同账号上
+//     可用性不同）→ 保留轮转（零动作，不罚号、不喂连败）。
+//
+// 单一事实来源：判定词表与 Classify 共用（badParamsMarkerMsg / badParamsMarkerCode），
+// 不在 handler 里另写一套子串。
+func IsBadParamsBody(body string) bool {
+	return strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode)
+}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -610,7 +627,9 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 //     相交，插入点不改变任何既有分类结果。
 //  12. 内容策略/参数错误/其他 4xx —— 通用兜底（内容策略拦截须先于通用 ErrClient，
 //     前者是误报信号、不罚账号，由网关降级重试处理）。11133 model_param_invalid
-//     在参数层归 ErrBadParams（不罚号但仍轮转，理由见该层注释）。
+//     在参数层归 ErrBadParams（**保留轮转**：可能是账号侧后端差异）；11101
+//     （IsBadParamsBody）同归 ErrBadParams 但**不轮转**（请求级终态）——分野理由
+//     见 IsBadParamsBody 与 handler 的 11101 分支注释。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
@@ -724,9 +743,11 @@ func Classify(status int, body string) ErrKind {
 		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
 		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
 		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
-		// 模型权限，值得再试一次）。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
+		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
+		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
+		// handler 侧用 upstream.IsBadParamsBody 区分本形态与 11133（后者保留轮转）。
+		if IsBadParamsBody(body) {
 			return ErrBadParams
 		}
 		return ErrClient
@@ -1965,11 +1986,12 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间，上游墙钟串（packageEndLayout "2006-01-02 15:04:05"，
+	// EndTime 该包的到期时间，上游墙钟串（packageEndLayout "2006-01-02 15:04:05"，
 	// UTC+8），**原样透传**不做格式归一：面板「到期」列按 slice(0,10) 取日期、并按同
-	// 口径算剩余天数。取值三级兜底 ExpiredTime → PackageEndTime → CycleEndTime（理由
-	// 见 CreditPackages 内赋值处）；空串 = 上游没给到期时间（面板渲染「-」，不是 0、
-	// 也不是「已过期」）。
+	// 口径算剩余天数。取值四级兜底 ExpiredTime → PackageEndTime → CycleEndTime →
+	// DeductionEndTime（最后一级是 epoch 毫秒，出站前格式化成同一墙钟串；理由与
+	// 「为什么只做兜底」见 CreditPackages 内赋值处）；空串 = 上游没给到期时间
+	// （面板渲染「-」，不是 0、也不是「已过期」）。
 	EndTime string `json:"end_time,omitempty"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
@@ -2019,7 +2041,7 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
 					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
 					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					// 到期时间字段三级兜底（取值顺序见下方赋值处）。前两个字段上游
+					// 到期时间字段四级兜底（取值顺序见下方赋值处）。前两个字段上游
 					// 实测从不下发（恒空串，这正是面板「到期」列全是「-」的根因），
 					// 真实到期字段是 CycleEndTime——与 UserResourceDetailed 的
 					// Expiring 分桶判据同源（同一端点 get-user-resource，同一种
@@ -2027,6 +2049,15 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
 					CycleEndTime   string `json:"CycleEndTime"`
+					// DeductionEndTime 可抵扣窗口结束（epoch 毫秒）——PR #93 声称它是
+					// 「这个包什么时候不能再花」的真失效时刻（CycleEndTime 是周期边界
+					// 即额度重置点）。本仓的既有实证（sliver 75c15e8 + 本仓 cfa10cf）
+					// 说真实到期字段是 CycleEndTime 且上游不下发 ExpiredTime/
+					// PackageEndTime——两者可能都对（不同 realm / 时间点），故本仓
+					// **只把它加为第四级兜底**：有值才用、缺失回落既有三级，即使 PR
+					// 的判断在本域不成立也不回归。单位差异见下方赋值处（格式化成同一
+					// 墙钟串出站，不让前端解析路径分叉）。
+					DeductionEndTime int64 `json:"DeductionEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -2049,12 +2080,13 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
-		// 到期时间三级兜底 ExpiredTime → PackageEndTime → CycleEndTime（「有值就用」：
-		// 空串不覆盖真值，故用 if/else if 而不是后写覆盖前写）。
+		// 到期时间四级兜底 ExpiredTime → PackageEndTime → CycleEndTime →
+		// DeductionEndTime（「有值就用」：空串不覆盖真值，故用 if/else if 而不是后写
+		// 覆盖前写）。
 		//
 		// 为什么是这个顺序：前两个字段是修复前就在读的，排在前面保证「真下发它们的域」
 		// 取值与修复前逐字一致（零回归）；但上游 CN/global 两域实测**都不下发**这两个
-		// 字段（恒空串，面板「到期」列全是「-」的根因），所以真正补上缺口的是末位的
+		// 字段（恒空串，面板「到期」列全是「-」的根因），所以真正补上缺口的是第三位的
 		// CycleEndTime。若哪天实测发现某域真的下发了前两个字段且语义与包到期不同，
 		// 才需要重新评估这个顺序。
 		//
@@ -2063,16 +2095,29 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 		// 字段是 CycleEndTime——上游 sliver 75c15e8 + 本仓 cfa10cf 两处实证），
 		// 照它的口径，不自创第二套。
 		//
+		// 为什么 DeductionEndTime 只排第四（兜底）：PR #93 声称它（epoch 毫秒）才是真
+		// 失效时刻、CycleEndTime 只是周期边界——与本仓实证（两处：真实到期字段就是
+		// CycleEndTime）冲突。两者可能都对（不同 realm / 时间点），故**只做兜底**：
+		// 前三者全空时才有值可用，即使 PR 的判断在本域不成立也不会让既有取值回归。
+		//
 		// 原样透传、不做格式归一：CycleEndTime 上游形态即 packageEndLayout
 		// "2006-01-02 15:04:05"（UTC+8 墙钟），前端「到期」列按 slice(0,10) 取日期、
 		// 三态判定按同口径算剩余天数，原样已够用；归一成 RFC3339 要多一次格式转换
 		// （且必须同步改前端），零收益而引入格式风险。
-		if p.ExpiredTime != "" {
+		//
+		// 第四级的**单位差异**处理：DeductionEndTime 是 epoch 毫秒，与前三级的墙钟串
+		// 不同源——这里把它格式化成同一 packageEndLayout 串出站（而非照搬 PR 的
+		// RFC3339），前端 pkgEndMs 只认墙钟形态，解析路径因此**不分叉**。
+		// 非正值（0/负数）视为未下发，不格式化（不得把 1970 渲染成「已过期」）。
+		switch {
+		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
-		} else if p.PackageEndTime != "" {
+		case p.PackageEndTime != "":
 			cp.EndTime = p.PackageEndTime
-		} else {
+		case p.CycleEndTime != "":
 			cp.EndTime = p.CycleEndTime
+		case p.DeductionEndTime > 0:
+			cp.EndTime = time.UnixMilli(p.DeductionEndTime).In(softRateResetLoc).Format(packageEndLayout)
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {

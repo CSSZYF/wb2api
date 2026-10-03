@@ -113,8 +113,13 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 }
 
 // rotateCallsUntil503 发一次聊天请求，返回上游被调用次数与收到过请求的 Authorization
-// 集合。所有号一律回 11101（ErrBadParams）：不罚账号但**仍然轮转**，因此换号次数 =
-// 上游调用次数（每轮必换新号，不被冷却/熔断提前截断，正好量出轮转上限）。
+// 集合。所有号一律回 11133（model_param_invalid，归 ErrBadParams）：不罚账号、
+// 零动作但**仍然轮转**（账号侧后端差异），因此换号次数 = 上游调用次数（每轮必换新号，
+// 不被冷却/熔断提前截断，正好量出轮转上限）。
+//
+// 为什么探针不用 11101：11101 已请求级化（吸收上游 PR #99）——解析请求体失败即
+// 终止轮转、400 透传，一次请求只打一次上游，量不出换号上限。11133 是 ErrBadParams
+// 里仍然轮转的那一支（见 upstream.IsBadParamsBody 注释），行为与旧探针一致。
 func rotateCallsUntil503(t *testing.T, h *Handler) (int, map[string]bool) {
 	t.Helper()
 	calls := map[string]bool{}
@@ -125,7 +130,7 @@ func rotateCallsUntil503(t *testing.T, h *Handler) (int, map[string]bool) {
 		return &http.Response{
 			StatusCode: 400,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"code":11133,"msg":"Invalid request parameters"}`)),
 		}, nil
 	})
 	rec := httptest.NewRecorder()
@@ -231,15 +236,18 @@ func TestMaxRotateAbovePoolSizeStopsAtPool(t *testing.T) {
 	}
 }
 
-// TestChatBadParamsRotatesWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
-// → 该类归 ErrBadParams：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），但**仍然轮转**
-// （换号重试可能命中不同权限的账号）。端到端断言 bad 失败、good 成功、账号完好。
+// TestChatBadParamsRotatesWithoutPenalty 上游 400 + 11133（model_param_invalid，
+// 归 ErrBadParams）→ 不罚账号（无冷却/无禁用/无熔断计数/无 errTotal/无连败），
+// 但**仍然轮转**（账号侧后端差异，换号重试可能命中可用后端）。
+// 端到端断言 bad 失败、good 成功、账号完好。
+//
+// 11101 已请求级化（不轮转、400 透传），其断言见 handler_badparams_terminal_test.go。
 func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls[authz]++
 		if authz == "Bearer at-bad" {
-			return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
+			return 400, `{"code":11133,"msg":"Invalid request parameters"}`, false
 		}
 		return 200, sseOK, true
 	})
@@ -258,19 +266,19 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
-	// 账号完好：无冷却、无禁用、无熔断计数、无 errTotal。
+	// 账号完好：无冷却、无禁用、无熔断计数、无 errTotal、无连败。
 	st, _ := p.Status("bad")
-	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 || st.ConsecutiveFails != 0 {
 		t.Errorf("ErrBadParams must not penalize account: %+v", st)
 	}
 }
 
-// TestChatAllBadParams503CarriesUpstreamBody 全部账号都 11101 时 503 文案必须包含
-// 上游原始 11101 信息（不再是空洞的 no_healthy_account）。
+// TestChatAllBadParams503CarriesUpstreamBody 池内唯一账号 11133（ErrBadParams）
+// 轮转耗尽后末端 503 文案必须包含上游原始信息（不再是空洞的 no_healthy_account）。
 // 现状即透传 lastErr.Error()（含上游 body），本测试把它锁定为回归。
 func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
+		return 400, `{"code":11133,"msg":"Invalid request parameters"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
@@ -280,8 +288,8 @@ func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "11101") || !strings.Contains(body, "Unmarshal chat params failed") {
-		t.Errorf("503 message should carry upstream 11101 info: %s", body)
+	if !strings.Contains(body, "11133") || !strings.Contains(body, "Invalid request parameters") {
+		t.Errorf("503 message should carry upstream 11133 info: %s", body)
 	}
 }
 

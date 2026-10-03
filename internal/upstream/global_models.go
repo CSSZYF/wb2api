@@ -372,22 +372,37 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]ModelInfo, error
 	return parseGlobalModelInfos(raw)
 }
 
-// probeGlobalV3Capabilities 并发两路 /v3/config（IDE UA + CLI UA）取并集
-// （吸收上游 9dce68a）。
+// desktopProbeUA /v3/config 第三路（桌面端形态）探测用的 UA。
 //
-// /v3/config 对不同 User-Agent 下发的模型集合不同（上游 2026-09-22 实测）：
-//   - CodeBuddyIDE/4.12.0 → 14 条，含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**；
-//   - CLI/2.63.2 CodeBuddy/2.63.2 → 22 条，含 deepseek-v4.1-flash / gpt-6-astra 等。
+// 为什么必须单独探这一路：该端点按 UA **家族**下发不同目录，三族各有独有模型
+// （PR #103 实测，同一账号同一端点：CN IDE 19 / CLI 32 / 桌面端 54，
+// global 13 / 22 / 29）。global 侧 gpt-6-luna 只在桌面端目录出现，但请求实测
+// 可正常返回 200——只探 IDE + CLI 时它永远进不了 /v1/models。
+// 版本号升降不改结果（IDE 4.12→5.0、CLI 2.63→2.80 目录条数一致），故只补家族。
 //
-// 两路各有独有模型（IDE 响应体积更大 = 单条字段更全，CLI 模型数更多），单纯换 UA
-// 只会引入新的缺失，故并发两路 + 并集。单路失败降级到另一路，两路全失败 → ok=false
-// （调用方保持既有目录，能力字段由 context_catalog 知识表兜底——fail-soft，探测失败
-// 不得把目录整体打空）。
+// 平台段固定用 CN 形态（`WorkBuddy`）：本次实测即该形态、两个 base 都返回最大目录；
+// defaultWorkBuddyUAFor 的 global 形态（`WorkBuddy AI`）未实测，不臆造。
+func (c *Client) desktopProbeUA() string {
+	return c.defaultWorkBuddyUAFor(nil)
+}
+
+// probeGlobalV3Capabilities 并发三路 /v3/config（IDE UA + CLI UA + 桌面端 UA）取并集
+// （吸收上游 9dce68a 双路 + PR #103 第三路）。
+//
+// /v3/config 按 UA **家族**（客户端形态）下发的模型集合不同：
+//   - CodeBuddyIDE/4.12.0 → 含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**；
+//   - CLI/2.63.2 CodeBuddy/2.63.2 → 含 deepseek-v4.1-flash / gpt-6-astra 等；
+//   - WorkBuddy/<ver> <platform>/<ver> CLI/<ver>（桌面端）→ global 侧独有 gpt-6-luna。
+//
+// 三路各有独有模型（IDE 响应体积更大 = 单条字段更全，CLI/桌面端模型数更多），单纯
+// 换 UA 只会引入新的缺失，故并发多路 + 并集。任一路成功即为主路、其余补缺失 id；
+// 单路失败降级到其余路，**全失败**才 ok=false（调用方保持既有目录，能力字段由
+// context_catalog 知识表兜底——fail-soft，探测失败不得把目录整体打空）。
 //
 // 本仓与上游的架构差异：上游把 v3 目录当 global 目录的**主源**（企业端点补缺），
 // 本仓的目录主源是企业端点（见 probeGlobalModels），v3 只作**能力覆盖源 + 独有 id
-// 补充源**（applyGlobalV3Catalog）。效果一致（v3 独有的可调用模型同样进目录），
-// 但不改动「探测失败回落静态名单」的既有降级链。
+// 补充源**（catalog.go 的 MergeCatalogOverlay）。效果一致（v3 独有的可调用模型同样
+// 进目录），但不改动「探测失败回落静态名单」的既有降级链。
 func (c *Client) probeGlobalV3Capabilities(a *auth.Auth) (map[string]ModelInfo, bool) {
 	type v3Result struct {
 		models map[string]ModelInfo
@@ -403,19 +418,41 @@ func (c *Client) probeGlobalV3Capabilities(a *auth.Auth) (map[string]ModelInfo, 
 	}
 	ideCh := probe(codeBuddyIDEUA)
 	cliCh := probe(codeBuddyCLIUA)
-	ide, cli := <-ideCh, <-cliCh
+	// 第三路：桌面端形态。缺它就会漏掉仅桌面端下发的模型——global 侧 gpt-6-luna
+	// 即此例（目录里没有、实际可调用），用户侧表现为「模型列表不全」。
+	desktopCh := probe(c.desktopProbeUA())
+	ide, cli, desktop := <-ideCh, <-cliCh, <-desktopCh
 
+	// 多路自合并：IDE 路字段权威（响应更大、单条字段更全），CLI 路与桌面路只补
+	// 缺失的模型 id / 零值能力字段。任一路成功即用其为主路；全失败才 ok=false。
+	type probeOut struct {
+		label  string
+		result v3Result
+	}
+	probes := []probeOut{
+		{"IDE-UA", ide},
+		{"CLI-UA", cli},
+		{"desktop-UA", desktop},
+	}
+	var okProbes []v3Result
+	for _, p := range probes {
+		if p.result.err != nil {
+			log.Printf("WARN: [upstream] global models: v3/config %s probe failed: %v", p.label, p.result.err)
+			continue
+		}
+		okProbes = append(okProbes, p.result)
+	}
 	switch {
-	case ide.err != nil && cli.err != nil:
+	case len(okProbes) == 0:
 		return nil, false
-	case ide.err != nil:
-		log.Printf("WARN: [upstream] global models: v3/config IDE-UA probe failed (CLI-UA only): %v", ide.err)
-		return cli.models, len(cli.models) > 0
-	case cli.err != nil:
-		log.Printf("WARN: [upstream] global models: v3/config CLI-UA probe failed (IDE-UA only): %v", cli.err)
-		return ide.models, len(ide.models) > 0
+	case len(okProbes) == 1:
+		return okProbes[0].models, len(okProbes[0].models) > 0
 	default:
-		return mergeV3CapabilityMaps(ide.models, cli.models), true
+		merged := okProbes[0].models
+		for _, p := range okProbes[1:] {
+			merged = mergeV3CapabilityMaps(merged, p.models)
+		}
+		return merged, true
 	}
 }
 
