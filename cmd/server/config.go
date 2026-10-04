@@ -118,6 +118,22 @@ type Config struct {
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
 		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
 
+		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
+		// 余额刷新）对**已禁用（disabled）**的账号也执行。
+		//
+		// 为什么需要它：面板「禁用」的语义是「不再参与选号」（见面板确认文案），但这四类
+		// 任务此前一律 `if st.Disabled { continue }`，等于把「停用流量」放大成「停止一切
+		// 上游保号行为」——被禁用的号拿不到签到积分、不续 token、余额也不再刷新；而
+		// ReenableIfCredits 明确不复活 disabled 账号（见 pool.state.go），于是签到这条唯一
+		// 的自动回血路径也断了，账号只能靠人工「解冻」回来。
+		//
+		// 对「一次只放开一个号、用禁用做流量开关」的轮换用法（同 IP 多号防风控），闲置
+		// 待命的号恰恰是最需要签到的那批——本开关即为该用法提供出口。
+		//
+		// 缺省 false = 保持既有行为，对老配置零影响。打开后禁用号仍会签到 / 保活，但
+		// **依旧不参与选号**：pool 选号侧的 disabled 过滤不受本开关影响。
+		IncludeDisabledInTasks bool `json:"include_disabled_in_tasks"`
+
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭

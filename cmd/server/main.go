@@ -220,6 +220,8 @@ func main() {
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
+		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -273,6 +275,9 @@ func main() {
 		log.Printf("冷却探活已禁用（schedule.cooldown_probe_enabled=false）：到期的软冷却只能等自然到期或手动解冻")
 	case cfg.CooldownProbeInterval > 0:
 		log.Printf("冷却探活：每 %s 试探已到期的软冷却（成功即解冻，失败零惩罚；硬冷却不探）", cfg.CooldownProbeInterval)
+	}
+	if cfg.Schedule.IncludeDisabledInTasks {
+		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
 	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
@@ -727,6 +732,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		// 无并发安全 setter，运行期赋值是数据竞争；且启动时那份静态值仅作兜底。
 		srv.SetReadTimeout(time.Duration(newCfg.Server.ReadTimeoutSeconds) * time.Second)
 	}
+	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
 	return restartRequiredFields(newCfg), nil
 }

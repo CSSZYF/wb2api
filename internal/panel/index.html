@@ -836,6 +836,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="cooldown_probe_minutes" type="number" min="1" placeholder="10">
                 <span class="hint">试探「已到期」的软冷却（如 6004 模型级限流），上游提前恢复即自动解冻；失败不罚号，硬冷却不探</span></label>
             </div>
+            <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
+              <input type="checkbox" name="include_disabled_in_tasks"></div>
+            <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。</div>
           </div>
         </div>
 

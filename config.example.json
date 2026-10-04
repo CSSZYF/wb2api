@@ -49,7 +49,8 @@
     "auth_watch_enabled": true,
     "auth_watch_seconds": 30,
     "cooldown_probe_enabled": true,
-    "cooldown_probe_minutes": 10
+    "cooldown_probe_minutes": 10,
+    "include_disabled_in_tasks": false
   },
   "global": {
     "enabled": true,

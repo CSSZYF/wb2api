@@ -1044,6 +1044,7 @@ const CFG_MAP = {
   cooldown_probe_enabled: ['schedule', 'cooldown_probe_enabled'], cooldown_probe_minutes: ['schedule', 'cooldown_probe_minutes'],
   max_body_mb: ['server', 'max_body_mb'], max_rotate: ['server', 'max_rotate'],
   read_timeout_seconds: ['server', 'read_timeout_seconds'],
+  include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   pick_mode: ['pool', 'pick_mode'],
   reserve_credits: ['pool', 'reserve_credits'],
