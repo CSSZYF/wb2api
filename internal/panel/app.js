@@ -1026,6 +1026,19 @@ const CFG_MAP = {
   ptl_max_tokens_retry: ['features', 'ptl_max_tokens_retry'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
 };
+/* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
+ *
+ * 其余文本字段保持「空 = 不下发」的既有语义——那是防误清空的保护，不是 bug：
+ * 表单里某个框没填，通常意味着"没改"，把它当成"请清空"会静默抹掉配置。
+ *
+ * 但覆盖型字段正好相反：清空 = 明确要求回到默认。漏发它们会让面板显示"已保存"
+ * 而值其实没变（issue #102 附带发现 2：user_agent 清空后 config.json 里仍是旧值）。
+ *
+ * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
+ * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
+ */
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
   let o = obj;
@@ -1079,7 +1092,8 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
-      if (raw === '') v = undefined;
+      // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
+      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
