@@ -429,6 +429,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// 本身也需要一次确认）。对齐上游 credit_floor 的 /status 透出。
 		// 只新增字段，既有键不变（零回归）。
 		"reserve_credits": h.cfg.Pool.ReserveCredits(),
+		"model_locks":     h.cfg.Pool.ModelLockView(),
 	})
 }
 

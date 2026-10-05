@@ -267,6 +267,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 与调度器同源（同一原子的热生效值，面板改 pool.expiring_soon 后立即一致）。
 		"expiring_soon_sec": int64(p.expiringSoonWindow().Seconds()),
 		"accounts":          p.cfg.Pool.List(),
+		"model_locks":       p.cfg.Pool.ModelLockView(),
 	})
 }
 

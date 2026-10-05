@@ -1744,7 +1744,7 @@ func TestAppJSCollectConfigClearable(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('const CFG_MAP');
-const end = src.indexOf('/* Go 时长字段即时校验');
+const end = src.indexOf('function ', src.indexOf('function collectConfig') + 10);
 if (start < 0 || end < 0 || end < start) throw new Error('collectConfig region not found');
 const mk = v => ({ type: 'text', value: v });
 const cfgForm = { elements: {
