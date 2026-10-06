@@ -480,7 +480,7 @@ function renderModelLocks(rows) {
   }
   const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
   const left = iso => {
-    const ms = parseAPITime(iso);
+    const ms = iso && !/^0001-/.test(iso) ? Date.parse(iso) : NaN;
     return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
   };
   tb.innerHTML = rows.map(r => {
@@ -886,6 +886,60 @@ function prefixedModelID(realm, id) {
    选择器只渲染 realm_servable 为 true 的域（池内没账号的域不给按钮，点了必 503）。
    当前域记在 mdRealm；首次进入由后端回显决定（纯 CN 部署 → cn）。 */
 let mdRealm = null;
+let mdCache = null;
+let mdFilter = {q: '', cap: '', effort: '', promo: '', sort: 'default'};
+function mdRateValue(m) {
+  const raw = (m.promo_credits != null && m.promo_credits !== '') ? m.promo_credits : m.credits;
+  const n = parseFloat(String(raw == null ? '' : raw).replace(/[^\d.]/g, ''));
+  return Number.isFinite(n) ? n : Infinity;
+}
+
+// mdSearchText 参与关键字搜索的字段（ID / 展示名 / 厂商 / 描述 / 标签）。
+function mdSearchText(m) {
+  return [m.id, m.name, m.vendor, m.description, (m.tags || []).join(' ')]
+    .filter(Boolean).join(' ').toLowerCase();
+}
+
+// mdMatch 单个模型是否满足全部筛选条件。
+function mdMatch(m, f) {
+  f = f || mdFilter;
+  if (f.q) {
+    const text = mdSearchText(m);
+    // 空格分词后逐个匹配：多关键词是 AND，便于"cn 视觉"这类组合查询。
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
+    }
+  }
+  if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  if (f.cap === 'tool' && !m.supports_tool_call) return false;
+  if (f.cap === 'vision' && !m.supports_images) return false;
+  if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
+  if (f.cap === 'default' && !m.is_default) return false;
+  if (f.effort === 'off') {
+    if (!m.can_disable_thinking) return false;
+  } else if (f.effort && !(m.supported_efforts || []).includes(f.effort)) {
+    return false;
+  }
+  const factor = m.promo_factor == null ? null : Number(m.promo_factor);
+  if (f.promo === 'promo' && factor == null && !m.promo_label) return false;
+  if (f.promo === 'free' && !(m.free || factor === 0)) return false;
+  if (f.promo === 'discount' && !(factor != null && factor > 0 && factor < 1)) return false;
+  return true;
+}
+
+// mdSortList 按当前排序条件返回新数组（不改动入参，保持上游原始顺序可回溯）。
+function mdSortList(list, f) {
+  f = f || mdFilter;
+  const out = list.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  if (f.sort === 'rate') out.sort((a, b) => mdRateValue(a) - mdRateValue(b));
+  else if (f.sort === 'context') out.sort((a, b) => num(b.context_length) - num(a.context_length));
+  else if (f.sort === 'output') out.sort((a, b) => num(b.max_output_tokens) - num(a.max_output_tokens));
+  else if (f.sort === 'name') out.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+  return out;
+}
+
+
 
 const REALM_LABEL = { cn: '国内版', global: '国际版' };
 
@@ -914,16 +968,17 @@ function renderModelRealms(d) {
     (realms.length > 1 ? '' : '（池内只有这一个域）');
 }
 
-async function loadModels() {
+async function loadModels(cached = false) {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
     const q = mdRealm ? '?realm=' + mdRealm : '';
-    const [d, pr] = await Promise.all([api('models' + q), api('model_probes').catch(() => ({}))]);
+    const [d, pr] = cached === true && mdCache ? mdCache : await Promise.all([api('models' + q), api('model_probes').catch(() => ({}))]);
+    mdCache = [d, pr];
     mdRealm = d.realm || mdRealm || 'global'; // 后端回显为准（缺省域由池内可用域决定）
     renderModelRealms(d);
-    const list = d.models || [];
+    const list = mdSortList((d.models || []).filter(m => mdMatch(m)));
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
     const probeKeys = Object.keys(probes);
@@ -978,7 +1033,10 @@ async function loadModels() {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
-$('btnModels').onclick = loadModels;
+$('btnModels').onclick = () => loadModels();
+for (const [id, key] of [['mdSearch','q'], ['mdCap','cap'], ['mdEffort','effort'], ['mdPromo','promo'], ['mdSort','sort']]) {
+  $(id).addEventListener(id === 'mdSearch' ? 'input' : 'change', () => { mdFilter[key] = $(id).value; if (mdCache) loadModels(true); });
+}
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
@@ -996,9 +1054,9 @@ async function loadLogs() {
     const [d, metrics, requestRows] = await Promise.all([
       api('logs'),
       api('request_metrics').catch(() => ({})),
-      api('request_logs?limit=100').catch(() => ({ entries: [] })),
+      api('request_logs?limit=1000&' + rangeQuery('req', false) + '&outcome=' + encodeURIComponent($('reqOutcome').value)).catch(() => ({ entries: [] })),
     ]);
-    const recent = (requestRows.entries && requestRows.entries.length) ? requestRows.entries : (metrics.recent || []);
+    const recent = metrics.archive && metrics.archive.enabled ? (requestRows.entries || []) : (metrics.recent || []).filter(e => requestInRange(e));
     renderRequestMetrics(metrics, recent);
     const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
@@ -1034,23 +1092,27 @@ function renderRequestMetrics(m, entries) {
     : '仅内存指标，JSONL 归档已关闭';
 
   const outcomeLabel = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' };
-  $('reqBody').innerHTML = (entries || []).map(e => {
+  const query = $('reqSearch').value.trim().toLowerCase();
+  const selected = (entries || []).filter(e => (!$('reqOutcome').value || e.outcome === $('reqOutcome').value) && (!query || [e.request_id, e.account, e.uid, e.model, e.client_ip, e.user_agent].join(' ').toLowerCase().includes(query)));
+  $('reqCount').textContent = selected.length + ' 条 · 最多显示最近 1000 条';
+  $('reqBody').innerHTML = selected.map(e => {
     const when = e.time ? new Date(e.time).toLocaleString('zh-CN', { hour12: false }) : '—';
     const token = Number(e.total_tokens || 0) || (Number(e.prompt_tokens || 0) + Number(e.completion_tokens || 0));
-    const credit = e.credit_known ? fmtCredit(e.credit) : '—';
+    const credit = e.credit_known ? Number(e.credit || 0).toFixed(2) : '—';
     return '<tr>' +
       '<td class="mark" aria-hidden="true"></td>' +
       '<td class="num">' + esc(when) + '</td>' +
-      '<td class="num">' + esc(e.request_id || '—') + '</td>' +
+      '<td class="req-id" title="' + esc(e.request_id || '') + '">' + esc(e.request_id || '—') + '</td>' +
       '<td>' + esc(e.account || '—') + '</td>' +
       '<td>' + esc(e.model || '—') + '</td>' +
+      '<td class="req-source" title="' + esc(e.user_agent || '') + '">' + esc(e.client_ip || '—') + '<small>' + esc(e.user_agent || '—') + '</small></td>' +
       '<td class="num">' + esc(e.status || '—') + '</td>' +
       '<td>' + esc(outcomeLabel[e.outcome] || e.outcome || '—') + '</td>' +
       '<td class="num">' + fmtMs(e.duration_ms) + '</td>' +
       '<td class="num">' + fmtTok(token) + '</td>' +
       '<td class="num">' + credit + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="10" class="empty">暂无请求记录</td></tr>';
+  }).join('') || '<tr><td colspan="11" class="empty">所选范围内没有请求记录</td></tr>';
 }
 
 function fmtBytes(bytes) {
@@ -1070,6 +1132,10 @@ $('btnLogPin').onclick = () => {
 // 取值类型约定：checkbox → bool；type=number → number；其余 → string。
 // _hours 后缀的输入按逗号/空白拆成 int 数组（见 collectConfig）。
 const CFG_MAP = {
+  request_client_info: ['logging', 'request_client_info'],
+  request_archive_enabled: ['logging', 'request_archive_enabled'],
+  request_retention_days: ['logging', 'request_retention_days'],
+  request_archive_max_mb: ['logging', 'request_archive_max_mb'],
   listen: ['listen'], api_key: ['api_key'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
@@ -2228,7 +2294,7 @@ function renderUsage(d) {
 
   // 「窗口：近 N 天」用后端回报的**实际生效**值（d.hours，非法入参已回退），不是
   // 下拉框的 value——两者不一致时必须显示后者，用户才能确认窗口真的生效了。
-  const win = usWindowText(d.hours);
+  const win = d.all_history ? '全部历史' : (d.window_from || d.window_to) ? [d.window_from ? new Date(d.window_from).toLocaleString() : '起点不限', d.window_to ? new Date(d.window_to).toLocaleString() : '至今'].join(' — ') : usWindowText(d.hours);
   $('usNote').textContent = (win ? '窗口：' + win + ' · ' : '') +
     (d.buckets || 0) + ' 个分桶 · ' +
     (d.since ? '自 ' + d.since.slice(0, 10) : '无数据') +
@@ -2430,7 +2496,7 @@ function fmtTokTip(v) { return fmtTok(v); }
 async function loadUsage() {
   const hours = ($('usWindow') && $('usWindow').value) || 72;
   try {
-    const d = await api('usage?hours=' + encodeURIComponent(hours));
+    const d = await api('usage?' + rangeQuery('us', true));
     renderUsage(d);
   } catch (e) {
     $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
@@ -2438,7 +2504,11 @@ async function loadUsage() {
 }
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
-if ($('usWindow')) $('usWindow').onchange = loadUsage;
+bindRange('us', loadUsage);
+bindRange('req', loadLogs);
+$('reqOutcome').onchange = loadLogs;
+let reqSearchTimer;
+$('reqSearch').oninput = () => { clearTimeout(reqSearchTimer); reqSearchTimer = setTimeout(loadLogs, 200); };
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」
@@ -2745,3 +2815,41 @@ async function loadExpiry(force) {
 }
 
 if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
+
+// Browser-local dates keep "today" aligned with the user's timezone.
+function rangeQuery(prefix, rolling) {
+  const value = $(prefix + 'Window').value;
+  const q = new URLSearchParams();
+  if (value === 'today') {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    q.set('from', Math.floor(start.getTime() / 1000));
+    q.set('to', Math.floor(Date.now() / 1000));
+  } else if (value === 'custom') {
+    for (const side of ['From', 'To']) {
+      const time = new Date($(prefix + side).value).getTime();
+      if (Number.isFinite(time)) q.set(side.toLowerCase(), Math.floor(time / 1000));
+    }
+    if (!q.size) q.set('hours', '72');
+  } else if (rolling || value === '0') {
+    q.set('hours', value); // Explicit zero means all history.
+  } else {
+    q.set('from', Math.floor(Date.now() / 1000) - Number(value) * 3600);
+  }
+  return q.toString();
+}
+function requestInRange(e) {
+  const q = new URLSearchParams(rangeQuery('req', false));
+  const t = new Date(e.time).getTime() / 1000;
+  return (!q.has('from') || t >= Number(q.get('from'))) && (!q.has('to') || t <= Number(q.get('to')));
+}
+function bindRange(prefix, load) {
+  $(prefix + 'Window').onchange = () => {
+    $(prefix + 'Dates').hidden = $(prefix + 'Window').value !== 'custom';
+    load();
+  };
+  $(prefix + 'Apply').onclick = () => {
+    const from = $(prefix + 'From').value, to = $(prefix + 'To').value;
+    if (from && to && from > to) { toast('开始时间不能晚于结束时间', 'err'); return; }
+    load();
+  };
+}

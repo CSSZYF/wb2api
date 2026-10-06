@@ -73,7 +73,7 @@ func TestFetchGlobalModelInfosParsesMetadata(t *testing.T) {
 		}
 		return 200, `{"code":0,"data":{"models":[
 			{"id":"gpt-5.4","name":"GPT 5.4","maxInputTokens":262144,"maxOutputTokens":65536,
-			 "maxAllowedSize":262144,"credits":"x1.00","supportsReasoning":true,"supportsImages":true,
+			 "maxAllowedSize":262144,"credits":"x1.00","supportsReasoning":true,"supportsImages":true,"supportsToolCall":true,"vendor":"OpenAI","descriptionZh":"test model","isDefault":true,
 			 "reasoning":{"defaultEffort":"high","canDisableThinking":true,"supportedEfforts":["low","high"]}},
 			{"id":"old-key-model","maxInputTokens":128000,"reasoning":{"effort":"medium"}},
 			{"name":"name-fallback","maxInputTokens":64000},
@@ -99,6 +99,9 @@ func TestFetchGlobalModelInfosParsesMetadata(t *testing.T) {
 	if !m.SupportsReasoning || !m.CanDisableThinking || !m.SupportsImages {
 		t.Errorf("gpt-5.4 能力旗标 reasoning=%v canDisable=%v images=%v want all true",
 			m.SupportsReasoning, m.CanDisableThinking, m.SupportsImages)
+	}
+	if !m.SupportsToolCall || !m.IsDefault || m.Vendor != "OpenAI" || m.Description != "test model" {
+		t.Fatalf("model filters lost metadata: %+v", m)
 	}
 	if m.DefaultEffort != "high" {
 		t.Errorf("gpt-5.4 DefaultEffort=%q want high", m.DefaultEffort)

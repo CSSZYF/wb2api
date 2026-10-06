@@ -688,8 +688,12 @@ type dynModelEntry struct {
 	Disabled        bool   `json:"disabled"`
 	Credits         string `json:"credits"`
 	// SupportsReasoning / SupportsImages 是能力旗标。
-	SupportsReasoning bool `json:"supportsReasoning"`
-	SupportsImages    bool `json:"supportsImages"`
+	SupportsReasoning bool   `json:"supportsReasoning"`
+	SupportsImages    bool   `json:"supportsImages"`
+	SupportsToolCall  bool   `json:"supportsToolCall"`
+	IsDefault         bool   `json:"isDefault"`
+	Vendor            string `json:"vendor"`
+	Description       string `json:"descriptionZh"`
 	// Tags 供 nonChatModel 判定（image-to-image 等非对话模型的唯一识别依据，
 	// 实测 CN 下发 hunyuan-image-alpha-edit 带该 tag）。
 	Tags      []string `json:"tags"`
@@ -774,6 +778,10 @@ func parseGlobalModelEntries(entries []dynModelEntry) []ModelInfo {
 			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			SupportsReasoning:  m.SupportsReasoning,
 			SupportsImages:     m.SupportsImages,
+			SupportsToolCall:   m.SupportsToolCall,
+			IsDefault:          m.IsDefault,
+			Vendor:             m.Vendor,
+			Description:        m.Description,
 			Tags:               m.Tags,
 			// Credits 在此解析（归一 "x0.79 credits" 形态），但只作旁表来源：
 			// 调用方落缓存时经 detachCredits 摘进旁表并从返回条目抹掉
@@ -832,6 +840,10 @@ func parseGlobalModelLoose(obj map[string]any) (ModelInfo, bool) {
 	}
 	mi.SupportsReasoning, _ = obj["supportsReasoning"].(bool)
 	mi.SupportsImages, _ = obj["supportsImages"].(bool)
+	mi.SupportsToolCall, _ = obj["supportsToolCall"].(bool)
+	mi.IsDefault, _ = obj["isDefault"].(bool)
+	mi.Vendor, _ = obj["vendor"].(string)
+	mi.Description, _ = obj["descriptionZh"].(string)
 	// tags 照常解析：nonChatModel 靠它识别 image-to-image 类非对话模型
 	// （该兜底路径此前完全不带 tags，等于把这类模型放行）。
 	if arr, ok := obj["tags"].([]any); ok {

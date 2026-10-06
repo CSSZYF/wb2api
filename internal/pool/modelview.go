@@ -48,9 +48,9 @@ type ModelLockRow struct {
 // 本视图把 (域, 模型) 维度聚合成一张清单补齐这一点。
 //
 // 口径与选号/ModelBlocked 严格一致，三处易错点：
-//   - 只看**参与选号**的账号：disabled / paused 号跳过——它们的不可用与模型无关，
+//   - 只看**参与选号**的账号：disabled / manualDisabled 号跳过——它们的不可用与模型无关，
 //     计进来会把「模型被锁」和「号被停了」混为一谈；
-//   - 只看**真正拦路由**的冷却：AuditOnly 台账（无重置时间的 6004）不改变选号，
+//   - 只看**真正拦路由**的冷却：无有效截止的台账（无重置时间的 6004）不改变选号，
 //     既不产生行也不计入 Locked；
 //   - 已过期的冷却不算锁。
 //
@@ -112,11 +112,12 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			FullyUnlockAt: a.fullyAt,
 			Reason:        a.reason,
 		}
+		gate := p.reserveGateFor(model, false)
 		for _, e := range p.byUID {
 			if e.a.Realm() != realm {
 				continue
 			}
-			if e.healthyForModel(now, model) && !p.inFlightFull(e) {
+			if e.healthyForModel(now, model) && !p.inFlightFull(e) && (!gate.active || gate.free || e.creditsTotal <= 0 || e.credits > gate.line) {
 				row.Servable++
 			}
 		}

@@ -227,10 +227,9 @@ func TestChatHintMessageUnchangedAnchor(t *testing.T) {
 			name:     "11102 模型不可用 末端出口",
 			status:   400,
 			body:     `{"code":11102,"msg":"model [glm-4.6v] service info not found"}`,
-			wantCode: "no_healthy_account",
-			wantMsg: "all accounts unavailable (cooling/disabled): upstream model_blocked (http 400): " +
-				`{"code":11102,"msg":"model [glm-4.6v] service info not found"}`,
-			wantHint: "upstream has no such model on this backend; switch model or retry on another account",
+			wantCode: "model_unavailable",
+			wantMsg:  `{"code":11102,"msg":"model [glm-4.6v] service info not found"}`,
+			wantHint: "model_blocked:",
 		},
 		{
 			// 无重置墙钟的 6004 → applyErrorPolicy 走**账号级** CooldownSoftRate
@@ -291,7 +290,7 @@ func TestChatHintMessageUnchangedAnchor(t *testing.T) {
 			if e.Error.Message != c.wantMsg {
 				t.Errorf("message changed!\n got: %q\nwant: %q", e.Error.Message, c.wantMsg)
 			}
-			if e.Error.GatewayHint == nil || *e.Error.GatewayHint != c.wantHint {
+			if e.Error.GatewayHint == nil || (c.wantCode == "model_unavailable" && !strings.HasPrefix(*e.Error.GatewayHint, c.wantHint)) || (c.wantCode != "model_unavailable" && *e.Error.GatewayHint != c.wantHint) {
 				t.Errorf("gateway_hint=%v want %q", e.Error.GatewayHint, c.wantHint)
 			}
 		})

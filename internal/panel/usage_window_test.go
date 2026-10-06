@@ -111,7 +111,7 @@ func TestPanelUsageInvalidHoursReportsEffectiveWindow(t *testing.T) {
 		t.Fatalf("缺省窗口 prompt=%v want 30（用例前提不成立）", basePT)
 	}
 	for _, q := range []string{
-		"", "?hours=72", "?hours=abc", "?hours=", "?hours=0", "?hours=-5",
+		"", "?hours=72", "?hours=abc", "?hours=", "?hours=-5",
 		"?hours=999999999", "?hours=1.5", "?hours=+72x",
 	} {
 		body := getUsage(t, p, q)

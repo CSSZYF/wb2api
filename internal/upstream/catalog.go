@@ -184,6 +184,18 @@ func overrideCapabilities(dst *ModelInfo, src ModelInfo) {
 	if src.SupportsReasoning {
 		dst.SupportsReasoning = true
 	}
+	if src.Description != "" {
+		dst.Description = src.Description
+	}
+	if src.Vendor != "" {
+		dst.Vendor = src.Vendor
+	}
+	if src.IsDefault {
+		dst.IsDefault = src.IsDefault
+	}
+	if src.SupportsToolCall {
+		dst.SupportsToolCall = src.SupportsToolCall
+	}
 	if src.SupportsImages {
 		dst.SupportsImages = true
 	}
@@ -221,6 +233,18 @@ func fillCapabilities(dst *ModelInfo, src ModelInfo) {
 	}
 	if !dst.SupportsReasoning {
 		dst.SupportsReasoning = src.SupportsReasoning
+	}
+	if dst.Description == "" {
+		dst.Description = src.Description
+	}
+	if dst.Vendor == "" {
+		dst.Vendor = src.Vendor
+	}
+	if !dst.IsDefault {
+		dst.IsDefault = src.IsDefault
+	}
+	if !dst.SupportsToolCall {
+		dst.SupportsToolCall = src.SupportsToolCall
 	}
 	if !dst.SupportsImages {
 		dst.SupportsImages = src.SupportsImages

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1786,5 +1787,58 @@ process.stdout.write(JSON.stringify([
 	const want = `[true,"",true,"",false,false,"secret"]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+func TestConfigFormMatchesCFGMap(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	htmlBytes, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+
+	// CFG_MAP 块（下面两条检查共用）。
+	mapBlock := js[strings.Index(js, "const CFG_MAP = {"):]
+	mapBlock = mapBlock[:strings.Index(mapBlock, "\n};")]
+	// 不能按行首匹配：CFG_MAP 里多个键写在同一行（`a: [...], b: [...]`），只有行首
+	// 那个带换行缩进。按「前面是行首或分隔符」判定才不漏。
+	inMap := func(name string) bool {
+		return regexp.MustCompile(`(?:^|[\s,{])` + regexp.QuoteMeta(name) + `:\s*\[`).MatchString(mapBlock)
+	}
+
+	// 1) 表单里的每个 name 都要有 CFG_MAP 条目（否则收集/回填都拿不到它）。
+	form := html[strings.Index(html, `<form id="cfgForm">`):]
+	form = form[:strings.Index(form, "</form>")]
+	names := map[string]bool{}
+	for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatch(form, -1) {
+		names[m[1]] = true
+	}
+	if len(names) == 0 {
+		t.Fatal("未从配置表单解析出任何 name 字段")
+	}
+	for n := range names {
+		if !inMap(n) {
+			t.Errorf("表单字段 %q 在 CFG_MAP 里没有条目（保存时会被静默丢弃）", n)
+		}
+	}
+
+	// 2) CFG_MAP 里的每个键都要在表单里有控件（否则回填/保存是空转）。
+	for _, m := range regexp.MustCompile(`(?:^|[\s,{])([a-z_0-9]+):\s*\[`).FindAllStringSubmatch(mapBlock, -1) {
+		if !names[m[1]] {
+			t.Errorf("CFG_MAP 键 %q 在配置表单里没有对应控件", m[1])
+		}
+	}
+
+	// 3) 明确断言这一个键：后端有配置项、README 说面板可改，UI 不能少。
+	if !strings.Contains(js, "request_client_info: ['logging', 'request_client_info']") {
+		t.Error("CFG_MAP 缺 request_client_info 条目")
+	}
+	if !names["request_client_info"] {
+		t.Error("配置表单缺「记录调用来源」开关（logging.request_client_info）")
 	}
 }

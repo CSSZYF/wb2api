@@ -309,14 +309,24 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 	if limit > 1000 {
 		limit = 1000
 	}
+	q := r.URL.Query()
 	rows, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{
-		Outcome: r.URL.Query().Get("outcome"),
-		Account: r.URL.Query().Get("account"),
-		Model:   r.URL.Query().Get("model"),
+		Outcome:   q.Get("outcome"),
+		Account:   q.Get("account"),
+		Model:     q.Get("model"),
+		ClientIP:  q.Get("client_ip"),
+		UserAgent: q.Get("user_agent"),
+		From:      parseTimeParam(q.Get("from")),
+		To:        parseTimeParam(q.Get("to")),
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// 空结果回 []（而不是 JSON null）：前端把 null 与"归档关闭"混在一起会走错分支，
+	// 显示成不满足筛选条件的最近请求。
+	if rows == nil {
+		rows = []reqlog.Event{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
 }
@@ -382,6 +392,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			"can_disable_thinking": mi.CanDisableThinking,
 			"supports_reasoning":   mi.SupportsReasoning,
 			"supports_images":      mi.SupportsImages,
+			"supports_tool_call":   mi.SupportsToolCall,
+			"is_default":           mi.IsDefault,
+			"description":          mi.Description,
+			"vendor":               mi.Vendor,
+			"tags":                 mi.Tags,
 			"credits":              mi.Credits,
 			// prefixed_id：带 realm 前缀的完整模型名（后端路由协议 "cn:"/"global:"，
 			// 见 server.splitRealmPrefix）——用户手动加模型只走一个域就靠它（复制用）。
@@ -976,7 +991,7 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
 		return
 	}
-	hours := 0 // 0 = 未指定，由 Snapshot 取缺省窗口
+	hours := 72 // 缺省近三天；显式 hours=0 为全部历史
 	if v := r.URL.Query().Get("hours"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			hours = n
@@ -989,7 +1004,7 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 			nicks[s.UID] = s.Nickname
 		}
 	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.Snapshot(hours, nicks))
+	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindow(usage.Window{Hours: hours, From: parseTimeParam(r.URL.Query().Get("from")), To: parseTimeParam(r.URL.Query().Get("to"))}, nicks))
 }
 
 // usageSave 立即把内存中的用量桶落盘（正常由后台 30s 防抖刷新负责）。
@@ -1063,4 +1078,28 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+func parseTimeParam(v string) time.Time {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return time.Time{}
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n <= 0 {
+			return time.Time{}
+		}
+		// 兼容秒与毫秒（前端可能直接把 Date.now() 传上来）。
+		if n > 1e12 {
+			return time.UnixMilli(n)
+		}
+		return time.Unix(n, 0)
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15:04", v, time.Local); err == nil {
+		return t
+	}
+	return time.Time{}
 }

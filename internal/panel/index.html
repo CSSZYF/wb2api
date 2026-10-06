@@ -494,6 +494,96 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .exp-main .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
   .exp-main.err { color: var(--bad); }
 
+
+/* Layout refinement: retain the navigation, palette and all existing views. */
+.shell { grid-template-columns: 204px minmax(0, 1fr); }
+.view { max-width: 1600px; margin-inline: auto; padding: 28px 28px 64px; }
+.topbar { padding: 16px 28px; min-height: 68px; }
+.nav a { padding: 11px 13px; margin-bottom: 4px; }
+.brand { padding: 24px 20px; }
+.brand .name { letter-spacing: -.3px; }
+.box { border-radius: 12px; margin-bottom: 24px; }
+.box > header { flex-wrap: wrap; padding: 17px 20px; gap: 10px 14px; }
+.box > header h3 { min-width: 0; font-size: 14px; flex: 0 1 auto; }
+.box > header h3 .hint { display: block; margin: 5px 0 0; max-width: 65ch; line-height: 1.65; }
+.box > header .note { white-space: normal; overflow-wrap: anywhere; font-size: 12px; }
+.box > header .grow { min-width: 0; }
+.box .pad { padding: 20px; }
+.stats { gap: 12px; border: 0; border-radius: 0; box-shadow: none; background: transparent; overflow: visible; }
+.stat { min-width: 0; padding: 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.stat .v { font-size: clamp(20px, 2vw, 28px); letter-spacing: -.04em; }
+.stat .k { color: var(--ink-2); margin-top: 8px; }
+.stat.good { border-top-color: var(--ok); } .stat.warn { border-top-color: var(--warn); } .stat.bad { border-top-color: var(--bad); }
+#sCredits { font-size: clamp(16px, 1.4vw, 24px); white-space: normal; overflow-wrap: anywhere; }
+.box > .stats { padding: 18px 20px 0; margin-bottom: 0; }
+#usStats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+#usStats .stat:nth-child(2) { grid-column: span 2; }
+.acc th { padding: 12px 14px; background: var(--surface-2); }
+.acc td { padding: 14px; }
+.acc tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface-2) 35%, transparent); }
+.acc tbody tr:hover { background: var(--surface-2); }
+.tbl-wrap { overscroll-behavior-inline: contain; scrollbar-width: thin; }
+.chips { flex-wrap: wrap; gap: 6px; }
+.chips .chip { padding: 5px 12px; }
+.filterbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 16px 20px; border-bottom: 1px solid var(--line-soft); }
+.filterbar input[type=search] { flex: 1 1 240px; width: auto; min-width: 180px; }
+.filterbar select { width: auto; max-width: 100%; min-height: 36px; }
+.filterbar .muted, .muted { color: var(--ink-3); font-size: 12px; }
+.date-range label { color: var(--ink-2); font-size: 12px; display: flex; align-items: center; gap: 8px; }
+.date-range input { width: auto; }
+.req-id { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); }
+.req-source { min-width: 160px; max-width: 220px; font: 12px var(--mono); }
+.req-source small { display: block; max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); margin-top: 5px; }
+.md-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; border-bottom: 1px solid var(--line-soft); }
+.md-bar .note { color: var(--ink-3); font-size: 12px; }
+#mdNote { flex: 1 1 100%; order: 5; }
+.exp-row { display: grid; grid-template-columns: 9px minmax(110px, 160px) 1fr; gap: 12px; padding: 13px 0; }
+.exp-nm { min-width: 0; overflow-wrap: anywhere; }
+.exp-main { line-height: 1.8; }
+.grid2, .grid3 { gap: 18px; }
+.switch { gap: 12px; flex-wrap: wrap; }
+.switch .hint { flex: 1 1 230px; line-height: 1.65; }
+.savebar { padding: 14px 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); gap: 12px; }
+#logBox { padding: 18px 20px; line-height: 1.8; }
+@media (max-width: 1200px) {
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .view { padding: 20px; }
+  .grid3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .nav { display: block; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand { padding: 14px 16px 8px; border: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .nav ul { overflow-x: auto; padding: 4px 8px 10px; flex-wrap: nowrap; }
+  .nav li { flex: none; }
+  .nav a { white-space: nowrap; margin: 0; padding: 9px 11px; }
+  .nav .sig { display: none; }
+  .topbar { position: static; padding: 12px 16px; flex-wrap: wrap; gap: 10px; }
+  .view { padding: 16px 12px 40px; }
+  .box { margin-bottom: 16px; }
+  .box > header, .box .pad, .filterbar { padding: 14px; }
+  .box > header h3 { flex-basis: 100%; }
+  .box > header .grow { display: none; }
+  .box > header .note { flex: 1 1 150px; }
+  .stats, #usStats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  #usStats .stat:nth-child(2) { grid-column: auto; }
+  #usStats .stat:last-child { grid-column: span 2; }
+  .stat { padding: 14px; }
+  .stat .v { font-size: 23px; }
+  .grid2, .grid3 { grid-template-columns: minmax(0, 1fr); }
+  .exp-row { grid-template-columns: 9px 1fr; }
+  .exp-main { grid-column: 2; }
+  .filterbar input[type=search] { flex-basis: 100%; }
+  .filterbar select { flex: 1 1 120px; min-width: 0; }
+  .date-range label { width: 100%; }
+  .date-range input { flex: 1; min-width: 0; }
+  .savebar { flex-wrap: wrap; }
+  .srow, .shead { min-width: 680px; }
+  #schoolList { overflow-x: auto; }
+  .qrow { grid-template-columns: 90px minmax(130px, 1fr) 45px 65px; gap: 8px; }
+  .qrow .msg { grid-column: 2 / -1; }
+}
+
 </style>
 </head>
 <body>
@@ -667,6 +757,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="chips" id="mdRealms"></span>
           <span class="note" id="mdRealmCur">—</span>
         </div>
+        <div class="filterbar model-filters">
+          <input id="mdSearch" type="search" aria-label="搜索模型" placeholder="搜索模型名、厂商或关键词">
+          <select id="mdCap" aria-label="模型能力"><option value="">全部能力</option><option value="tool">工具调用</option><option value="vision">图片理解</option><option value="reasoning">推理</option><option value="default">默认模型</option></select>
+          <select id="mdEffort" aria-label="思考档位"><option value="">全部档位</option><option value="off">可关闭思考</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select>
+          <select id="mdPromo" aria-label="模型价格"><option value="">全部价格</option><option value="free">免费</option><option value="discount">折扣</option><option value="promo">优惠中</option></select>
+          <select id="mdSort" aria-label="模型排序"><option value="default">默认顺序</option><option value="rate">倍率从低到高</option><option value="context">上下文从大到小</option><option value="output">输出从大到小</option><option value="name">模型名称</option></select>
+        </div>
         <div class="tbl-wrap">
         <table class="acc md">
           <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
@@ -701,15 +798,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>用量总览</h3>
           <span class="grow"></span>
           <span class="note" id="usNote">—</span>
-          <select id="usWindow" class="xs">
-            <option value="24">近 24 小时</option>
-            <option value="72" selected>近 3 天</option>
-            <option value="168">近 7 天</option>
-            <option value="720">近 30 天</option>
-          </select>
+          <select id="usWindow" class="xs" aria-label="用量时间范围"><option value="today">今天</option><option value="24">近 24 小时</option><option value="72" selected>近 3 天</option><option value="168">近 7 天</option><option value="720">近 30 天</option><option value="0">全部历史</option><option value="custom">自定义区间</option></select>
           <button class="xs" id="btnUsage">刷新</button>
         </header>
-        <div class="stats" id="usStats"></div>
+        <div class="filterbar date-range" id="usDates" hidden><label>开始<input id="usFrom" type="datetime-local"></label><label>结束<input id="usTo" type="datetime-local"></label><button class="xs" id="usApply" type="button">应用区间</button><span class="muted">用量按时间桶汇总，请求记录按事件时间筛选</span></div><div class="stats" id="usStats"></div>
         <div class="pad">
           <div class="uschart">
             <div class="uschart-hd">
@@ -1046,6 +1138,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
         </div>
 
+
+        <div class="box"><header><h3>请求日志</h3><span class="note">保留定位断流所需的请求元数据</span></header><div class="pad">
+          <label class="switch"><span class="lb">记录调用来源</span><input type="checkbox" name="request_client_info"><span class="hint">记录客户端 IP / User-Agent，保存后即时生效</span></label>
+          <label class="switch"><span class="lb">启用请求归档</span><input type="checkbox" name="request_archive_enabled"><span class="hint">JSONL 元数据，不记录正文或 API Key；需重启</span></label>
+          <div class="grid2"><label class="fld"><span class="lb">归档保留天数</span><input type="number" name="request_retention_days" min="1"><span class="hint">默认 7 天；需重启</span></label><label class="fld"><span class="lb">归档容量上限（MB）</span><input type="number" name="request_archive_max_mb" min="1"><span class="hint">默认 100 MB；需重启</span></label></div>
+        </div></div>
         <div class="savebar">
           <span class="grow"></span>
           <span class="restart-note" id="cfgNote"></span>
@@ -1063,11 +1161,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="reqNote">—</span>
         </header>
-        <div class="stats" id="reqStats"></div>
+        <div class="stats" id="reqStats"></div><div class="filterbar"><input id="reqSearch" type="search" aria-label="搜索请求记录" placeholder="搜索模型、账号、请求 ID、IP 或客户端"><select id="reqOutcome" aria-label="请求结果"><option value="">全部结果</option><option value="success">成功</option><option value="http_error">HTTP 错误</option><option value="stream_error">流错误</option><option value="interrupted">客户端中断</option></select><select id="reqWindow" aria-label="请求时间范围"><option value="today">今天</option><option value="24">近 24 小时</option><option value="72" selected>近 3 天</option><option value="168">近 7 天</option><option value="720">近 30 天</option><option value="0">全部历史</option><option value="custom">自定义区间</option></select><span class="muted" id="reqCount"></span></div><div class="filterbar date-range" id="reqDates" hidden><label>开始<input id="reqFrom" type="datetime-local"></label><label>结束<input id="reqTo" type="datetime-local"></label><button class="xs" id="reqApply" type="button">应用区间</button><span class="muted">用量按时间桶汇总，请求记录按事件时间筛选</span></div>
         <div class="tbl-wrap">
           <table class="acc">
             <thead><tr>
-              <th class="mark" aria-hidden="true"></th><th>时间</th><th>请求 ID</th><th>账号</th><th>模型</th>
+              <th class="mark" aria-hidden="true"></th><th>时间</th><th>请求 ID</th><th>账号</th><th>模型</th><th>来源 / 客户端</th>
               <th class="num">状态</th><th>结果</th><th class="num">耗时</th>
               <th class="num">Token</th><th class="num">积分</th>
             </tr></thead>

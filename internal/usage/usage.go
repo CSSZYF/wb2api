@@ -543,15 +543,18 @@ const (
 
 // Snapshot 面板一次拉取的全部用量视图数据。
 type Snapshot struct {
-	Totals    Agg        `json:"totals"`
-	ByRealm   []KeyedAgg `json:"by_realm"`
-	ByAccount []KeyedAgg `json:"by_account"`
-	ByModel   []KeyedAgg `json:"by_model"`
-	Series    []Point    `json:"series"`
-	Buckets   int        `json:"buckets"`
-	FileBytes int64      `json:"file_bytes"`
-	Since     string     `json:"since,omitempty"`
-	Generated string     `json:"generated"`
+	WindowFrom string     `json:"window_from,omitempty"`
+	WindowTo   string     `json:"window_to,omitempty"`
+	AllHistory bool       `json:"all_history,omitempty"`
+	Totals     Agg        `json:"totals"`
+	ByRealm    []KeyedAgg `json:"by_realm"`
+	ByAccount  []KeyedAgg `json:"by_account"`
+	ByModel    []KeyedAgg `json:"by_model"`
+	Series     []Point    `json:"series"`
+	Buckets    int        `json:"buckets"`
+	FileBytes  int64      `json:"file_bytes"`
+	Since      string     `json:"since,omitempty"`
+	Generated  string     `json:"generated"`
 
 	// Hours 是**实际生效**的窗口（小时）。入参非法（<=0 / 超上限）时回退
 	// defaultWindowHours，这里如实回报——前端据此显示「窗口：近 N 天」，让用户
@@ -591,7 +594,26 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	if hours <= 0 || hours > maxWindowHours {
 		hours = defaultWindowHours
 	}
+	return r.SnapshotWindow(Window{Hours: hours}, nicks)
+}
+
+// Window selects rolling hours, an explicit interval, or all retained history.
+type Window struct {
+	Hours    int
+	From, To time.Time
+}
+
+func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string) Snapshot {
+	hours := w.Hours
+	explicit := !w.From.IsZero() || !w.To.IsZero()
+	all := !explicit && hours == 0
+	if !explicit && !all && (hours < 0 || hours > maxWindowHours) {
+		hours = defaultWindowHours
+	}
 	gran := granularityFor(hours)
+	if all || (explicit && (w.From.IsZero() || w.To.IsZero() || w.To.Sub(w.From) > granularityHourMaxHours*time.Hour)) {
+		gran = GranularityDay
+	}
 	if r == nil {
 		return Snapshot{
 			Generated:   time.Now().Format(time.RFC3339),
@@ -619,7 +641,13 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	for i := range bs {
 		b := &bs[i]
 		// 窗口外的桶既不进汇总也不进时序：这正是「切换范围要看到变化」的前提。
-		if !inWindow(b.Scope, cutoff) {
+		if explicit {
+			start, ok := bucketStart(b.Scope)
+			end, _ := bucketEnd(b.Scope)
+			if !ok || (!w.From.IsZero() && !end.After(w.From)) || (!w.To.IsZero() && start.After(w.To)) {
+				continue
+			}
+		} else if !all && !inWindow(b.Scope, cutoff) {
 			continue
 		}
 
@@ -682,6 +710,15 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 		Generated:   time.Now().Format(time.RFC3339),
 		Hours:       hours,
 		Granularity: gran,
+	}
+	snap.AllHistory = all
+	if explicit {
+		if !w.From.IsZero() {
+			snap.WindowFrom = w.From.Format(time.RFC3339)
+		}
+		if !w.To.IsZero() {
+			snap.WindowTo = w.To.Format(time.RFC3339)
+		}
 	}
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]

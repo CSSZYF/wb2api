@@ -42,7 +42,7 @@ import (
 // 之所以用 var 而非 const：const 无法被 -ldflags -X 覆盖，版本号就得手改源码，
 // 于是很容易留下 `+dirty` / `+realmfix` 这类构建期后缀与源码里写死的字符串对不上。
 // 单一来源 = git tag，产物版本号永远可复现、无后缀。
-var appVersion = "v1.9.33"
+var appVersion = "v1.9.34"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -287,6 +287,7 @@ func main() {
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -354,19 +355,20 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Pool:             p,
+		Upstream:         up,
+		APIKey:           cfg.APIKey,
+		Session:          sessRouter,
+		StickyCount:      sessCount,
+		RedisMode:        redisMode,
+		SoftCooldown:     cfg.SoftRateDur,
+		Panel:            pn,
+		Live:             live,
+		Usage:            rec,
+		RequestLog:       requestLog,
+		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		PromptMode:       cfg.Prompt.Mode,
+		PromptText:       cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 对外模型名协议：缺省去域前缀（单域部署不再出现 "global:"/"cn:"）。
@@ -659,6 +661,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
+		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 	})

@@ -1412,6 +1412,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
 type ModelInfo struct {
+	Description        string
+	Vendor             string
+	IsDefault          bool
+	SupportsToolCall   bool
 	ID                 string
 	Name               string
 	ContextWindow      int64    // = maxInputTokens
@@ -1625,6 +1629,10 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 				Credits           string   `json:"credits"`
 				SupportsReasoning bool     `json:"supportsReasoning"`
 				SupportsImages    bool     `json:"supportsImages"`
+				SupportsToolCall  bool     `json:"supportsToolCall"`
+				IsDefault         bool     `json:"isDefault"`
+				Vendor            string   `json:"vendor"`
+				Description       string   `json:"descriptionZh"`
 				Tags              []string `json:"tags"`
 				Reasoning         struct {
 					Effort             string   `json:"effort"`        // 老模型键（auto/hy3/glm-5.2 系）
@@ -1695,6 +1703,10 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			SupportsReasoning:  m.SupportsReasoning,
 			SupportsImages:     m.SupportsImages,
+			SupportsToolCall:   m.SupportsToolCall,
+			IsDefault:          m.IsDefault,
+			Vendor:             m.Vendor,
+			Description:        m.Description,
 			Tags:               m.Tags,
 			Credits:            normalizeCredits(m.Credits),
 		}, m.Disabled}
@@ -1893,6 +1905,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 				Credits           string   `json:"credits"`
 				SupportsReasoning bool     `json:"supportsReasoning"`
 				SupportsImages    bool     `json:"supportsImages"`
+				SupportsToolCall  bool     `json:"supportsToolCall"`
+				IsDefault         bool     `json:"isDefault"`
+				Vendor            string   `json:"vendor"`
+				Description       string   `json:"descriptionZh"`
 				Tags              []string `json:"tags"`
 				Reasoning         struct {
 					Effort             string   `json:"effort"`
@@ -1945,6 +1961,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			SupportsReasoning:  m.SupportsReasoning,
 			SupportsImages:     m.SupportsImages,
+			SupportsToolCall:   m.SupportsToolCall,
+			IsDefault:          m.IsDefault,
+			Vendor:             m.Vendor,
+			Description:        m.Description,
 			Tags:               m.Tags,
 			Credits:            normalizeCredits(m.Credits),
 		}

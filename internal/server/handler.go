@@ -104,7 +104,8 @@ type Config struct {
 	// Default() 会给 true，测试/裸用场景传 nil 即默认开。
 	PTLMaxTokensRetry *bool
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
-	RequestLog *reqlog.Recorder
+	RequestLog       *reqlog.Recorder
+	RecordClientInfo bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -113,8 +114,9 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:       h.cfg.APIKey,
-		SoftCooldown: h.cfg.SoftCooldown,
+		APIKey:           h.cfg.APIKey,
+		SoftCooldown:     h.cfg.SoftCooldown,
+		RecordClientInfo: h.cfg.RecordClientInfo,
 	}
 }
 
@@ -348,6 +350,9 @@ func NewHandler(cfg Config) *Handler {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+		if h.loadLive().RecordClientInfo {
+			trace.captureClientInfo(r)
+		}
 		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
 		obs := &responseObserver{ResponseWriter: w}
 		w.Header().Set("X-Request-Id", trace.id)
@@ -877,6 +882,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st := newChatStat(time.Now(), body, peek.Stream)
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
+		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
+		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
+		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
 	defer st.done()
 
@@ -1713,6 +1721,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				msg = fmt.Sprintf(
 					"all accounts unavailable: every account for this model has credits at or below the reserve line (pool.reserve_credits=%d, %d account(s) blocked) — top up the accounts, lower pool.reserve_credits, or use a free model",
 					line, blocked)
+			}
+		}
+	}
+	// Model-level unavailability must not look like an empty pool. Keep 6004's
+	// existing 429/Retry-After contract; 11102 or mixed model locks return 400.
+	if !wafTerminal && status == http.StatusServiceUnavailable && h.cfg.Pool != nil {
+		scope := realm
+		if !realmExplicit {
+			scope = ""
+		}
+		block := h.cfg.Pool.ModelBlocked(bareModel, scope)
+		if block.Blocked || (ue != nil && ue.Kind == upstream.ErrModelBlocked) {
+			status, code = http.StatusBadRequest, "model_unavailable"
+			msg = "model is unavailable on the eligible accounts; try another model"
+			if ue != nil && strings.TrimSpace(ue.Msg) != "" {
+				msg = ue.Msg
+			}
+			hint = "model_blocked: upstream has no such model on an eligible backend; try another model"
+			if block.Blocked {
+				hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", block.Count)
+				if !block.Until.IsZero() {
+					hint += "; earliest unblock: " + block.Until.Format(time.RFC3339)
+				}
+				if block.Reason != "" {
+					hint += "; " + block.Reason
+				}
 			}
 		}
 	}

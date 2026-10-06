@@ -175,7 +175,7 @@ func TestChat503OnAccountLevelCoolingNot429(t *testing.T) {
 // TestChat503OnModelBlockedNot429 11102「该后端无此模型」负缓存（与 6004 共用
 // modelCooldowns 承载）→ 仍 503：模型不存在不是限流，退避多久都不会变好
 // （TTL 6h 起、封顶 24h），回 429 + Retry-After 会让客户端白等数小时。
-func TestChat503OnModelBlockedNot429(t *testing.T) {
+func TestChat400OnModelBlockedNot429(t *testing.T) {
 	const raw = `{"code":11102,"msg":"model [glm-4.6v] service info not found"}`
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, raw, false
@@ -187,11 +187,11 @@ func TestChat503OnModelBlockedNot429(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-4.6v","messages":[]}`)))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("11102 应 503（不是 429），code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("11102 应 400（不是 429），code=%d body=%s", rec.Code, rec.Body)
 	}
 	if ra := rec.Header().Get("Retry-After"); ra != "" {
-		t.Errorf("503 不得带 Retry-After: %q", ra)
+		t.Errorf("400 不得带 Retry-After: %q", ra)
 	}
 	var e hintEnvelope
 	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
@@ -201,7 +201,7 @@ func TestChat503OnModelBlockedNot429(t *testing.T) {
 	if !strings.HasSuffix(e.Error.Message, raw) {
 		t.Errorf("message must carry verbatim upstream body: %q", e.Error.Message)
 	}
-	if e.Error.GatewayHint == nil || !strings.Contains(*e.Error.GatewayHint, "no such model") {
+	if e.Error.GatewayHint == nil || !strings.Contains(*e.Error.GatewayHint, "model_blocked") {
 		t.Errorf("gateway_hint=%v want model-blocked hint", e.Error.GatewayHint)
 	}
 }

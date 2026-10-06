@@ -83,6 +83,14 @@ type Config struct {
 		RequestRetentionDays int `json:"request_retention_days"`
 		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
 		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+		// RequestClientInfo 是否在请求日志（归档事件 + stdout 流水行 + 面板运行
+		// 日志）里记录调用来源：客户端 IP 与 User-Agent。缺省 true。
+		//
+		// 为什么做成开关而不是恒开：来源信息是排查"谁在打网关"的第一手线索，
+		// 但它比 token 计数敏感（IP 属个人信息），共享部署/多租户场景可能需要
+		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
+		// 热生效（经 livecfg 快照），无需重启。
+		RequestClientInfo bool `json:"request_client_info"`
 	} `json:"logging"`
 
 	Cooldown struct {
@@ -406,6 +414,9 @@ func Default() *Config {
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
+	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
+	// 只有显式 false 才关闭来源记录。
+	c.Logging.RequestClientInfo = true
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}

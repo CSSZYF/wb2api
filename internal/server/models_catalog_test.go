@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -213,9 +214,9 @@ func TestModelListGlobalFallbackToStaticNoMetadata(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "tok"})
 
-	var hits int
+	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		hits.Add(1)
 		http.Error(w, "<html>500 Internal Server Error</html>", http.StatusInternalServerError)
 	}))
 	t.Cleanup(srv.Close)
@@ -253,10 +254,10 @@ func TestModelListGlobalFallbackToStaticNoMetadata(t *testing.T) {
 		t.Error("default-model 是路由别名，默认应被 hidden_models 隐藏")
 	}
 	// 负缓存：第二次调用零上游请求。
-	before := hits
+	before := hits.Load()
 	_ = h.modelList()
-	if hits != before {
-		t.Errorf("负缓存期内不应再打上游：hits %d → %d", before, hits)
+	if hits.Load() != before {
+		t.Errorf("负缓存期内不应再打上游：hits %d → %d", before, hits.Load())
 	}
 }
 
