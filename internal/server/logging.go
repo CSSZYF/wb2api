@@ -557,7 +557,7 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
 		if total > 0 {
-			tokpsField = fmt.Sprintf("%.1f", float64(toks)/total.Seconds())
+			tokpsField = fmt.Sprintf("%.1f", chatTokenRate(int64(toks), total, ttfb))
 		} else {
 			tokpsField = "0.0"
 		}
@@ -593,4 +593,9 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		total.Seconds(),
 		extra,
 	)
+}
+
+func chatTokenRate(tokens int64, total, ttfb time.Duration) float64 {
+	rate, _ := tokensPerSecond(tokens, total, ttfb)
+	return rate
 }

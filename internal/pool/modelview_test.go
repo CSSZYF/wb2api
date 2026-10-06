@@ -29,7 +29,10 @@ func setModelCooldown(p *Pool, uid, model string, until time.Time, reason string
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = map[string]modelCooldown{}
 	}
-	e.modelCooldowns[model] = modelCooldown{Until: until, Reason: reason, AuditOnly: auditOnly}
+	if auditOnly {
+		until = time.Time{}
+	}
+	e.modelCooldowns[model] = modelCooldown{Until: until, Reason: reason}
 	p.mu.Unlock()
 }
 

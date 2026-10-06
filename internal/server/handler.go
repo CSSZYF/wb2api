@@ -988,7 +988,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		delta.LatencyMs = latencyMs
 		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && latencyMs > 0 {
 			delta.HasTokensPerSecond = true
-			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(latencyMs)
+			delta.TokensPerSecond, delta.HasTokensPerSecond = tokensPerSecond(delta.CompletionTokens, time.Duration(latencyMs)*time.Millisecond, obs.TTFB)
 		}
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
 
@@ -1021,7 +1021,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// （分母涨、分子不涨，算出来的 tokens/s 会系统性偏低）。
 			genMs := latencyMs
 			if obs.HasTTFB && obs.TTFB > 0 {
-				if g := latencyMs - obs.TTFB.Milliseconds(); g > 0 {
+				if g := latencyMs - obs.TTFB.Milliseconds(); g >= 200 {
 					genMs = g
 				}
 			}

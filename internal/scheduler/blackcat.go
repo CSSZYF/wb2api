@@ -28,7 +28,7 @@ func (s *Scheduler) runBlackcat(ctx context.Context) {
 		return
 	}
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled || st.ManualDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)

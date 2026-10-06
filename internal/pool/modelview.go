@@ -76,7 +76,7 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 		}
 		routable[realm]++
 		for model, mc := range e.modelCooldowns {
-			if mc.AuditOnly || mc.Until.IsZero() || !now.Before(mc.Until) {
+			if !e.modelCooled(now, model) {
 				continue
 			}
 			key := realm + "\x1f" + model
