@@ -86,6 +86,7 @@ func PrepareBodyOptRealmHistory(src []byte, realm string, sanitize, zeroWidth bo
 	normalizeToolChoice(obj)
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
+	normalizeToolContentParts(obj)
 	normalizeImageURL(obj)
 	// tool 配对四步（见 tool_pairing.go）：唯一化 id → 合并背靠背调用 → 重排 → 清理孤儿。
 	// 所有模型一律执行（独立于 deepseek-only 的 sanitize 开关）。这是「让请求通过」的

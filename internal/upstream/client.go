@@ -447,12 +447,22 @@ func hasBusinessEnvelope(body string) bool {
 	return strings.Contains(body, `"code":`) || strings.Contains(body, `"msg":`)
 }
 
-// IsWafBlocked 报告 403 响应是否为 WAF 拦截形态（WAF 403 修复 P0-1 判定口径）：
-// HTTP 403 且 body 无业务信封（无 `"code":`/`"msg":` JSON 字段——HTML 拦截页、
-// 空体、纯文本均命中）。带业务信封的 403（11140 request illegal / 11128 等）
-// 仍走既有分类链，不受影响。本函数仅作形态判定，不重复关键词逻辑。
+// IsWafBlocked recognizes non-business 403 responses and explicit WAF HTML
+// served with status 503. Other 5xx responses retain server-error semantics.
 func IsWafBlocked(status int, body string) bool {
-	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
+	if hasBusinessEnvelope(body) {
+		return false
+	}
+	if status == http.StatusForbidden {
+		return true
+	}
+	// Tencent also serves its WAF HTML with HTTP 503. Only identify explicit
+	// block pages; ordinary 503 maintenance pages remain server errors.
+	lower := strings.ToLower(body)
+	return status == http.StatusServiceUnavailable &&
+		strings.Contains(lower, "<html") &&
+		(strings.Contains(lower, "<title>waf block page</title>") ||
+			(strings.Contains(lower, "tencent cloud waf") && strings.Contains(lower, "access blocked")))
 }
 
 // retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列（P1-2）：
@@ -631,6 +641,11 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 //     （IsBadParamsBody）同归 ErrBadParams 但**不轮转**（请求级终态）——分野理由
 //     见 IsBadParamsBody 与 handler 的 11101 分支注释。
 func Classify(status int, body string) ErrKind {
+	// Explicit 503 WAF pages must precede the generic 5xx branch. Business
+	// envelopes are excluded by IsWafBlocked and keep their existing priority.
+	if status == http.StatusServiceUnavailable && IsWafBlocked(status, body) {
+		return ErrWafBlock
+	}
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
 	// 但可能被更宽的 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
@@ -805,6 +820,8 @@ type Client struct {
 	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
 	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
 	ChatHTTP *http.Client
+
+	chatFallback chatProtocolFallback
 
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
 	HeaderTimeout time.Duration
@@ -1348,14 +1365,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
+		httpClient := c.chatHTTPFor(req.URL)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			cancel()
 			log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能
 			// 仍留在空闲池里，下一个请求会继续捡到它（仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根）。CloseIdleConnections 只关空闲连接，不影响在途请求。
-			roundTripCloseIdle(c.chatHTTP().Transport)
+			roundTripCloseIdle(httpClient.Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -1386,7 +1404,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+		body := c.observeChatProtocol(resp.Body, reqCtx, req.URL, resp.ProtoMajor)
+		return monitorBody(body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
