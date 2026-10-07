@@ -170,17 +170,32 @@ func TestNoteConsumedCreditsDecrementsExpiring(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetCreditsDetailed("u1", 100, 900, 30)
+	expAt := time.Now().Add(2 * time.Hour)
+	p.SetCreditsExpiringAt("u1", 30, expAt)
 
 	p.NoteConsumedCredits("u1", 10)
 	credits, expiring := p.creditsAndExpiringOf("u1")
 	if credits != 90 || expiring != 20 {
 		t.Fatalf("credits=%d expiring=%d want 90/20", credits, expiring)
 	}
-	// 扣穿：子集钳 0，且不得大于 credits（不变量 expiring ⊆ credits）。
+	p.mu.RLock()
+	keepAt := p.byUID["u1"].creditsExpiringAt
+	p.mu.RUnlock()
+	if !keepAt.Equal(expAt) {
+		t.Fatalf("快过期子集未扣穿时 creditsExpiringAt=%v want %v（部分消耗后仍指向最早到期）", keepAt, expAt)
+	}
+	// 扣穿：子集钳 0，最早到期时刻同步作废（否则 stale 时间会继续制造优先级），
+	// 且不得大于 credits（不变量 expiring ⊆ credits）。
 	p.NoteConsumedCredits("u1", 200)
 	credits, expiring = p.creditsAndExpiringOf("u1")
 	if credits != 0 || expiring != 0 {
 		t.Fatalf("扣穿后 credits=%d expiring=%d want 0/0", credits, expiring)
+	}
+	p.mu.RLock()
+	clearAt := p.byUID["u1"].creditsExpiringAt
+	p.mu.RUnlock()
+	if !clearAt.IsZero() {
+		t.Fatalf("扣穿后 creditsExpiringAt=%v want 零值（expiring=0 时不得保留 stale 时间）", clearAt)
 	}
 }
 

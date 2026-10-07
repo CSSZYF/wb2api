@@ -1058,9 +1058,39 @@ func TestUserResourceDetailedDiagNearestEnd(t *testing.T) {
 	if !diag.NearestEnd.Equal(want) {
 		t.Errorf("diag.NearestEnd=%v want %v（最早的到期时刻）", diag.NearestEnd, want)
 	}
+	if !diag.ExpiringEnd.Equal(want) {
+		t.Errorf("diag.ExpiringEnd=%v want %v（快过期子集的最早到期时刻）", diag.ExpiringEnd, want)
+	}
 	// 最近到期的可读文案：上游墙钟格式（UTC+8），供日志行直接拼用。
 	if got := diag.NearestEndText(); got != in3d {
 		t.Errorf("NearestEndText()=%q want %q", got, in3d)
+	}
+}
+
+// TestUserResourceDetailedDiagExpiringEnd ExpiringEnd 只统计「窗口内且剩余>0」的
+// 套餐：全池最早到期（NearestEnd）可能是零余额包，选号优先级不能拿它当快过期依据。
+func TestUserResourceDetailedDiagExpiringEnd(t *testing.T) {
+	in1d := time.Now().In(softRateResetLoc).Add(24 * time.Hour).Format(packageEndLayout)
+	in3d := time.Now().In(softRateResetLoc).Add(3 * 24 * time.Hour).Format(packageEndLayout)
+	in10d := time.Now().In(softRateResetLoc).Add(10 * 24 * time.Hour).Format(packageEndLayout)
+	c := resourceStub(
+		`{"PackageName":"空包","CycleEndTime":"` + in1d + `","CycleCapacitySize":100,"CycleCapacityRemain":0,"CycleCapacityUsed":100},` +
+			`{"PackageName":"快过期","CycleEndTime":"` + in3d + `","CycleCapacitySize":100,"CycleCapacityRemain":20,"CycleCapacityUsed":80},` +
+			`{"PackageName":"窗口外","CycleEndTime":"` + in10d + `","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}`)
+	_, _, expiring, diag, err := c.UserResourceDetailedDiag(&auth.Auth{AccessToken: "at"}, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("detailed diag: %v", err)
+	}
+	if expiring != 20 {
+		t.Errorf("expiring=%d want 20（零余额/窗口外套餐不计入）", expiring)
+	}
+	wantNear, _ := time.ParseInLocation(packageEndLayout, in1d, softRateResetLoc)
+	wantExp, _ := time.ParseInLocation(packageEndLayout, in3d, softRateResetLoc)
+	if !diag.NearestEnd.Equal(wantNear) {
+		t.Errorf("NearestEnd=%v want %v（全池最早到期，含零余额包）", diag.NearestEnd, wantNear)
+	}
+	if !diag.ExpiringEnd.Equal(wantExp) {
+		t.Errorf("ExpiringEnd=%v want %v（仅快过期子集的最早到期，不受零余额包影响）", diag.ExpiringEnd, wantExp)
 	}
 }
 

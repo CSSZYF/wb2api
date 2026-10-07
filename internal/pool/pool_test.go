@@ -856,6 +856,118 @@ func TestCreditsExpiringPersistClamped(t *testing.T) {
 	}
 }
 
+// TestCreditsExpiringAtPersistRoundTrip 快过期子集的最早到期时刻已持久化：落盘 →
+// 重启 → 恢复。credits_expiring_at 是顺序模式「快过期账号按最近到期优先」的依据；
+// 不持久化会在重启后到下一次余额刷新之间退回普通顺序，丢失优先级。
+func TestCreditsExpiringAtPersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	expAt := time.Now().Add(2 * 24 * time.Hour).UTC().Truncate(time.Second)
+	p.SetCredits("u1", 1000, 2000)
+	p.SetCreditsExpiringAt("u1", 500, expAt)
+	p.Flush()
+	p.Close()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"credits_expiring_at"`) {
+		t.Errorf("state.json missing credits_expiring_at:\n%s", raw)
+	}
+
+	p2 := New(fp)
+	defer p2.Close()
+	p2.Add(&auth.Auth{UID: "u1"})
+	p2.mu.RLock()
+	e := p2.byUID["u1"]
+	gotExp, gotAt := e.creditsExpiring, e.creditsExpiringAt
+	p2.mu.RUnlock()
+	if gotExp != 500 || !gotAt.Equal(expAt) {
+		t.Errorf("恢复后 creditsExpiring=%d creditsExpiringAt=%v want 500/%v", gotExp, gotAt, expAt)
+	}
+}
+
+// TestCreditsExpiringAtOldStateAndZeroClears 旧 state 没有 credits_expiring_at 时保持
+// 零值（不误造优先级）；state 里 credits_expiring<=0 却带时间戳的脏数据在恢复时清零，
+// 且再次落盘不回写该键（防 stale 时间制造虚假「快过期优先」）。
+func TestCreditsExpiringAtOldStateAndZeroClears(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	staleAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	dirty := `{"accounts":{
+		"old":{"credits":100,"credits_expiring":50},
+		"zero":{"credits":100,"credits_expiring":0,"credits_expiring_at":"` + staleAt + `"},
+		"neg":{"credits":100,"credits_expiring":-5,"credits_expiring_at":"` + staleAt + `"}
+	}}`
+	if err := os.WriteFile(fp, []byte(dirty), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	defer p.Close()
+	for _, uid := range []string{"old", "zero", "neg"} {
+		p.Add(&auth.Auth{UID: uid})
+	}
+	check := func(uid string, wantExp int64, wantAtZero bool) {
+		p.mu.RLock()
+		e := p.byUID[uid]
+		exp, at := e.creditsExpiring, e.creditsExpiringAt
+		p.mu.RUnlock()
+		if exp != wantExp || at.IsZero() != wantAtZero {
+			t.Errorf("%s: creditsExpiring=%d at=%v want exp=%d atZero=%v", uid, exp, at, wantExp, wantAtZero)
+		}
+	}
+	check("old", 50, true) // 旧 state：有分桶但无最早到期时刻 → 不参与时间排序
+	check("zero", 0, true) // expiring=0 → 时间戳必须作废
+	check("neg", 0, true)  // expiring<0 → 钳 0，时间戳同样作废
+
+	p.NoteSuccess("zero") // 只负责把 dirty 位置位，验证再次落盘不再带 stale 时间戳
+	p.Flush()
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"credits_expiring_at"`) {
+		t.Errorf("creditsExpiringAt 零值时不应落盘（会把 stale 时间再次带进重启）:\n%s", raw)
+	}
+}
+
+// TestBalanceUpdateClearsExpiringAt 不带套餐诊断的余额更新必须先作废旧
+// creditsExpiringAt（防 stale 排序依据），同时保持 expiring ⊆ credits；
+// 紧随其后的 SetCreditsExpiringAt 会按本轮 ResourceDiag.ExpiringEnd 重建。
+func TestBalanceUpdateClearsExpiringAt(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	at := time.Now().Add(2 * time.Hour)
+	read := func() (int64, time.Time) {
+		p.mu.RLock()
+		defer p.mu.RUnlock()
+		e := p.byUID["u1"]
+		return e.creditsExpiring, e.creditsExpiringAt
+	}
+
+	p.SetCredits("u1", 1000, 2000)
+	p.SetCreditsExpiringAt("u1", 500, at)
+	p.SetCredits("u1", 800, 2000) // 普通余额写：无到期时刻 → 排序依据作废，分桶值仍有效
+	if exp, gotAt := read(); exp != 500 || !gotAt.IsZero() {
+		t.Fatalf("SetCredits 后 exp=%d at=%v want 500/zero", exp, gotAt)
+	}
+
+	p.SetCreditsExpiringAt("u1", 500, at)
+	p.SetCredits("u1", 300, 2000) // 余额下调低于旧分桶：先钳回 credits
+	if exp, gotAt := read(); exp != 300 || !gotAt.IsZero() {
+		t.Fatalf("SetCredits 下调后 exp=%d at=%v want 300/zero", exp, gotAt)
+	}
+
+	p.SetCreditsExpiringAt("u1", 200, at)
+	p.ReenableIfCredits("u1", 150, 2000) // 签到/余额刷新同口径：钳回并作废旧时刻
+	if exp, gotAt := read(); exp != 150 || !gotAt.IsZero() {
+		t.Fatalf("ReenableIfCredits 后 exp=%d at=%v want 150/zero", exp, gotAt)
+	}
+}
+
 // TestSessionDeadFailsPersistRoundTrip 连续 12153 计数已持久化：落盘 → 重启 → 恢复。
 // 修复重启归零重学：上游持续 session dead 时不用再吃 2 次失败才禁用。
 func TestSessionDeadFailsPersistRoundTrip(t *testing.T) {

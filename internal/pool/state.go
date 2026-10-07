@@ -232,6 +232,12 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 			e.credits = remain
 			e.creditsTotal = total
 		}
+		if e.creditsExpiring > e.credits {
+			e.creditsExpiring = e.credits // 新余额可能低于旧分桶：保持 expiring ⊆ credits
+		}
+		// 本入口不带套餐到期时刻：余额更新后旧 creditsExpiringAt 可能已陈旧，
+		// 先清掉排序依据，紧随其后的 SetCreditsExpiringAt 会按本轮诊断重建。
+		e.creditsExpiringAt = time.Time{}
 		p.dirty.Store(true)
 	}
 }

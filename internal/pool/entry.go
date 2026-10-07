@@ -154,15 +154,20 @@ type entry struct {
 	// （weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，窗口外重启会丢快过期
 	// 积分偏好，可能让奖励积分到期作废。恢复时钳到 [0, credits]（防脏数据放大）。
 	creditsExpiring int64
-	successCount    int64      // 累计成功
-	errTotal        int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr         time.Time  // 最近一次错误时间
-	lastSuccess     time.Time  // 最近一次成功时间
-	tokenUsage      TokenUsage // 聊天请求 token 用量摘要（持久化）
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
+	// creditsExpiringAt creditsExpiring 子集中最早的套餐到期时刻（与上游 CycleEndTime
+	// 同源，来自 ResourceDiag.ExpiringEnd）。顺序填充式选号据此把「有快过期积分的
+	// 账号」排到最前并按作废先后排序；零值 = 没有快过期积分或时间未知（旧 state）。
+	// 与 creditsExpiring 同刷新、同持久化（stateAccount.CreditsExpiringAt）。
+	creditsExpiringAt time.Time
+	successCount      int64      // 累计成功
+	errTotal          int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr           time.Time  // 最近一次错误时间
+	lastSuccess       time.Time  // 最近一次成功时间
+	tokenUsage        TokenUsage // 聊天请求 token 用量摘要（持久化）
+	coolKind          CoolKind
+	until             time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled          bool
+	reason            string
 	// manualDisabled 运维临时停用（上游 a20d06f / issue #138/#118）：与 disabled 并列的
 	// 独立状态位，语义是「**对话流量摘除**」而非「账号冻结」——停用期间签到 / token 保活 /
 	// 排程任务照常执行（scheduler 只判 Status.Disabled，见 internal/scheduler/scheduler.go:412），
@@ -512,6 +517,10 @@ type stateAccount struct {
 	// 恢复时钳到 [0, credits]：上游分桶异常/手工改文件留下的脏数据不得经
 	// 落盘-恢复往返被放大（weightOf 的占比项会被越界值撑爆）。
 	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
+	// CreditsExpiringAt creditsExpiring 子集中最早的套餐到期时刻（顺序模式的
+	// 「最快过期先消耗」排序依据）。仅 creditsExpiring>0 且时间非零时持久化；
+	// 旧文件缺省/分桶未启用 → nil，恢复后该账号在快过期组内按原顺序垫底。
+	CreditsExpiringAt *time.Time `json:"credits_expiring_at,omitempty"`
 
 	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
 	// 6004 精确对齐上游重置墙钟后，单模型冷却可长达数小时，跨重启是常态；

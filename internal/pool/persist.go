@@ -154,11 +154,16 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if creditsExpiring > s.Credits {
 			creditsExpiring = s.Credits
 		}
+		var creditsExpiringAt time.Time
+		if creditsExpiring > 0 && s.CreditsExpiringAt != nil {
+			creditsExpiringAt = *s.CreditsExpiringAt
+		}
 		e := &entry{
 			a:                 &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:           s.Credits,
 			creditsTotal:      s.CreditsTotal,
 			creditsExpiring:   creditsExpiring,
+			creditsExpiringAt: creditsExpiringAt,
 			disabled:          s.Disabled,
 			reason:            s.Reason,
 			manualDisabled:    s.ManualDisabled,
@@ -335,6 +340,11 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			du := e.degradeUntil
 			degradeUntil = &du
 		}
+		var creditsExpiringAt *time.Time
+		if e.creditsExpiring > 0 && !e.creditsExpiringAt.IsZero() {
+			t := e.creditsExpiringAt
+			creditsExpiringAt = &t
+		}
 		// 惰性清理僵尸 reason：until 为零值或已过期时不写出 cool_kind/reason，
 		// 避免 state.json 残留「until=0001 零值 + reason=6004 model rate limit」
 		// 的不一致快照（模型级冷却不该污染账号级 coolKind/reason 域）。disabled
@@ -365,6 +375,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			BreakerUntil:      breakerUntil,
 			RetryCount:        retryCount,
 			CreditsExpiring:   e.creditsExpiring,
+			CreditsExpiringAt: creditsExpiringAt,
 			ModelCooldowns:    mcs,
 		}
 	}

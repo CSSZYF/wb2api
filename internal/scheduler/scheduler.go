@@ -572,7 +572,7 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 		// 上游不再下发 CycleEndTime 后必须把上一轮的非零值复位，否则陈旧值永久留存
 		// （缺陷 A）。与 ReenableIfCredits 分工：那个写余额+解冻（带解冻语义，不可被
 		// 无解冻语义的入口替代），这个只写分桶观测量。
-		s.cfg.Pool.SetCreditsExpiring(st.UID, expiring)
+		s.cfg.Pool.SetCreditsExpiringAt(st.UID, expiring, diag.ExpiringEnd)
 		logBalance(st.UID, remain, total, expiring, diag)
 	}
 	s.RunStreakBonusNow()
@@ -744,7 +744,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			// 的硬冷却账号」永不解冻——分支语义分裂，同一账号是否解冻取决于上游是否
 			// 返回 expiring 分桶。
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsExpiring(uid, expiring)
+			s.cfg.Pool.SetCreditsExpiringAt(uid, expiring, diag.ExpiringEnd)
 			logBalance(uid, remain, total, expiring, diag)
 		}(a, st.UID)
 	}

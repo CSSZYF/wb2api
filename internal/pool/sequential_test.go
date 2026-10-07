@@ -651,3 +651,73 @@ func TestSequentialFallbackSemanticsUnchanged(t *testing.T) {
 		t.Fatalf("cn 域全冷却 → 应回落 global 的 g1, got %v", got)
 	}
 }
+
+// TestSequentialExpiringFirstOrdering 顺序模式的「快过期账号优先」：
+// creditsExpiring>0 的账号整体提前，组内按 creditsExpiringAt（快过期子集的最早
+// 到期时刻）升序；没有时间戳的旧状态排在没有时间戳的快过期账号之后、非快过期
+// 账号之前。其余账号保持运维顺序；在途占满照常溢出。
+func TestSequentialExpiringFirstOrdering(t *testing.T) {
+	withNoPickGap(t)
+	p := seqPool(t, "a", "b", "c", "d")
+	p.SetMaxInFlight(1)
+	now := time.Now()
+	p.SetCreditsExpiringAt("a", 5, now.Add(5*time.Hour))
+	p.SetCreditsExpiringAt("c", 10, now.Add(2*time.Hour))
+	p.SetCreditsExpiringAt("d", 7, time.Time{}) // 旧 state：有分桶但无最早到期时刻
+
+	// 粘性新会话走的 AvailableUIDs 必须与顺序选号同一口径（快过期前置）。
+	if got, want := p.AvailableUIDs(), []string{"c", "a", "d", "b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("AvailableUIDs()=%v want %v（粘性分配与顺序选号同口径）", got, want)
+	}
+	for _, uid := range []string{"c", "a", "d", "b"} {
+		got := p.Pick()
+		if got == nil || got.UID != uid {
+			t.Fatalf("顺序选号 want %s, got %v（快过期账号应按最早到期优先）", uid, got)
+		}
+		if !p.Acquire(uid) {
+			t.Fatalf("warm up %s（在途占满后应溢出到下一个）", uid)
+		}
+	}
+}
+
+// TestSequentialExpiringTieKeepsConfiguredOrder 同为快过期且最早到期时刻相同（或
+// 都缺时间戳）时，按运维顺序作稳定 tie-breaker——快过期优先不是重排账号池。
+func TestSequentialExpiringTieKeepsConfiguredOrder(t *testing.T) {
+	withNoPickGap(t)
+	p := seqPool(t, "a", "b", "c")
+	p.SetMaxInFlight(1)
+	at := time.Now().Add(3 * time.Hour)
+	p.SetCreditsExpiringAt("a", 5, at)
+	p.SetCreditsExpiringAt("c", 5, at)
+	for _, uid := range []string{"a", "c", "b"} {
+		got := p.Pick()
+		if got == nil || got.UID != uid {
+			t.Fatalf("相同到期时刻 want %s, got %v（应保持运维顺序）", uid, got)
+		}
+		if !p.Acquire(uid) {
+			t.Fatalf("warm up %s", uid)
+		}
+	}
+}
+
+// TestSequentialExpiringRespectsReserve 快过期优先只在「有资格」的候选里生效：
+// 贵模型受 reserve_credits 闸门约束，低余额快过期账号不能靠到期优先绕过底线；
+// 免费模型不受底线限制，低余额快过期账号仍按最早到期优先消耗。
+func TestSequentialExpiringRespectsReserve(t *testing.T) {
+	withNoPickGap(t)
+	p := seqPool(t, "low", "high", "normal")
+	p.SetReserveCredits(50)
+	now := time.Now()
+	setKnownCredits(p, "low", 45) // ≤50：贵模型不得选它
+	p.SetCreditsExpiringAt("low", 10, now.Add(time.Hour))
+	setKnownCredits(p, "high", 60) // >50 且有快过期：贵模型首选
+	p.SetCreditsExpiringAt("high", 5, now.Add(10*time.Hour))
+	setKnownCredits(p, "normal", 1000)
+
+	if got := p.PickExcludingForModel(nil, "glm-5.2"); got == nil || got.UID != "high" {
+		t.Fatalf("贵模型 want high（low 到期更早但余额触底线）, got %v", got)
+	}
+	if got := p.PickExcludingForModel(nil, "hy3"); got == nil || got.UID != "low" {
+		t.Fatalf("免费模型 want low（免费模型不受底线限制，仍按最早到期优先）, got %v", got)
+	}
+}

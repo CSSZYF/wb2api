@@ -146,9 +146,9 @@ const (
 	// PickWeighted 三因子加权随机（**缺省**，零值即本模式）：改动前的既有行为，
 	// 逐字节不变。Top5 短名单 + 加权抽签 + minPickGap 防并发撞号 + LRU 兜底。
 	PickWeighted PickMode = iota
-	// PickSequential 顺序填充式：按 Pool.Order() 从上到下取**第一个**合格账号，
-	// 靠 inFlightFull 过滤实现「并发满了临时溢出给下一个号、并发降回来它重新成为
-	// 首选」的语义（顺序遍历是确定性的，不需要任何额外逻辑）。
+	// PickSequential 顺序填充式：按运维顺序 + 快过期账号前置排序取**第一个**合格
+	// 账号，靠 inFlightFull 过滤实现「并发满了临时溢出给下一个号、并发降回来它重新
+	// 成为首选」的语义（顺序遍历是确定性的，不需要任何额外逻辑）。
 	PickSequential
 )
 
@@ -202,8 +202,9 @@ type seqSkip struct {
 // 并把 reserve 项一并列出（用户能看到完整的跳过链路）。
 const seqSkipReserve = "reserve"
 
-// pickSequentialLocked 顺序填充式选号：按 Pool.Order() 从上到下遍历，返回第一个
-// 同时满足 tried 未标记 / healthy(ForModel) / 保留积分闸门 / 未占满在途 的账号。
+// pickSequentialLocked 顺序填充式选号：按 sequentialPickOrderLocked()（运维顺序 +
+// 快过期账号前置）从上到下遍历，返回第一个同时满足 tried 未标记 /
+// healthy(ForModel) / 保留积分闸门 / 未占满在途 的账号。
 //
 // 三条需求的实现方式（都不需要额外状态机）：
 //   - 需求 2「并发满 = 临时溢出」：inFlightFull 过滤天然实现——顺序靠前的号满了就
@@ -234,7 +235,7 @@ const seqSkipReserve = "reserve"
 // （unhealthy）、保留积分触底（reserve）。跳过原因取每个被跳过账号的首个判据
 // （顺序：tried → realm → healthy → reserve → inflight）。
 func (p *Pool) pickSequentialLocked(tried map[string]bool, now time.Time, reqModel, realm string, gate reserveGate) *auth.Auth {
-	order := p.effectiveOrderLocked()
+	order := p.sequentialPickOrderLocked()
 	var chosen *entry
 	// skipped 收集被跳过的账号及其原因（仅在真的选中了后面的号时才打日志：
 	// 无候选返回 nil 时由 pick 决定跨域回落/兜底，那些路径有自己的日志）。

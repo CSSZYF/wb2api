@@ -277,7 +277,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	if rm, tt, exp, diag, err := p.cfg.Upstream.UserResourceDetailedDiag(a, p.expiringSoonWindow()); err == nil {
 		remain, total = rm, tt
 		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
-		p.cfg.Pool.SetCreditsExpiring(acct.UID, exp)
+		p.cfg.Pool.SetCreditsExpiringAt(acct.UID, exp, diag.ExpiringEnd)
 		log.Printf("panel: login balance uid=%s %s", logfmt.UID8(acct.UID),
 			upstream.BalanceLine(rm, tt, exp, diag))
 	}

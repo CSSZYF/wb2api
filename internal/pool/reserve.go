@@ -290,6 +290,7 @@ func (p *Pool) NoteConsumedCredits(uid string, credit float64) {
 	if e.creditsExpiring > 0 {
 		if d > e.creditsExpiring {
 			e.creditsExpiring = 0
+			e.creditsExpiringAt = time.Time{}
 		} else {
 			e.creditsExpiring -= d
 		}

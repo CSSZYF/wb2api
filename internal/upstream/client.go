@@ -2215,6 +2215,10 @@ type ResourceDiag struct {
 	// 过滤，正常不该出现已过期的包，出现即上游数据异常，日志里直接可见）。
 	// 零值 = 一条都没解析到。
 	NearestEnd time.Time
+	// ExpiringEnd 本次分桶计入 expiring 的套餐里最早的到期时刻（仅 soon>0、余额 r>0、
+	// 且到期时刻在窗口内的条目参与）。它是「快过期积分优先消耗」的排序依据：哪个账号
+	// 的快过期积分最先作废，就先消耗哪个账号。零值 = 没有快过期积分 / 分桶未启用。
+	ExpiringEnd time.Time
 }
 
 // NearestEndText 最近到期时刻的可读文案（按上游墙钟 UTC+8 输出，与官网/面板展示同口径）；
@@ -2365,6 +2369,9 @@ func (c *Client) UserResourceDetailedDiag(a *auth.Auth, soon time.Duration) (rem
 				}
 				if soon > 0 && r > 0 && !end.After(now.Add(soon)) {
 					expiring += r
+					if diag.ExpiringEnd.IsZero() || end.Before(diag.ExpiringEnd) {
+						diag.ExpiringEnd = end
+					}
 				}
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -63,6 +64,65 @@ func TestAppJSExpiryCardWiring(t *testing.T) {
 		if !strings.Contains(h, must) {
 			t.Errorf("index.html 缺到期提醒卡片接线：%s", must)
 		}
+	}
+}
+
+// TestAppJSModelLockBoxHidesWhenEmpty 模型锁池为空时整盒隐藏，而不是留下一个
+// 「没有数据」的空盒子占位。隐藏/显示都必须在 renderModelLocks 内接线，DOM 上
+// 初始 hidden，避免首屏闪一下空盒。
+func TestAppJSModelLockBoxHidesWhenEmpty(t *testing.T) {
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(html), `id="mlBox" hidden`) {
+		t.Error("index.html 的模型锁池容器必须是 id=mlBox 且初始 hidden（空态整盒隐藏）")
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := jsFuncBody(string(js), "function renderModelLocks(")
+	if body == "" {
+		t.Fatal("app.js 缺 renderModelLocks")
+	}
+	for _, must := range []string{"$('mlBox')", "box.hidden = true", "box.hidden = false"} {
+		if !strings.Contains(body, must) {
+			t.Errorf("renderModelLocks 未按行数切换 mlBox.hidden：缺 %s", must)
+		}
+	}
+}
+
+// TestExpiryCardExpandedUsesPageFlow 展开态不能再把长列表塞进小滚动盒：
+// expBody/expList 不得有 max-height/overflow 规则，renderExpiry 必须渲染所有账号行
+// （列表本身不截断），由页面自然滚动而不是盒内二次滚动。
+func TestExpiryCardExpandedUsesPageFlow(t *testing.T) {
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(html)
+	for _, sel := range []string{`.exp-body`, `#expBody`, `#expList`} {
+		re := regexp.MustCompile(regexp.QuoteMeta(sel) + `\s*\{([^}]*)\}`)
+		for _, m := range re.FindAllStringSubmatch(h, -1) {
+			if strings.Contains(m[1], "max-height") || strings.Contains(m[1], "overflow") {
+				t.Errorf("%s 不得有内部滚动/限高规则（展开后应完整显示）：{%s}", sel, m[1])
+			}
+		}
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := jsFuncBody(string(js), "function renderExpiry(")
+	if body == "" {
+		t.Fatal("app.js 缺 renderExpiry")
+	}
+	if !strings.Contains(body, "const rows = list.map") || !strings.Contains(body, "innerHTML = rows") {
+		t.Error("renderExpiry 必须渲染完整账号列表（不得在盒内截断）")
+	}
+	if !strings.Contains(string(js), "$('btnExpToggle')") || !strings.Contains(h, `id="expBody" hidden`) {
+		t.Error("到期提醒展开/收起接线缺失")
 	}
 }
 

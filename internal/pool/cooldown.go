@@ -49,6 +49,12 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
 		e.creditsTotal = total
+		if e.creditsExpiring > credits {
+			e.creditsExpiring = credits // 快过架子集仍是 credits 的子集：余额下调时同步钳回
+		}
+		// 本入口不带套餐到期时刻：新余额下旧 creditsExpiringAt 可能已不成立，
+		// 清掉排序依据，等下一次带上 ResourceDiag.ExpiringEnd 的分桶同步重建。
+		e.creditsExpiringAt = time.Time{}
 		p.dirty.Store(true)
 	}
 }
@@ -72,6 +78,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
 		e.credits = credits
 		e.creditsTotal = total
 		e.creditsExpiring = expiring
+		e.creditsExpiringAt = time.Time{} // 本入口不带到期时刻：清掉旧值，防陈旧排序依据残留
 		p.dirty.Store(true)
 	}
 }
@@ -99,6 +106,13 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
 // 前者写余额与解冻，后者只写分桶。入参 expiring 钳到 [0, e.credits]（与
 // SetCreditsDetailed / 恢复侧 applyAccountsLocked 同口径）。
 func (p *Pool) SetCreditsExpiring(uid string, expiring int64) {
+	p.SetCreditsExpiringAt(uid, expiring, time.Time{})
+}
+
+// SetCreditsExpiringAt 同 SetCreditsExpiring，并同步快过架子集的最早到期时刻
+// （ResourceDiag.ExpiringEnd）。顺序填充式选号据此把快过期账号按「最快作废」排序；
+// expiring==0 或 expiringAt 为零值时清空排序依据，避免陈旧时间残留。
+func (p *Pool) SetCreditsExpiringAt(uid string, expiring int64, expiringAt time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -112,6 +126,10 @@ func (p *Pool) SetCreditsExpiring(uid string, expiring int64) {
 		expiring = e.credits
 	}
 	e.creditsExpiring = expiring
+	e.creditsExpiringAt = time.Time{}
+	if expiring > 0 {
+		e.creditsExpiringAt = expiringAt
+	}
 	p.dirty.Store(true)
 }
 

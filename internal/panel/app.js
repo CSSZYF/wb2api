@@ -473,11 +473,14 @@ function renderModelLocks(rows) {
   const tb = $('mlBody');
   if (!tb) return;
   const note = $('mlNote');
+  const box = $('mlBox');
   if (!rows || !rows.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
+    tb.innerHTML = '';
     if (note) note.textContent = '';
+    if (box) box.hidden = true;
     return;
   }
+  if (box) box.hidden = false;
   const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
   const left = iso => {
     const ms = iso && !/^0001-/.test(iso) ? Date.parse(iso) : NaN;
@@ -528,8 +531,9 @@ async function loadOverview(quiet) {
     // sequential 横幅：只在顺序模式显示（加权随机模式下「从上到下溢出」不成立，
     // 显示它会误导用户以为顺序生效）。文案与 pool/pick.go 的 pickSequentialLocked 语义对齐。
     const seq = seqModeOn();
+    const expWin = expiringWindowText(d.expiring_soon_sec);
     $('accSeqNote').hidden = !seq;
-    $('accSeqNote').textContent = seq ? '按顺序选号：从上到下，占满溢出到下一个（拖动 ⠿ 调整顺序）' : '';
+    $('accSeqNote').textContent = seq ? '按顺序选号：' + (expWin ? expWin + ' 内快过期账号按最近到期优先，' : '快过期账号优先，') + '其余从上到下，占满溢出（拖动 ⠿ 调整基础顺序）' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     // 顺序保存在途时先不重渲染账号表（见 orderSaving 注释）：overviewData 仍按后端

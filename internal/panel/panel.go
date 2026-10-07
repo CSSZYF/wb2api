@@ -759,7 +759,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	p.cfg.Pool.SetCreditsExpiring(uid, expiring)
+	p.cfg.Pool.SetCreditsExpiringAt(uid, expiring, diag.ExpiringEnd)
 	resp["credits"] = remain
 	resp["credits_total"] = total
 	resp["credits_expiring"] = expiring
@@ -788,7 +788,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Pool.SetCredits(uid, remain, total)
-	p.cfg.Pool.SetCreditsExpiring(uid, expiring)
+	p.cfg.Pool.SetCreditsExpiringAt(uid, expiring, diag.ExpiringEnd)
 	log.Printf("panel: balance uid=%s %s", logfmt.UID8(uid),
 		upstream.BalanceLine(remain, total, expiring, diag))
 	writeJSON(w, http.StatusOK, map[string]any{

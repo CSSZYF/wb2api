@@ -74,34 +74,61 @@ func (p *Pool) effectiveOrderLocked() []string {
 	return append(out, rest...)
 }
 
+// expiringFirstOrderLocked 把一条账号顺序临时改排成「快过期账号优先」：
+// creditsExpiring>0 的账号整体提前，内部按 creditsExpiringAt（该账号快过架子集
+// 的最早到期时刻）升序；没有时间戳的旧状态排在有明确时间的快过期账号之后。
+// 其余账号保持原相对顺序。它不改写 p.order（面板拖拽/运维指定顺序仍是权威），
+// 只在 sequential 选号与粘性分配候选排序时现算。
+func (p *Pool) expiringFirstOrderLocked(order []string) []string {
+	if len(order) < 2 {
+		return order
+	}
+	expiring := make([]string, 0, len(order))
+	rest := make([]string, 0, len(order))
+	for _, uid := range order {
+		if e := p.byUID[uid]; e != nil && e.creditsExpiring > 0 {
+			expiring = append(expiring, uid)
+			continue
+		}
+		rest = append(rest, uid)
+	}
+	if len(expiring) < 2 {
+		return append(expiring, rest...)
+	}
+	sort.SliceStable(expiring, func(i, j int) bool {
+		ti := p.byUID[expiring[i]].creditsExpiringAt
+		tj := p.byUID[expiring[j]].creditsExpiringAt
+		if ti.IsZero() != tj.IsZero() {
+			return !ti.IsZero() // 有明确到期时间的快过期账号排在时间未知者之前
+		}
+		return ti.Before(tj)
+	})
+	return append(expiring, rest...)
+}
+
+// sequentialPickOrderLocked sequential 模式实际使用的账号顺序：
+// effectiveOrderLocked（运维/默认顺序）+ 快过期账号临时前置排序。
+func (p *Pool) sequentialPickOrderLocked() []string {
+	return p.expiringFirstOrderLocked(p.effectiveOrderLocked())
+}
+
 // sortByOrderLocked 把 uids（池内账号的一个子集，如"当前可用账号"）就地排成
-// **选号顺序**——即 Pool.Order() 的口径（effectiveOrderLocked 是顺序的单一权威，
-// 本函数只借它的输出取 rank）。调用方必须已持 p.mu（读锁即可）。
-//
-// 两条路径（与 effectiveOrderLocked 的收敛规则一一对应）：
-//   - **无自定义顺序**（p.order 为空 = 旧 state.json / 用户清除顺序）：走 sort.Strings
-//     ——改动前的原路径。此时 effectiveOrderLocked 本就把全部账号按 UID 升序输出
-//     （seen 为空 → 尾部补全 = 全量 UID 升序），两条路径输出逐元素相同
-//     （等价性由 TestAvailableUIDsOrderEmptyEqualsUIDSort 锁定）。之所以短路，
-//     是因为本函数在**请求路径**上被调用（internal/session 的 availableSet 每请求一次）：
-//     order 为空时构造完整顺序列表 + seen 映射纯属浪费（46 账号实测 1 alloc/2.4µs
-//     vs 6 allocs/3.8µs），默认部署应保持改动前的分配特征。
-//   - **有自定义顺序**：按 rank 升序排。rank 唯一（effectiveOrderLocked 对 p.byUID
-//     每个 uid 恰好输出一次，uids ⊆ p.byUID），故排序结果就是"顺序里该子集的原序"，
-//     与逐项遍历顺序等价；不依赖排序稳定性。
-//
-// 成本（实测 46 账号）：无顺序路径与原实现同量级（1 alloc / 768B / ~2.4µs）；有顺序
-// 路径因每次构造完整顺序视图 + rank 映射为 10 allocs / ~10µs。取舍是**刻意**的：
-// 本函数在请求路径上每次调用一次（session.availableSet），10µs 相对上游秒级响应可忽略
-// （千 RPS 下约 0.75% 单核），而"顺序的收敛规则只实现一处"（effectiveOrderLocked）换来
-// 的是不会与新账号追加/已删除跳过等规则漂移——收益大于这点开销。
+// 选号顺序。weighted/无顺序时走原 sort.Strings / Pool.Order() 口径；sequential 时
+// 改按 sequentialPickOrderLocked（快过期账号前置），让粘性路由给新会话分配的
+// 首元素与 pickSequentialLocked 的首选保持同一口径。
 func (p *Pool) sortByOrderLocked(uids []string) {
-	if len(p.order) == 0 {
+	if len(p.order) == 0 && p.pickMode != PickSequential {
 		sort.Strings(uids)
 		return
 	}
-	rank := make(map[string]int, len(uids))
-	for i, uid := range p.effectiveOrderLocked() {
+	var order []string
+	if p.pickMode == PickSequential {
+		order = p.sequentialPickOrderLocked()
+	} else {
+		order = p.effectiveOrderLocked()
+	}
+	rank := make(map[string]int, len(order))
+	for i, uid := range order {
 		rank[uid] = i
 	}
 	sort.Slice(uids, func(i, j int) bool { return rank[uids[i]] < rank[uids[j]] })
