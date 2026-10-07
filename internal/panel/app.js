@@ -2814,7 +2814,15 @@ async function loadExpiry(force) {
   expFetching = false;
 }
 
-if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
+function setExpiryOpen(open) {
+  const body = $('expBody'), btn = $('btnExpToggle');
+  if (!body || !btn) return;
+  body.hidden = !open;
+  btn.textContent = open ? '收起' : '展开';
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+if ($('btnExpToggle')) $('btnExpToggle').onclick = () => setExpiryOpen(!$('expBody') || $('expBody').hidden);
+if ($('btnExp')) $('btnExp').onclick = () => { setExpiryOpen(true); loadExpiry(true); };
 
 // Browser-local dates keep "today" aligned with the user's timezone.
 function rangeQuery(prefix, rolling) {

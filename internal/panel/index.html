@@ -493,6 +493,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .exp-main b { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .exp-main .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
   .exp-main.err { color: var(--bad); }
+  .exp-body { max-height: 320px; overflow: auto; }
+  .exp-body .exp-row { padding: 9px 0; }
 
 
 /* Layout refinement: retain the navigation, palette and all existing views. */
@@ -666,16 +668,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 账号池 -->
     <section class="view" id="view-accounts">
-      <div class="box" id="expBox" hidden>
-        <header>
-          <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="expNote"></span>
-          <button class="xs" id="btnExp">检查</button>
-        </header>
-        <div class="pad"><div id="expList"></div></div>
-      </div>
-
       <div class="box">
         <header>
           <h3>账号池</h3>
@@ -726,6 +718,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <tbody id="mlBody"></tbody>
         </table>
         </div>
+      </div>
+
+      <div class="box exp-box" id="expBox" hidden>
+        <header>
+          <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="expNote"></span>
+          <button class="xs ghost" id="btnExpToggle" aria-expanded="false">展开</button>
+          <button class="xs" id="btnExp">检查</button>
+        </header>
+        <div class="pad exp-body" id="expBody" hidden><div id="expList"></div></div>
       </div>
     </section>
 
