@@ -342,6 +342,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
+		h.mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/panel/", http.StatusFound)
+		})
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
 	return h
