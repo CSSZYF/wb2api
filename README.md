@@ -588,7 +588,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 **auths 目录热加载**（`schedule.auth_watch_enabled`，缺省开启）：每 `auth_watch_seconds`（缺省 30）秒扫描 `auth_dir`，把手工上传/删除的凭证文件与池内账号增量对账（新增入池、消失出池，运行态保留）——云服务器场景下本地登录后上传 `workbuddy-*.json` 免重启即生效，与启动时的对齐语义完全一致。扫描只做一次目录列表 + 逐文件 stat，未变更的文件不重复解析；正在写入的半截文件跳过并打 WARN，下轮重试，账号不会因上传中间态被误剔除。开关与间隔支持面板热改（`auth_dir` 本身仍需重启）。
 
-本次同步范围、兼容取舍与升级说明见 [v1.9.34 发布说明](docs/releases/v1.9.34.md)。
+本次同步范围、兼容取舍与升级说明见 [v1.9.35 发布说明](docs/releases/v1.9.35.md)。
 
 ## 🖥️ Web 管理面板
 
