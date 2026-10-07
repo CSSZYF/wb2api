@@ -685,3 +685,51 @@ func TestSnapshotAggCacheOmitEmpty(t *testing.T) {
 		t.Error("全未命中时 cache_hit_rate=0 被 omitempty 省略（符合既定口径）；前端应从 miss 在场推 0%，不得依赖该字段")
 	}
 }
+
+// Since 只汇总「覆盖区间与 [start,+∞) 相交」的分片：今天的小时桶计入，
+// 昨天结束的桶排除（边界 = 右端点 <= start 即丢，与 inWindow 同判据）；
+// 日桶按覆盖区间判定（右端点 > start 即计入，宁多算不丢）；畸形键宁留不丢。
+// Credit 是桶级 Cr 的加和——只有真实扣费观测（HasCredit）才贡献，无观测不估算。
+func TestSinceSumsOnlyIntersectingBuckets(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+
+	// 今天：两笔真实扣费 + 一笔无 credit 观测（免费模型，只进 tokens/请求数）。
+	r.Add(dayStart.Add(1*time.Hour), "cn", "u1", "m1", Delta{TotalTokens: 100, HasTotal: true, Credit: 0.5, HasCredit: true}, true)
+	r.Add(dayStart.Add(2*time.Hour), "cn", "u1", "m2", Delta{TotalTokens: 200, HasTotal: true, Credit: 1.25, HasCredit: true}, true)
+	r.Add(dayStart.Add(3*time.Hour), "cn", "u1", "free", Delta{TotalTokens: 50, HasTotal: true}, true)
+	// 昨天 23:00 的小时桶：右端点恰为今日零点 → 不相交，必须排除。
+	r.Add(dayStart.Add(-1*time.Hour), "cn", "u1", "m1", Delta{TotalTokens: 9999, HasTotal: true, Credit: 99, HasCredit: true}, true)
+
+	got := r.Since(dayStart)
+	if got.Requests != 3 || got.TotalTokens != 350 {
+		t.Fatalf("today req/tok = %d/%d want 3/350（昨天的桶不得计入）", got.Requests, got.TotalTokens)
+	}
+	if got.Credit != 1.75 {
+		t.Fatalf("today credit = %v want 1.75（真实扣费加和；无观测不估算）", got.Credit)
+	}
+
+	// 覆盖今天的日桶：右端点 > start 即计入（日桶覆盖区间跨整天，固有多算，
+	// 与窗口过滤同一取舍）；畸形键同样宁留不丢。
+	dayScope := "d:" + now.Format(dayLayout)
+	r.buckets[dayScope+"|cn|u1|m1"] = &bucket{Scope: dayScope, Realm: "cn", UID: "u1", Model: "m1", Req: 1, TT: 7, Cr: 0.25}
+	r.buckets["x:garbage|cn|u1|m1"] = &bucket{Scope: "x:garbage", Req: 1, TT: 1}
+
+	got = r.Since(dayStart)
+	if got.Requests != 5 || got.TotalTokens != 358 {
+		t.Fatalf("含日桶+畸形键 req/tok = %d/%d want 5/358", got.Requests, got.TotalTokens)
+	}
+	if got.Credit != 2.0 {
+		t.Fatalf("credit = %v want 2.0（日桶的 Cr 也计入）", got.Credit)
+	}
+}
+
+// nil Recorder 的 Since 返回零值 Agg（面板未装配用量记录器时的兜底路径）。
+func TestSinceNilRecorder(t *testing.T) {
+	var r *Recorder
+	got := r.Since(time.Now())
+	if got.Requests != 0 || got.TotalTokens != 0 || got.Credit != 0 {
+		t.Fatalf("nil recorder Since = %+v, want 全零", got)
+	}
+}

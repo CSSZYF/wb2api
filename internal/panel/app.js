@@ -142,6 +142,9 @@ let lastPackages = null;
 let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
+// expDailyNeed 概览条「日均需耗」：各账号最近到期批次的日均需耗之和，
+// 由 renderExpiry 顺带算出（与到期提醒逐行同口径）。null = 套餐信息还没拉到。
+let expDailyNeed = null;
 
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
@@ -518,6 +521,7 @@ async function loadOverview(quiet) {
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sSticky').textContent = d.sticky_sessions;
+    paintDailyStats();
     // 版本号自身可能已带 v 前缀（CI 从 git tag 注入，tag 形如 v1.9.2）：
     // 已带则原样显示，否则补一个 v——两种来源都不会渲染成 vv1.9.2。
     const ver = /^v/i.test(d.version || '') ? d.version : 'v' + d.version;
@@ -2747,12 +2751,59 @@ function expDaysLeft(dateStr, today) {
   return Math.round((new Date(dateStr + 'T00:00:00') - today) / 86400000);
 }
 
+// fmtSpend 小额积分的花费格式：credit 观测常是零点几的小数，fmtTok 的
+// 取整与 k/M 缩写会把它抹成 0——按量级给 0/1/2 位小数。
+function fmtSpend(n) {
+  n = Number(n || 0);
+  if (n >= 100) return Math.round(n).toLocaleString('en-US');
+  if (n >= 10) return n.toFixed(1);
+  if (n > 0) return n.toFixed(2);
+  return '0';
+}
+
+// paintDailyStats 概览条「日均需耗 / 今日已耗」两个数字：
+//   - 需耗 = 各账号最近到期批次的日均需耗之和（renderExpiry 与到期提醒逐行
+//     同口径算进 expDailyNeed；套餐信息未拉取时显示 —）。
+//   - 已耗 = overview.today.credit（后端对今日分片的真实扣费求和；没有该键
+//     = 用量记录器未启用 → —，不是 0）。
+//   已耗 ≥ 需耗染绿、未达染琥珀——「今天有没有消耗到位」一眼可辨。
+function paintDailyStats() {
+  const needEl = $('sDailyNeed'), usedEl = $('sTodayUsed');
+  if (!needEl || !usedEl) return;
+  needEl.textContent = expDailyNeed == null ? '—' : fmtTok(expDailyNeed);
+  needEl.parentElement.title = expDailyNeed == null
+    ? '各账号最近到期批次的日均需耗合计；拉取套餐信息后显示'
+    : '各账号最近到期批次的日均需耗合计（估算下限，与下方到期提醒同口径）';
+  const cell = usedEl.parentElement;
+  const today = overviewData && overviewData.today;
+  if (!today) {
+    usedEl.textContent = '—';
+    cell.title = '用量记录未启用';
+    cell.classList.remove('good', 'warn');
+    return;
+  }
+  const credit = Number(today.credit || 0);
+  // 双段显示：主值是积分（上游实扣 credit，与需耗同单位可对比），后面弱显
+  // 今日 tokens——免费模型（x0.00）烧再多也是 0 积分，没有这段会让人以为
+  // 「跑了 39M tok 怎么已耗是 0」是 bug。
+  const toks = Number(today.total_tokens || 0);
+  usedEl.innerHTML = fmtSpend(credit) +
+    (toks > 0 ? '<span class="used-tok"> · ' + fmtTok(toks) + ' tok</span>' : '');
+  const target = expDailyNeed != null && expDailyNeed > 0;
+  cell.title = '今日已耗 ' + fmtSpend(credit) + ' 积分 · ' + fmtTok(today.requests) +
+    ' 次请求 · ' + fmtTok(today.total_tokens) + ' tok' +
+    (target ? '（日均需耗 ≥' + fmtTok(expDailyNeed) + '）' : '');
+  cell.classList.toggle('good', target && credit >= expDailyNeed);
+  cell.classList.toggle('warn', target && credit < expDailyNeed);
+}
+
 // renderExpiry 首页卡片渲染：每账号一行，色点 = 危险度（≤3 天红 / ≤7 天琥珀 /
 // 更远绿），正文给出最近到期批次、该批剩余、到期前日均需耗（= 剩余 ÷ 距到期天数，
 // 至少 1 天防除零）与 7 天内合计。
 function renderExpiry(d) {
   const list = (d.accounts || []);
   const today = new Date(); today.setHours(0, 0, 0, 0);
+  let needSum = 0;
   const rows = list.map(a => {
     if (a.error) {
       return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
@@ -2768,6 +2819,7 @@ function renderExpiry(d) {
     const first = bs[0];
     const days = expDaysLeft(first.date, today);
     const daily = Math.ceil(first.remain / Math.max(1, days));
+    needSum += daily;
     const week = bs.filter(b => expDaysLeft(b.date, today) <= 7)
       .reduce((s, b) => s + b.remain, 0);
     // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀、更远绿。
@@ -2787,6 +2839,10 @@ function renderExpiry(d) {
       (rest ? '<div class="note">' + rest + '</div>' : '') +
       '</span></div>';
   }).join('');
+  // 概览条「日均需耗」= 各行日均需耗之和：查询失败的账号无法贡献（它是
+  // 估算下限不是精确账，下方各行看得到谁没算进去）。
+  expDailyNeed = needSum;
+  paintDailyStats();
   $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
   // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
   const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;

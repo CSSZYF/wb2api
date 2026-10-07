@@ -313,8 +313,9 @@ func TestAppJSRenderExpiryLogic(t *testing.T) {
 	src := string(js)
 	var parts []string
 	for _, sig := range []string{
-		"function esc(", "function fmtTok(", "function pkgEndMs(", "function expBatches(",
-		"function expDaysLeft(", "function renderExpiry(",
+		"function esc(", "function fmtTok(", "function fmtSpend(", "function pkgEndMs(",
+		"function expBatches(", "function expDaysLeft(", "function paintDailyStats(",
+		"function renderExpiry(",
 	} {
 		fn := jsFuncFull(src, sig)
 		if fn == "" {
@@ -323,9 +324,20 @@ func TestAppJSRenderExpiryLogic(t *testing.T) {
 		parts = append(parts, fn)
 	}
 	script := `let lastPackages = null; let lastPackagesAt = 0;
+let expDailyNeed = null; let overviewData = null;
 const writes = {};
-function makeEl(id) { return { id, set innerHTML(v) { writes[id] = String(v); }, get innerHTML() { return writes[id] || ''; },
-  textContent: '', hidden: true, children: [] }; }
+// makeEl 的最小 DOM 桩：paintDailyStats 需要 el.parentElement.title/classList。
+function makeEl(id) {
+  const el = { id, textContent: '', hidden: true, children: [],
+    set innerHTML(v) { writes[id] = String(v); }, get innerHTML() { return writes[id] || ''; } };
+  const pel = { title: '', _cls: [] };
+  pel.classList = {
+    toggle: (c, on) => { const i = pel._cls.indexOf(c); if (on && i < 0) pel._cls.push(c); if (!on && i >= 0) pel._cls.splice(i, 1); },
+    remove: (...cs) => { for (const c of cs) { const i = pel._cls.indexOf(c); if (i >= 0) pel._cls.splice(i, 1); } },
+  };
+  el.parentElement = pel;
+  return el;
+}
 const els = {};
 const $ = id => (els[id] = els[id] || makeEl(id));
 ` + strings.Join(parts, "\n") + `
@@ -340,7 +352,15 @@ renderExpiry({ accounts: [
   { uid: 'u4', nickname: 'none',  packages: [{ remain: 10 }] },
   { uid: 'u5', nickname: 'err',   error: 'boom' },
 ]});
-console.log(JSON.stringify({ list: writes.expList, note: writes.expNote, hidden: els.expBox.hidden }));
+// 概览条：需耗 = 30(u1)+40(u2)+14(u6)+1(u3)=85（u4 无到期、u5 失败不计）；
+// 已耗在 overviewData 到位前是 —，到位后按 vs 需耗染绿/琥珀。
+const before = { need: els.sDailyNeed.textContent, used: els.sTodayUsed.textContent };
+overviewData = { today: { credit: 100, requests: 2, total_tokens: 5000 } };
+paintDailyStats();
+const after = { used: writes.sTodayUsed || els.sTodayUsed.textContent, cls: els.sTodayUsed.parentElement._cls.join(',') };
+overviewData.today.credit = 10; paintDailyStats();
+const under = els.sTodayUsed.parentElement._cls.join(',');
+console.log(JSON.stringify({ list: writes.expList, note: writes.expNote, hidden: els.expBox.hidden, before, after, under, need: expDailyNeed }));
 `
 	fp := filepath.Join(t.TempDir(), "render_expiry_check.js")
 	if err := os.WriteFile(fp, []byte(script), 0o600); err != nil {
@@ -354,6 +374,16 @@ console.log(JSON.stringify({ list: writes.expList, note: writes.expNote, hidden:
 		List   string `json:"list"`
 		Note   string `json:"note"`
 		Hidden bool   `json:"hidden"`
+		Need   int    `json:"need"`
+		Before struct {
+			Need string `json:"need"`
+			Used string `json:"used"`
+		} `json:"before"`
+		After struct {
+			Used string `json:"used"`
+			Cls  string `json:"cls"`
+		} `json:"after"`
+		Under string `json:"under"`
 	}
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("node 输出解析失败: %v\n%s", err, out)
@@ -382,5 +412,19 @@ console.log(JSON.stringify({ list: writes.expList, note: writes.expNote, hidden:
 	// 查询失败账号单独一行，不吞掉其余账号。
 	if !strings.Contains(got.List, "查询失败") {
 		t.Errorf("单账号查询失败应就地显示：%s", got.List)
+	}
+	// 概览条：需耗 = 各行日均需耗之和（30+40+14+1=85），失败/无到期账号不计。
+	if got.Need != 85 || got.Before.Need != "85" {
+		t.Errorf("日均需耗合计 = %v/%q want 85/\"85\"（各行之和，失败账号不贡献）", got.Need, got.Before.Need)
+	}
+	// 已耗：overview.today 未到位 → —；到位且 ≥ 需耗 → 绿（good）；低于 → 琥珀（warn）。
+	if got.Before.Used != "—" {
+		t.Errorf("today 缺席时已耗应显示 —, got %q", got.Before.Used)
+	}
+	if !strings.Contains(got.After.Used, "100") || !strings.Contains(got.After.Used, "tok") || !strings.Contains(got.After.Cls, "good") {
+		t.Errorf("已耗 100 ≥ 需耗 85 应显示 100+tok 且染绿：used=%q cls=%q", got.After.Used, got.After.Cls)
+	}
+	if !strings.Contains(got.Under, "warn") {
+		t.Errorf("已耗 10 < 需耗 85 应染琥珀：cls=%q", got.Under)
 	}
 }

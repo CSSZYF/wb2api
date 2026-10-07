@@ -472,6 +472,12 @@ type Agg struct {
 	CacheHitTokens  int64   `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens int64   `json:"cache_miss_tokens,omitempty"`
 	CacheHitRate    float64 `json:"cache_hit_rate,omitempty"`
+
+	// Credit 上游真实扣费累计（桶级 Cr 求和，与 stats.go StatsModel.Credit
+	// 同口径：只采信上游 usage.credit 观测，缺失不估算）。omitempty 在这里
+	// 没有「缺席 ≠ 0」的歧义问题——它是加和量不是比率，0 与无观测对消费方
+	// 同义（今日已耗 0 与今日无观测都显示 0）。
+	Credit float64 `json:"credit,omitempty"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -500,6 +506,8 @@ func (g *aggAcc) add(b *bucket) {
 	// 全部桶累加完才能算（中间值写进 Agg 只会是半成品）。
 	g.cacheHit += b.CH
 	g.cacheMiss += b.CM
+	// 扣费是加和量不是比率：直接累加（桶里的 Cr 只在上游给了 credit 时非零）。
+	g.Credit += b.Cr
 }
 
 func (g *aggAcc) finish() Agg {
@@ -741,6 +749,34 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string) Snapshot {
 		}
 	}
 	return snap
+}
+
+// Since 汇总覆盖区间与 [start, +∞) 相交的全部分片，返回单行合计。
+//
+// 这是「今日以来」这类自然边界取数的轻量路径（面板概览每几秒拉一次）：
+// 只扫一遍桶求和，不构建 SnapshotWindow 的按域/账号/模型分组与时序序列。
+// 判据与 inWindow 同口径——按分片覆盖区间的右端点判定（起点早于 start 但
+// 仍在覆盖中的当前小时桶不能整片丢）。日桶会把当天零点前的量也带进来，
+// 这是桶粒度的固有上取整，与窗口过滤一致（宁多算不丢数据）；畸形键同样
+// 宁留不丢。
+func (r *Recorder) Since(start time.Time) Agg {
+	var g aggAcc
+	if r == nil {
+		return g.finish()
+	}
+	r.mu.Lock()
+	bs := make([]bucket, 0, len(r.buckets))
+	for _, b := range r.buckets {
+		bs = append(bs, *b)
+	}
+	r.mu.Unlock()
+	for i := range bs {
+		if end, ok := bucketEnd(bs[i].Scope); ok && !end.After(start) {
+			continue
+		}
+		g.add(&bs[i])
+	}
+	return g.finish()
 }
 
 // seriesKey 返回分片在当前粒度下的时序键；键解析不出来返回空串。

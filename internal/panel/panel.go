@@ -251,7 +251,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
 		"auth_required":   p.apiKey() != "",
@@ -268,7 +268,16 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"expiring_soon_sec": int64(p.expiringSoonWindow().Seconds()),
 		"accounts":          p.cfg.Pool.List(),
 		"model_locks":       p.cfg.Pool.ModelLockView(),
-	})
+	}
+	// today 今日（本地日历日零点起）的用量合计：credit 是上游真实扣费加和
+	// （usage 桶级 Cr），前端拿它对照「日均需耗」判断今天是否消耗到位。
+	// 记录器未装配时键整体缺席——前端显示「—」而非 0：0 = 真没消耗，
+	// 缺席 = 没这笔账，两回事不能混。左边界与 usage 分片键同用本地时区。
+	if p.cfg.Usage != nil {
+		now := time.Now()
+		out["today"] = p.cfg.Usage.Since(time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local))
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // expiringSoonWindow 当前生效的快过期窗口：与调度器同源（热改后立即一致）。

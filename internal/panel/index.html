@@ -598,6 +598,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 #view-accounts .acct-stats .stat .v { font: 600 14px/1.2 var(--mono); letter-spacing: -.01em; white-space: nowrap; }
 #view-accounts .acct-stats .stat .k { margin: 0; color: var(--ink-3); font-size: 11.5px; white-space: nowrap; }
 #view-accounts .acct-stats #sCredits { font-size: 13px; white-space: nowrap; overflow-wrap: normal; }
+/* 今日已耗的 tokens 弱显段：主值是积分，tok 只做参照，弱化避免抢眼 */
+#view-accounts .acct-stats .used-tok { font-size: 11px; font-weight: 500; color: var(--ink-3); }
 #view-accounts .acc th { padding-top: 10px; padding-bottom: 10px; }
 #view-accounts .acc td { padding-top: 10px; padding-bottom: 10px; }
 #view-accounts .acc td .tag { margin: 1px 4px 1px 0; }
@@ -688,6 +690,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">不可选</div></div>
           <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
           <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+          <div class="stat"><div class="v" id="sDailyNeed">-</div><div class="k">日均需耗</div></div>
+          <div class="stat"><div class="v" id="sTodayUsed">-</div><div class="k">今日已耗</div></div>
         </div>
         <div class="tbl-wrap">
         <table class="acc">
