@@ -584,6 +584,35 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .qrow .msg { grid-column: 2 / -1; }
 }
 
+#view-accounts .box > .acct-stats {
+  display: flex; flex-wrap: wrap; gap: 0; margin: 0; padding: 0 20px;
+  border: 0; border-bottom: 1px solid var(--line-soft); border-radius: 0;
+  background: transparent; box-shadow: none; overflow: visible;
+}
+#view-accounts .acct-stats .stat {
+  display: flex; align-items: baseline; gap: 7px; min-width: 0;
+  padding: 10px 14px 10px 0; border: 0; background: transparent;
+}
+#view-accounts .acct-stats .stat + .stat { border-left: 1px solid var(--line-soft); padding-left: 14px; }
+#view-accounts .acct-stats .stat .v { font: 600 14px/1.2 var(--mono); letter-spacing: -.01em; white-space: nowrap; }
+#view-accounts .acct-stats .stat .k { margin: 0; color: var(--ink-3); font-size: 11.5px; white-space: nowrap; }
+#view-accounts .acct-stats #sCredits { font-size: 13px; white-space: nowrap; overflow-wrap: normal; }
+#view-accounts .acc th { padding-top: 10px; padding-bottom: 10px; }
+#view-accounts .acc td { padding-top: 10px; padding-bottom: 10px; }
+#view-accounts .acc td .tag { margin: 1px 4px 1px 0; }
+#view-accounts .acc .usage-cell { min-width: 236px; }
+#view-accounts .acc .usage-item { padding: 2px 5px; }
+#view-accounts .acc .c-acts { min-width: 190px; }
+#view-accounts .acc .acts { max-width: 230px; justify-content: flex-end; flex-wrap: wrap; white-space: normal; }
+#view-accounts .acc-tools { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+#view-accounts .acc-tools button { flex: none; }
+@media (max-width: 760px) {
+  #view-accounts .box > .acct-stats { padding: 0 14px 8px; }
+  #view-accounts .acct-stats .stat { flex: 1 1 45%; padding: 7px 10px 7px 0; }
+  #view-accounts .acct-stats .stat + .stat { border-left: 0; padding-left: 0; }
+  #view-accounts .acc .acts { max-width: none; }
+  #view-accounts .acc-tools { flex: 1 1 100%; justify-content: flex-start; }
+}
 </style>
 </head>
 <body>
@@ -637,15 +666,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 账号池 -->
     <section class="view" id="view-accounts">
-      <div class="stats">
-        <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
-        <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
-        <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
-        <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">不可选（禁用/停用）</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
-        <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
-      </div>
-
       <div class="box" id="expBox" hidden>
         <header>
           <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
@@ -662,12 +682,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="accSeqNote" hidden></span>
           <span class="note" id="accNote"></span>
-          <button class="xs" id="btnCheckinAll">全部签到</button>
-          <button class="xs" id="btnTravelAll">旅行巡检</button>
-          <button class="xs" id="btnActivityAll">活跃上报</button>
-          <button class="xs" id="btnKeepaliveAll">全部保活</button>
-          <button class="xs" id="btnCooldownProbe" title="立即试探已到期的软冷却（如 6004 模型级限流）：上游提前恢复即自动解冻；失败不罚号">冷却探活</button>
+          <span class="acc-tools" aria-label="账号批量操作">
+            <button class="xs" id="btnCheckinAll">全部签到</button>
+            <button class="xs" id="btnTravelAll">旅行巡检</button>
+            <button class="xs" id="btnActivityAll">活跃上报</button>
+            <button class="xs" id="btnKeepaliveAll">全部保活</button>
+            <button class="xs" id="btnCooldownProbe" title="立即试探已到期的软冷却（如 6004 模型级限流）：上游提前恢复即自动解冻；失败不罚号">冷却探活</button>
+          </span>
         </header>
+        <div class="stats acct-stats" aria-label="账号池概览">
+          <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
+          <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
+          <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
+          <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">不可选</div></div>
+          <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
+          <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+        </div>
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
