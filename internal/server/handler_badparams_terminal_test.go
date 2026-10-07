@@ -117,3 +117,79 @@ func TestChatModelParamInvalidStillRotates(t *testing.T) {
 		t.Errorf("11133 不得罚号: %+v", st)
 	}
 }
+
+// body11133 用户实测形态的 11133 原文（extError=model_param_invalid）。
+const body11133 = `{"code":11133,"msg":"Invalid request parameters","requestId":"r1",` +
+	`"extError":{"code":"model_param_invalid","message":"the request parameters were rejected by the model provider"}}`
+
+// TestChatModelParamInvalidSameFingerprintEarlyExit 两个不同账号回**同一** 11133
+// 业务码 → 参数拒绝被证明是请求级终态（账号侧后端真有差异时应回不同结果）：
+// 第三个账号不再打（不把必败请求放大 MaxRotate 倍），直接 400 透传原文，
+// 且不再是 503「all accounts unavailable」。不罚任何账号。
+func TestChatModelParamInvalidSameFingerprintEarlyExit(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 400, body11133, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at-a1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at-a2", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a3", AccessToken: "at-a3", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("a1", 3000, 0)
+	p.SetCredits("a2", 2000, 0)
+	p.SetCredits("a3", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400 bad_params, not 503)", rec.Code, rec.Body)
+	}
+	total := 0
+	for _, n := range calls {
+		total += n
+	}
+	if total != 2 {
+		t.Errorf("upstream calls=%d want 2（第二个号同指纹即终态，不再放大）", total)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "11133") || !strings.Contains(body, "model_param_invalid") {
+		t.Errorf("400 must passthrough upstream body: %s", body)
+	}
+	if strings.Contains(body, "no_healthy_account") || strings.Contains(body, "all accounts unavailable") {
+		t.Errorf("request-level 400 must not masquerade as pool exhaustion: %s", body)
+	}
+	for _, uid := range []string{"a1", "a2"} {
+		st, _ := p.Status(uid)
+		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.ConsecutiveFails != 0 || st.BreakerFails != 0 {
+			t.Errorf("11133 must not penalize account %s: %+v", uid, st)
+		}
+	}
+}
+
+// TestChatModelParamInvalidTerminal400 单号池 11133：无同指纹可撞、轮转耗尽
+// → 末端同样回 400 透传（paramsTerminal 分支），不再 503 误导为池子空了。
+func TestChatModelParamInvalidTerminal400(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 400, body11133, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400 bad_params terminal, not 503)", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "bad_params") || !strings.Contains(body, "11133") {
+		t.Errorf("terminal must be bad_params + upstream body: %s", body)
+	}
+	if strings.Contains(body, "all accounts unavailable") {
+		t.Errorf("11133 terminal must not say pool exhausted: %s", body)
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
+		t.Errorf("11133 must not penalize account: %+v", st)
+	}
+}

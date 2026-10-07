@@ -170,7 +170,7 @@ func TestSaveConfigAppliesPickModeHot(t *testing.T) {
 
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: rotateTripFunc(func(r *http.Request) (*http.Response, error) {
-			return badParamsResponse(), nil
+			return rotatingProbeResponse(), nil
 		})},
 		ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example",
 	}
@@ -187,7 +187,7 @@ func TestSaveConfigAppliesPickModeHot(t *testing.T) {
 			if first == "" {
 				first = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer at-")
 			}
-			return badParamsResponse(), nil
+			return rotatingProbeResponse(), nil
 		})
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions",
 			strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))

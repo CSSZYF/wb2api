@@ -113,13 +113,14 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 }
 
 // rotateCallsUntil503 发一次聊天请求，返回上游被调用次数与收到过请求的 Authorization
-// 集合。所有号一律回 11133（model_param_invalid，归 ErrBadParams）：不罚账号、
-// 零动作但**仍然轮转**（账号侧后端差异），因此换号次数 = 上游调用次数（每轮必换新号，
-// 不被冷却/熔断提前截断，正好量出轮转上限）。
+// 集合。所有号一律回 11148（tool calls mismatch，归 ErrClient）：未知 4xx 业务码
+// 不冷却/不熔断、**仍然轮转**（请求级错误指纹去重只影响连败计数，不影响换号），
+// 因此换号次数 = 上游调用次数（每轮必换新号，不被冷却/熔断提前截断，正好量出
+// 轮转上限）。
 //
-// 为什么探针不用 11101：11101 已请求级化（吸收上游 PR #99）——解析请求体失败即
-// 终止轮转、400 透传，一次请求只打一次上游，量不出换号上限。11133 是 ErrBadParams
-// 里仍然轮转的那一支（见 upstream.IsBadParamsBody 注释），行为与旧探针一致。
+// 为什么探针不用 11133：11133 已升级为「同指纹跨账号确定性收敛」——第二个账号
+// 回同一业务码即 400 终态，最多只打 2 次上游，量不出换号上限。11101 同理更早
+// 请求级化。11148 是仍然全量轮转的那一支（见 applyErrorPolicy ErrClient 分支）。
 func rotateCallsUntil503(t *testing.T, h *Handler) (int, map[string]bool) {
 	t.Helper()
 	calls := map[string]bool{}
@@ -130,7 +131,7 @@ func rotateCallsUntil503(t *testing.T, h *Handler) (int, map[string]bool) {
 		return &http.Response{
 			StatusCode: 400,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"code":11133,"msg":"Invalid request parameters"}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"code":11148,"msg":"tool calls and tool results do not match"}`)),
 		}, nil
 	})
 	rec := httptest.NewRecorder()
@@ -273,10 +274,11 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 	}
 }
 
-// TestChatAllBadParams503CarriesUpstreamBody 池内唯一账号 11133（ErrBadParams）
-// 轮转耗尽后末端 503 文案必须包含上游原始信息（不再是空洞的 no_healthy_account）。
-// 现状即透传 lastErr.Error()（含上游 body），本测试把它锁定为回归。
-func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
+// TestChatAllBadParams400CarriesUpstreamBody 池内唯一账号 11133（ErrBadParams）
+// 轮转耗尽后末端回 400 bad_params + 上游原文——参数拒绝是请求级终态，此前
+// 包装成 503「all accounts unavailable」会让 OpenAI 兼容客户端把必败请求当
+// 可重试故障无限打（newapi 侧实测的 503 刷屏即源于此）。
+func TestChatAllBadParams400CarriesUpstreamBody(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11133,"msg":"Invalid request parameters"}`, false
 	})
@@ -284,12 +286,15 @@ func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	if rec.Code != 400 {
+		t.Fatalf("code=%d body=%s (want 400)", rec.Code, rec.Body)
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "11133") || !strings.Contains(body, "Invalid request parameters") {
-		t.Errorf("503 message should carry upstream 11133 info: %s", body)
+		t.Errorf("400 message should carry upstream 11133 info: %s", body)
+	}
+	if strings.Contains(body, "all accounts unavailable") || strings.Contains(body, "no_healthy_account") {
+		t.Errorf("request-level 400 must not masquerade as pool exhaustion: %s", body)
 	}
 }
 

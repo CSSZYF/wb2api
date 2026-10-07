@@ -1388,14 +1388,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			}
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
-				a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+				a.UID, resp.StatusCode, kind, truncate(DisplayBody(string(raw)), 200))
 			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
 			if kind == ErrNone {
 				return nil, resp.StatusCode, raw, nil
 			}
-			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(DisplayBody(string(raw)), 200)}
 			if d := ParseRetryAfter(resp.Header); d > 0 {
 				ue.RetryAfter = d
 			}

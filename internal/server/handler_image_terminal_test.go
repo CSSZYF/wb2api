@@ -136,11 +136,12 @@ func TestChatInvalidImageThreeAccountsNoPoolPollution(t *testing.T) {
 	}
 }
 
-// TestChat11133RotatesButNoConsecutiveFails 11133 相邻风险（任务 B 判断）：
-// 保持「不罚号但**仍轮转**」——不同账号可能路由到不同后端/模型能力（11102 的
-// (账号,模型) 负缓存是既有证据），轮转仍有价值；但**绝不喂连败**：修复前 11133 落
-// ErrClient → 3 账号各记一次连败，与 11135 同一自伤面。此处锁定：3 账号全被尝试
-// （轮转语义不变）+ 三个账号 consecutive_fails 全 0 + 末端仍带 11133 的 hint。
+// TestChat11133RotatesButNoConsecutiveFails 11133 相邻风险（任务 B 判断 +
+// 同指纹收敛升级）：首个 11133 仍换号（不同账号可能路由到不同后端/模型能力，
+// 11102 的 (账号,模型) 负缓存是既有证据）；但第二个账号回**同一业务码**即证明
+// 确定性拒绝 → 400 终态，第三号不再放大调用。且**绝不喂连败**：修复前 11133 落
+// ErrClient → 各号记连败，与 11135 同一自伤面。此处锁定：恰好 2 次上游调用 +
+// 400 bad_params + message 逐字含上游原文 + hint 不回归 + 全池连败为 0。
 func TestChat11133RotatesButNoConsecutiveFails(t *testing.T) {
 	resetModelsCache()
 	defer resetModelsCache()
@@ -162,9 +163,12 @@ func TestChat11133RotatesButNoConsecutiveFails(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
 		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
 	}
-	// 轮转语义保持（3 个账号都试过；MaxRotate 默认 3）。
-	if calls != 3 {
-		t.Errorf("calls=%d want 3（11133 保持轮转：不同账号可能有不同模型权限）", calls)
+	// 同指纹确定性收敛：首号 11133 → 换号；第二号同码 → 400 终态，第三号不打。
+	if calls != 2 {
+		t.Errorf("calls=%d want 2（第二号同指纹即请求级终态，不放大到满轮转）", calls)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("code=%d want 400 bad_params（不再 503 误导为池子空）", rec.Code)
 	}
 	// message 逐字含上游原文（透传纪律不回归）。
 	if !strings.HasSuffix(e.Error.Message, body11133Real) {

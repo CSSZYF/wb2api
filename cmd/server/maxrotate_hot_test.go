@@ -25,21 +25,21 @@ type rotateTripFunc func(*http.Request) (*http.Response, error)
 
 func (f rotateTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-// badParamsResponse 上游 400 + 11133（model_param_invalid，归 ErrBadParams 但
-// **保留轮转**）：不罚账号、零动作、每轮必换新号——上游调用次数因此恰好等于本轮
-// 生效的换号上限，是量上限的干净探针。
+// rotatingProbeResponse 上游 400 + 11148（tool calls mismatch，归 ErrClient）：
+// 未知 4xx 业务码不冷却/不熔断、每轮必换新号（请求级指纹去重只影响连败计数，
+// 不影响换号本身）——上游调用次数因此恰好等于本轮生效的换号上限，是量上限的
+// 干净探针。
 //
-// 为什么探针改用 11133 而不是 11101：11101 已请求级化（吸收上游 PR #99）——上游在
-// 解析请求体阶段拒绝即终止轮转、400 透传原文，一次请求只打一次上游，量不出换号上限。
-// 11133 是 ErrBadParams 里**仍然轮转**的那一支（参数被模型供应商拒绝，可能是账号侧
-// 后端差异，见 upstream.IsBadParamsBody 注释），正好继续充当探针（行为与旧探针一致：
-// 不罚号 + 每轮换新号）。
-func badParamsResponse() *http.Response {
+// 探针演变：11101 已请求级化（解析请求体失败即终止轮转、400 透传，一次请求
+// 只打一次上游）；11133 已升级为「同指纹跨账号确定性收敛」（第二个账号同码
+// 即 400 终态，最多打 2 次上游）。两支都量不出换号上限。11148 是仍然**全量
+// 轮转**的那一支（ErrClient 分支保留退避 + 满轮转），探针语义与旧版一致。
+func rotatingProbeResponse() *http.Response {
 	return &http.Response{
 		StatusCode: 400,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body: io.NopCloser(strings.NewReader(
-			`{"code":11133,"msg":"Invalid request parameters"}`)),
+			`{"code":11148,"msg":"tool calls and tool results do not match"}`)),
 	}
 }
 
@@ -65,7 +65,7 @@ func TestSaveConfigAppliesMaxRotateHot(t *testing.T) {
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: rotateTripFunc(func(r *http.Request) (*http.Response, error) {
 			attempts++
-			return badParamsResponse(), nil
+			return rotatingProbeResponse(), nil
 		})},
 		ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example",
 	}

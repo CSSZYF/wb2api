@@ -144,7 +144,7 @@ func TestSaveConfigAppliesPickModeToStickyHot(t *testing.T) {
 
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: rotateTripFunc(func(r *http.Request) (*http.Response, error) {
-			return badParamsResponse(), nil
+			return rotatingProbeResponse(), nil
 		})},
 		ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example",
 	}
@@ -237,7 +237,7 @@ func TestSaveConfigSequentialStickyOverflowHot(t *testing.T) {
 	p.SetPickMode(pool.PickSequential)
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: rotateTripFunc(func(r *http.Request) (*http.Response, error) {
-			return badParamsResponse(), nil
+			return rotatingProbeResponse(), nil
 		})},
 		ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example",
 	}

@@ -911,6 +911,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		ptlFirstHint string
 	)
 	var lastErr error
+	// 11133 跨账号确定性收敛（见循环内 bad_params 分支注释）：本请求已见过的
+	// bad_params 业务码指纹（ErrFingerprint 取 code，requestId 不参与比对）。
+	badParamsFP := ""
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -1314,7 +1317,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind = uerr.Kind
 			} else {
 				kind = upstream.Classify(status, string(respBody))
-				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+				uerr = &upstream.Error{Kind: kind, Status: status, Msg: upstream.DisplayBody(string(respBody))}
 			}
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
@@ -1463,10 +1466,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
-			// 要求原文全量）+ Kind/Status（末端映射与冷却时长共用）+ RetryAfter
-			// （末端 429 映射与冷却对齐共用）。
-			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+			// lastErr 携带展示态 body（DisplayBody：JSON 业务错误原文全量透传，
+			// HTML 错误页压成单行摘要——整页 WAF HTML 不能拼进客户端 error.message）
+			// + Kind/Status（末端映射与冷却时长共用）+ RetryAfter（末端 429 映射
+			// 与冷却对齐共用）。
+			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: upstream.DisplayBody(string(respBody)), RetryAfter: uerr.RetryAfter}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr, errDedup)
 			fail(acct.UID)
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
@@ -1476,6 +1480,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 仍冷却），IP 级状态只改变「是否继续轮转」——协同不叠加。
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
 				break
+			}
+			// 11133 跨账号确定性收敛：同一请求在两个不同账号上拿到**同一业务码**
+			// （ErrFingerprint 取 code，requestId 不参与比对）→ 参数拒绝是请求级
+			// 终态而非账号差异。账号侧后端真存在差异时，不同账号应回**不同**结果
+			// （11102 不可用 / 200 可用 / 11133）；两个独立账号同码即证明「换号救
+			// 不回」——继续轮转只是把必败请求放大 MaxRotate 倍打上游（每号一次
+			// 调用 + 一行上游错误日志 + 占在途名额）。立即 400 透传原文，与轮转
+			// 耗尽后末端的 bad_params→400 同一契约（见末端分支）。不罚号：
+			// ErrBadParams 在 applyErrorPolicy 本就零动作。
+			if kind == upstream.ErrBadParams {
+				fp := upstream.ErrFingerprint(string(respBody))
+				if fp != "" && fp == badParamsFP {
+					msg := string(respBody)
+					if strings.TrimSpace(msg) == "" {
+						msg = "invalid request parameters"
+					}
+					log.Printf("chat_stream model=%s: terminal %d %s: %s",
+						bareModel, http.StatusBadRequest, "bad_params", logfmt.Truncate(msg, 240))
+					writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg,
+						h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
+					st.status = http.StatusBadRequest
+					st.outcome = reqlog.OutcomeHTTPError
+					return
+				}
+				badParamsFP = fp
 			}
 			// 429 立即换下一个号（不退避，首字延迟优先）；WAF 403 与其余分类照常退避。
 			// 判据与分野理由见 backoff.go 的 backoffWorthwhile/rotateBackoffKind。
@@ -1645,12 +1674,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 未激活）保持 no_healthy_account 通用文案不变。
 	var ue *upstream.Error
 	wafTerminal := false
+	paramsTerminal := false
 	if errors.As(lastErr, &ue) {
 		// 上游错误：hint 按 Kind + 上游原文 + 请求形态判定（upstream.GatewayHint
 		// 单一事实来源）。11133/11135 形态判定在 hint 层自带，ErrClient 家族也
 		// 可能带上 hint；未覆盖形态（ErrServer/ErrNotFound/ErrBadParams/ErrNone）
 		// 返回空串 → 字段缺席（不编造）。
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
+		// 11133 model_param_invalid（11101 已在循环内直接透传，不进轮转）：
+		// 循环内的同指纹收敛通常已提前 400 返回；走到这里=合格账号耗尽或
+		// 只打过一个号，证据仍指向请求本身——400 透传原文而非 503
+		// 「cooling/disabled」。503 会让 newapi 等上游客户端把必败请求当
+		// 可重试故障反复打（错误风暴的放大器）；400 让客户端直接看到上游
+		// 参数拒绝原文，与 11101 的末端契约一致。不罚号：ErrBadParams
+		// 在 applyErrorPolicy 本就零动作。
+		if ue.Kind == upstream.ErrBadParams {
+			paramsTerminal = true
+			code = "bad_params"
+			if s := strings.TrimSpace(ue.Msg); s != "" {
+				msg = s
+			} else {
+				msg = "invalid request parameters"
+			}
+		}
 		if ue.Kind == upstream.ErrWafBlock && h.wafIP.active() {
 			wafTerminal = true
 			code = "waf_ip_blocked"
@@ -1675,8 +1721,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// WAF IP 级 fail-fast 优先：那是更具体的终态信号（换号/重试都无意义，等窗口），
 	// 语义上不该被 429 覆盖（账号级冷却本就不会写出模型级条目，此处只是显式排他）。
 	status := http.StatusServiceUnavailable
+	if paramsTerminal {
+		status = http.StatusBadRequest
+	}
 	retryAfter := 0
-	if !wafTerminal && h.cfg.Pool != nil {
+	if !wafTerminal && !paramsTerminal && h.cfg.Pool != nil {
 		scope := realm
 		if !realmExplicit {
 			scope = "" // 裸名归属：回落允许跨域 → 判定范围是全池
@@ -1729,7 +1778,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// Model-level unavailability must not look like an empty pool. Keep 6004's
 	// existing 429/Retry-After contract; 11102 or mixed model locks return 400.
-	if !wafTerminal && status == http.StatusServiceUnavailable && h.cfg.Pool != nil {
+	if !wafTerminal && !paramsTerminal && status == http.StatusServiceUnavailable && h.cfg.Pool != nil {
 		scope := realm
 		if !realmExplicit {
 			scope = ""
@@ -1758,6 +1807,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// （no_healthy_account/waf_ip_blocked 文案 + gateway_hint）保持原样不动。
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	}
+	// 终态落一行 sys 日志：面板「运行日志」镜像 log 输出，此前客户端看到的
+	// 4xx/5xx 终态在面板里完全不可见（只有逐次尝试的 upstream 行）——本行让
+	// 面板能看到与 newapi 侧对得上的终态错误（status/code/model + 短消息）。
+	log.Printf("chat_stream model=%s: terminal %d %s: %s",
+		bareModel, status, code, logfmt.Truncate(msg, 240))
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError

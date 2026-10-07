@@ -143,7 +143,7 @@ func TestSaveConfigAppliesReserveCreditsHot(t *testing.T) {
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: rotateTripFunc(func(r *http.Request) (*http.Response, error) {
 			attempts++
-			return badParamsResponse(), nil
+			return rotatingProbeResponse(), nil
 		})},
 		ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example",
 	}
@@ -211,7 +211,7 @@ func TestReserveCreditsExhaustedMessage(t *testing.T) {
 	p.SetCredits("u1", 45, 8451) // 余额已知且触底
 	p.SetReserveCredits(50)
 	up := &upstream.Client{
-		HTTP:       &http.Client{Transport: rotateTripFunc(func(r *http.Request) (*http.Response, error) { return badParamsResponse(), nil })},
+		HTTP:       &http.Client{Transport: rotateTripFunc(func(r *http.Request) (*http.Response, error) { return rotatingProbeResponse(), nil })},
 		ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example",
 	}
 	h := server.NewHandler(server.Config{Pool: p, Upstream: up})
