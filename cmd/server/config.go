@@ -340,7 +340,8 @@ type Config struct {
 		// 不拿"未知"当"余额 0"，否则全新部署在首次余额刷新前会把付费模型全打成 503。
 		//
 		// 面板保存后经 pool.SetReserveCredits 热生效（下一次选号即按新值）。
-		ReserveCredits int `json:"reserve_credits"`
+		ReserveCredits     int  `json:"reserve_credits"`
+		DeepseekSGFallback bool `json:"deepseek_sg_fallback"`
 	} `json:"pool"`
 
 	// Models 网关对外模型名协议（/v1/models 的 id 形态 + 裸名归属域）。
@@ -496,6 +497,7 @@ func Default() *Config {
 	// 只留免费模型可用。键缺席时 Default() 的值被保留（Load 先取 Default 再 unmarshal）；
 	// 显式 0 才关闭。
 	c.Pool.ReserveCredits = DefaultReserveCredits
+	c.Pool.DeepseekSGFallback = true
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"

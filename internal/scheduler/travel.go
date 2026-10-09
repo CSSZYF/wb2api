@@ -82,7 +82,7 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if a.IsGlobal() {
+		if a.IsGlobal() || a.IsEnterprise() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 		if !first {

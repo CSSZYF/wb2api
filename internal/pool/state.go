@@ -477,17 +477,19 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
-	return p.countsDetailedForRealm("")
+	total, healthy, cooling, disabled, paused, inFlightFull := p.countsDetailedForRealm("")
+	return total, healthy, cooling, disabled + paused, inFlightFull
 }
 
 // CountsDetailedForRealm 同 CountsDetailed，但仅统计 Realm()==realm 的账号；
 // realm=="" 不加谓词（= CountsDetailed）。供 /status 按域分组透出。
 func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
-	return p.countsDetailedForRealm(realm)
+	total, healthy, cooling, disabled, paused, inFlightFull := p.countsDetailedForRealm(realm)
+	return total, healthy, cooling, disabled + paused, inFlightFull
 }
 
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
-func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, paused, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -497,12 +499,11 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 		}
 		total++
 		switch {
-		// 临时停用与永久禁用同归 disabled 计数：对「多少号不参与选号」这个运维问题
-		// 二者等价，分开会让 total/healthy/cooling/disabled 不闭合。
-		// 具体是哪一种看 /status 账号级的 manual_disabled/disabled 两位（面板据此区分
-		// 「临时停用」与「已禁用」标签）。
-		case e.disabled || e.manualDisabled:
+		// 面板区分永久禁用与临时停用；对外 CountsDetailed 仍合并不可选数量。
+		case e.disabled:
 			disabled++
+		case e.manualDisabled:
+			paused++
 		case !e.healthy(now):
 			cooling++
 		default:
@@ -512,7 +513,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 			}
 		}
 	}
-	return total, healthy, cooling, disabled, inFlightFull
+	return total, healthy, cooling, disabled, paused, inFlightFull
 }
 
 // ServableNow 报告池当前是否可服务：存在至少一个 healthy 且未占满在途名额的账号。
@@ -582,7 +583,10 @@ func (p *Pool) ModelRateLimitExhausted(model, realm string) (time.Duration, bool
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	return p.modelRateLimitExhaustedLocked(model, realm, time.Now())
+}
+
+func (p *Pool) modelRateLimitExhaustedLocked(model, realm string, now time.Time) (time.Duration, bool) {
 	cands := 0
 	var earliest time.Time
 	for _, e := range p.byUID {
@@ -628,7 +632,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	// 清理 cooledReasonLocked 同口径）。disabled 账号的 reason 是禁用原因，保留。
 	_, reason := cooledReasonLocked(e, now)
 	st := Status{
-		UID: uid,
+		Enterprise: e.a.IsEnterprise(),
+		UID:        uid,
 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
@@ -739,4 +744,8 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 		return nil
 	}
 	return rows
+}
+
+func (p *Pool) CountsDetailedWithPaused() (total, healthy, cooling, disabled, paused, inFlightFull int) {
+	return p.countsDetailedForRealm("")
 }

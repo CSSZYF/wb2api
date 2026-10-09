@@ -687,7 +687,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
           <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
           <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
-          <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">不可选</div></div>
+          <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
+<div class="stat warn"><div class="v" id="sPaused">—</div><div class="k">临时停用</div></div>
           <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
           <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
           <div class="stat"><div class="v" id="sDailyNeed">-</div><div class="k">日均需耗</div></div>
@@ -1008,6 +1009,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                   <option value="sequential">sequential — 顺序填充</option>
                 </select>
                 <span class="hint">顺序填充：按账号池的顺序（在「账号池」表里拖动 ⠿ 调整，顺序立即落盘）从上到下取第一个可用号；该号在途占满即临时溢出到下一个，并发降回来它重新成为首选。用于减少「每次挑不同账号」引发的频繁 429；保存后立即生效（非法值按加权随机处理）</span></label>
+              <label class="fld"><span class="lb">免费额度耗尽后使用 SG</span><input name="deepseek_sg_fallback" type="checkbox"><span class="hint">仅国际服 deepseek-v4.1-flash：全池额度耗尽后自动使用付费 flash-sg，余额须高于保留积分；免费额度恢复后优先切回。保存即时生效。</span></label>
               <label class="fld"><span class="lb">保留积分</span>
                 <input name="reserve_credits" type="number" min="0" placeholder="50">
                 <span class="hint">余额 ≤ 此值时该号只服务免费/低价模型（倍率 ≤ 0，如 x0.00 与限时免费），贵模型自动换别的号——免得贵模型把积分吃到连免费的 4.1 都用不了。免费模型另含 hy4-preview / hy3 / deepseek-v4.1-flash 兜底；0 = 关闭；余额未刷新（未知）时不拦；保存后立即生效</span></label>

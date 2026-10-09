@@ -99,7 +99,9 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			if a.IsGlobal() {
 				return
 			}
-			if tasks, err := p.listAllTasks(a); err != nil {
+			if a.IsEnterprise() {
+				it.GrowthErr = "企业账号不支持个人成长任务"
+			} else if tasks, err := p.listAllTasks(a); err != nil {
 				it.GrowthErr = err.Error()
 			} else {
 				for _, t := range tasks {
@@ -232,7 +234,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth, school bool) (started 
 			if a.IsGlobal() {
 				return
 			}
-			if growth {
+			if growth && !a.IsEnterprise() {
 				if tasks, err := p.listAllTasks(a); err == nil {
 					for _, t := range tasks {
 						if growthPending(t) {

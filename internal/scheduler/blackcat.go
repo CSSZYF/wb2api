@@ -10,6 +10,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
+var nowForNightWindow = time.Now
+
 // RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过）。
 // 由 blackcat_hours 排程（默认 [23]）触发；执行前二次校验 InNightWindow。
 // 无 ctx 的外部入口，内部走 runBlackcat 取背景 ctx（语义与引入前 time.Sleep 版一致）。
@@ -23,7 +25,7 @@ func (s *Scheduler) RunBlackcatNow() {
 
 // runBlackcat 夜猫子遍历，随 ctx 取消立即退出（账号间限速改用 sleepCtx）。
 func (s *Scheduler) runBlackcat(ctx context.Context) {
-	if !upstream.InNightWindow(time.Now()) {
+	if !upstream.InNightWindow(nowForNightWindow()) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
 	}
@@ -35,7 +37,7 @@ func (s *Scheduler) runBlackcat(ctx context.Context) {
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
-		if a.IsGlobal() {
+		if a.IsGlobal() || a.IsEnterprise() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 		need, err := s.cfg.Upstream.BlackcatNeed(a)

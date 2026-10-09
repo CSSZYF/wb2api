@@ -62,6 +62,7 @@ type TokenUsageDelta struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
+	Enterprise   bool   `json:"enterprise,omitempty"`
 	UID          string `json:"uid"`
 	Nickname     string `json:"nickname,omitempty"`
 	Credits      int64  `json:"credits"`

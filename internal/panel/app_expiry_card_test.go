@@ -38,7 +38,7 @@ func TestAppJSExpiryCardWiring(t *testing.T) {
 		"$('expList')",           // 列表容器
 		"expiring_soon_sec",      // 窗口/口径与既有三态同源（不另立一套）
 		"日均需耗",                   // 核心可操作数字
-		"loadExpiry()",           // 路由（accounts 视图）触发
+		"loadExpiry(true)",       // 路由（accounts 视图）触发
 	} {
 		if !strings.Contains(s, must) {
 			t.Errorf("app.js 缺到期提醒卡片接线：%s", must)

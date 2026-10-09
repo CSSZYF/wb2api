@@ -2297,6 +2297,13 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 // （soon<=0 禁用分桶、忽略 PackageEndTime、缺/坏 EndTime 归长期），改签名等于改动全部
 // 调用点与断言；变体是纯增量，既有签名/用例逐字不变。
 func (c *Client) UserResourceDetailedDiag(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, diag ResourceDiag, err error) {
+	if a.IsEnterprise() {
+		remain, total, expiring, end, _, err := c.enterpriseResource(a, soon)
+		if expiring > 0 {
+			diag.ExpiringEnd = end
+		}
+		return remain, total, expiring, diag, err
+	}
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,

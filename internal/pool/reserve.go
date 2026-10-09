@@ -172,10 +172,11 @@ func (p *Pool) modelIsFreeLocked(model string) bool {
 // reqModel 算一次，之后所有候选共用同一个判定结果（本闸门只依赖 reqModel 与池级配置，
 // 与候选账号无关，故这么做不改变语义）。
 type reserveGate struct {
-	p      *Pool
-	active bool  // 是否生效（reserve_credits > 0 且本次选号不豁免）
-	line   int64 // 保留线
-	free   bool  // 该模型免费/低价 → 余额触底也放行
+	p            *Pool
+	requireKnown bool
+	active       bool  // 是否生效（reserve_credits > 0 且本次选号不豁免）
+	line         int64 // 保留线
+	free         bool  // 该模型免费/低价 → 余额触底也放行
 }
 
 // allows 报告候选账号是否通过保留积分闸门。未命中时打一条节流日志并返回 false。
@@ -189,6 +190,9 @@ type reserveGate struct {
 //
 // 调用方需已持 p.mu（读锁或写锁；日志节流器自持锁，见其类型注释）。
 func (g reserveGate) allows(e *entry, reqModel string) bool {
+	if g.requireKnown {
+		return (e.creditsTotal > 0 || (e.a.IsEnterprise() && e.creditsTotal == -1)) && e.credits > g.line
+	}
 	if !g.active || e.credits > g.line || e.creditsTotal <= 0 || g.free {
 		return true
 	}

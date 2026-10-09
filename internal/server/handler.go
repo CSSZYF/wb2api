@@ -104,8 +104,9 @@ type Config struct {
 	// Default() 会给 true，测试/裸用场景传 nil 即默认开。
 	PTLMaxTokensRetry *bool
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
-	RequestLog       *reqlog.Recorder
-	RecordClientInfo bool
+	RequestLog         *reqlog.Recorder
+	RecordClientInfo   bool
+	DeepseekSGFallback bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -114,9 +115,10 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:           h.cfg.APIKey,
-		SoftCooldown:     h.cfg.SoftCooldown,
-		RecordClientInfo: h.cfg.RecordClientInfo,
+		APIKey:             h.cfg.APIKey,
+		SoftCooldown:       h.cfg.SoftCooldown,
+		RecordClientInfo:   h.cfg.RecordClientInfo,
+		DeepseekSGFallback: h.cfg.DeepseekSGFallback,
 	}
 }
 
@@ -871,6 +873,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
+	declaredTools := upstream.ToolNameAllowlist(body)
 
 	// realm 归属解析：model 名可带显式 "[realm:]" 前缀（老客户端配置兼容）；
 	// 裸名按池内可用域归属——单域部署（只登国际版账号）下裸名直接走该域，
@@ -880,6 +883,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 本域无可用号时**不跨域回落**（换域可能违反其意图）；裸名归属 = 网关默认倾向，
 	// 本域无可用号时回落另一域，避免混合池下「本域全限流即 503」而另一域明明可用。
 	realm, bareModel, realmExplicit := h.router.ResolveWithSource(peek.Model)
+	// Snapshot the opt-in once. Bare names resolving to global share this policy;
+	// explicit CN and all other models retain their existing routing.
+	sgEligible := h.loadLive().DeepseekSGFallback && h.cfg.GlobalEnabled && realm == "global" && bareModel == pool.DeepseekFreeModel
+	paidFallback := false
+	actualModel := peek.Model
+	if sgEligible {
+		realmExplicit = true
+	}
+	freeExhausted := func() bool {
+		if !sgEligible || paidFallback || r.Context().Err() != nil || h.wafIP.active() {
+			return false
+		}
+		_, exhausted := h.cfg.Pool.ModelRateLimitExhausted(pool.DeepseekFreeModel, "global")
+		return exhausted
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -992,7 +1010,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		} else if delta.HasPromptTokens || delta.HasCompletionTokens {
 			st.totalTokens = st.promptTokens + st.completionTokens
 		}
-		delta.Model = peek.Model
+		delta.Model = actualModel
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
 		if latencyMs < 1 {
@@ -1116,7 +1134,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 换号上限本请求内固定一次（与 maxBodyBytes 同口径的"请求内快照"）：
 	// 轮转中途面板改值不影响本请求已定的次数，避免同请求内上限漂移。
 	maxRotate := h.rotateLimit()
-	for i := 0; i < maxRotate; i++ {
+	maxAttempts := maxRotate
+	for i := 0; i < maxAttempts || freeExhausted(); i++ {
+		if freeExhausted() {
+			paidFallback = true
+			bareModel, actualModel = pool.DeepseekPaidModel, "global:"+pool.DeepseekPaidModel
+			body = rewriteModel(body, bareModel)
+			st.model = actualModel
+			w.Header().Set("X-WB2API-Requested-Model", peek.Model)
+			w.Header().Set("X-WB2API-Actual-Model", actualModel)
+			tried = map[string]bool{} // an account tried for free may still serve SG
+			unbindSticky()
+			ptlRetryUID = ""
+			lastErr = nil
+			maxAttempts = i + maxRotate // one bounded SG rotation phase
+			log.Printf("INFO: [server] global free pool exhausted; fallback %s -> %s (reserve=%d)", pool.DeepseekFreeModel, bareModel, h.cfg.Pool.ReserveCredits())
+		}
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		// 11115 下调 max_tokens 的重试：**钉住首次那个账号**（见 ptlRetryUID 注释）。
@@ -1150,7 +1183,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				acct = nil
 			}
 		}
-		if acct == nil {
+		if paidFallback && acct != nil {
+			// Pinned max_tokens retry still has to pass the paid reserve check.
+			stPaid, ok := h.cfg.Pool.Status(acct.UID)
+			if !ok || stPaid.Credits <= h.cfg.Pool.ReserveCredits() || (stPaid.CreditsTotal <= 0 && !(stPaid.Enterprise && stPaid.CreditsTotal == -1)) {
+				acct = nil
+			}
+		}
+		if acct == nil && paidFallback {
+			acct = h.cfg.Pool.PickDeepseekPaidFallback(tried)
+		}
+		if acct == nil && !paidFallback {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			// 裸名归属（realmExplicit=false）走软优先入口：本域无候选（含 6004 模型级
@@ -1545,9 +1588,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// errFrame：上游 error 帧原文（观察者旁路采集，见 WithErrorFrameObserver），
 			// 用于流尾的账号处置——error 帧形态下账号**不得**被记成功。
 			var errFrame string
+			repair := upstream.NewMarkupRepair(declaredTools, true)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }))
+			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }), upstream.WithMarkupRepair(repair))
 			// 流式观测收敛（上游缺陷 → 502）：两种上游缺陷哨兵共用同一口径，
 			// 与「客户端已走」严格区分——两道闸门，缺一不可：
 			//   1) 哨兵闸：终结帧（error 帧/[DONE]）写失败时 Stream 返回**写错误**
@@ -1641,6 +1685,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.outcome = reqlog.OutcomeHTTPError
 			return
 		}
+		upstream.RepairAggregatedResponse(resp, declaredTools, true)
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), obsFromResponse(resp), attemptStarted)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
@@ -1801,6 +1846,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+	if paidFallback && lastErr == nil && status == http.StatusServiceUnavailable {
+		code = "paid_fallback_unavailable"
+		msg = "free global deepseek quota exhausted; no healthy SG account with known credits above pool.reserve_credits"
+		hint = "refresh account balances or wait for free quota recovery; reserve credits are enforced"
 	}
 	if retryAfter > 0 {
 		// Retry-After 是 HTTP 标准头（秒数）：429 之外不发——503 的既有契约

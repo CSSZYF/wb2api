@@ -1229,6 +1229,7 @@ func TestPanelOverviewExposesManualDisable(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var resp struct {
+		Paused   int `json:"paused"`
 		Disabled int `json:"disabled"`
 		Accounts []struct {
 			UID            string `json:"uid"`
@@ -1241,8 +1242,8 @@ func TestPanelOverviewExposesManualDisable(t *testing.T) {
 		t.Fatalf("bad json: %v", err)
 	}
 	// 汇总口径：临时停用计入 disabled（保证 total/healthy/cooling/disabled 闭合）。
-	if resp.Disabled != 1 {
-		t.Errorf("汇总 disabled=%d want 1（临时停用计入不可选）", resp.Disabled)
+	if resp.Disabled != 0 || resp.Paused != 1 {
+		t.Errorf("汇总 disabled=%d want 0（临时停用独立统计）", resp.Disabled)
 	}
 	byUID := map[string]bool{}
 	for _, a := range resp.Accounts {

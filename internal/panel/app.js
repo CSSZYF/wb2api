@@ -157,7 +157,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-  if (v === 'accounts') loadExpiry();
+  if (v === 'accounts' && lastPackages) renderExpiry(lastPackages);
   if (v === 'taskscenter') { loadSchoolStatus(true); reattachQueueView(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -419,7 +419,7 @@ function renderAccounts(list) {
     if (s.manual_reason) noteLines.push('停用：' + esc(s.manual_reason));
     const note = noteLines.length ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + noteLines.join('<br>') + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
-    const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
+    const cred = s.enterprise && s.credits_total === -1 ? '不限' : s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
       ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
       : Math.round((s.credits || 0) / maxCred * 100);
@@ -442,7 +442,7 @@ function renderAccounts(list) {
       // 拖拽手柄：仅此单元格可起拖（见「账号拖拽排序」段）。draggable 由手柄的
       // mousedown 武装——直接给 tr 挂 draggable 会让选中文字/点按钮都变成拖拽。
       '<td class="drag-handle" title="按住拖动调整选号顺序">⠿</td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + modelLimitTag(s.rate_limited_models, frozen) + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div>' + expTag + '</td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -455,9 +455,9 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
-        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+        (s.enterprise ? '' : '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>') +
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">' + (s.enterprise ? '额度' : '余额') + '</button>' +
+        (s.enterprise ? '' : '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         '<button class="xs ghost" data-a="testchat" data-u="' + esc(s.uid) + '" title="用该账号发一条消息，验证模型可用性">测试</button>' +
         // 「解冻」= 清惩罚态（禁用/冷却/熔断/降权），「恢复」= 解除临时停用。两套独立：
         // 按钮文案与 tooltip 必须说清差异，否则运维分不清该点哪个。
@@ -517,6 +517,7 @@ async function loadOverview(quiet) {
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
     $('sDisabled').textContent = d.disabled;
+    $('sPaused').textContent = d.paused || 0;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
@@ -1159,6 +1160,7 @@ const CFG_MAP = {
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   pick_mode: ['pool', 'pick_mode'],
   reserve_credits: ['pool', 'reserve_credits'],
+  deepseek_sg_fallback: ['pool', 'deepseek_sg_fallback'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'],
   degrade_cooldown: ['pool', 'degrade_cooldown'], degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
@@ -2423,6 +2425,7 @@ function renderUsageChart(series, granularity) {
     const x = xOf(p.t) - bw / 2;
     const hTot = ih * (p.tt / max);
     const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
+    out += '<g>';
     const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
     const yBase = PT + ih;
     if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
@@ -2430,7 +2433,7 @@ function renderUsageChart(series, granularity) {
     if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) + '" fill="var(--ok)" rx="1.5"/>';
     out += '<title>' + esc(p.raw) + ' (' + esc(p.scope) + ')  ' +
-      fmtTok(p.pt) + ' prompt / ' + fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+      fmtTok(p.pt) + ' prompt / ' + fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title></g>';
   }
 
   // x 轴基线画在柱子之后，避免压在柱底
@@ -2706,7 +2709,12 @@ if ($('pkSort')) {
   };
 }
 
-async function loadPackages() {
+async function loadPackages(force) {
+ if (force !== true && lastPackages) {
+  renderPackages(lastPackages);
+  $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · 缓存于 ' + new Date(lastPackagesAt).toLocaleTimeString() + '，点刷新更新';
+  return;
+ }
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
   $('pkDetail').innerHTML = '';
   try {
@@ -2723,7 +2731,7 @@ async function loadPackages() {
   }
 }
 
-if ($('btnPk')) $('btnPk').onclick = loadPackages;
+if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
 
 /* ── 积分到期提醒（首页卡片）────────────────────────────────────────── */
 /* 积分不是永久的：签到/任务发的裂变包约一个月失效。只看「剩余积分 ÷ 日消耗」
@@ -2801,8 +2809,10 @@ function paintDailyStats() {
 // 更远绿），正文给出最近到期批次、该批剩余、到期前日均需耗（= 剩余 ÷ 距到期天数，
 // 至少 1 天防除零）与 7 天内合计。
 function renderExpiry(d) {
-  const list = (d.accounts || []);
+  const list = (d.accounts || []).slice();
   const today = new Date(); today.setHours(0, 0, 0, 0);
+  const expiry = a => a.error ? Infinity : Math.min(...expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0).map(b => new Date(b.date + 'T00:00:00').getTime()));
+  list.sort((a, b) => expiry(a) - expiry(b));
   let needSum = 0;
   const rows = list.map(a => {
     if (a.error) {

@@ -551,15 +551,18 @@ func (s *Scheduler) runCheckin(ctx context.Context) {
 		if a.IsGlobal() {
 			continue
 		}
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-			if upstream.IsAlreadyCheckin(err) {
-				log.Printf("checkin %s: 今天已签到（幂等）", st.UID)
-			} else {
-				log.Printf("checkin %s: %v", st.UID, err)
+		if !a.IsEnterprise() {
+			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
+				if upstream.IsAlreadyCheckin(err) {
+					log.Printf("checkin %s: 今天已签到（幂等）", st.UID)
+				} else {
+					log.Printf("checkin %s: %v", st.UID, err)
+				}
+				// 其余业务错误也继续走余额查询
 			}
-			// 其余业务错误也继续走余额查询
 		}
+
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
 		remain, total, expiring, diag, err := s.cfg.Upstream.UserResourceDetailedDiag(a, s.expiringSoonWindow())
@@ -623,7 +626,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessTokenValue() == "" {
+		if a == nil || a.AccessTokenValue() == "" || a.IsEnterprise() {
 			continue
 		}
 		if !first {
